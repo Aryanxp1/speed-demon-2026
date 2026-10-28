@@ -8,7 +8,7 @@ A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev
 2. **Install the [Speed Demon Board app](https://github.com/apps/speed-demon-board)** on that repo. It gets read-only access to the repos you pick and nothing else.
 3. **Register your team** on the submission form linked from speeddemon.dev, with the repo URL and the tracks you are entering.
 4. **Push to the `speed-demon` branch.** It is this template's default branch, so a plain `git push` does it. The board picks up each push, builds every `track-*` folder and runs it once on the full public dataset. Results appear on speeddemon.dev.
-5. **Make it fast.** Log every step in the track's `PERF.md`, with the board run ID that measured it. At code freeze (November 2, 18:00 UTC), make the repo public.
+5. **Make it fast.** Log every step in the track's `PERF.md`, with the board run ID that measured it. At code freeze (November 2, 15:00 UTC), make the repo public.
 
 One repo per team holds all your tracks. Delete the folders of the tracks you are not entering. An unchanged folder is the reference itself, so the board reports it as unchanged and does not run it.
 
@@ -59,7 +59,7 @@ Run the check once on the unchanged folder. The sha256 it prints is the correct 
 python3 check.py a --data data/a --expected <sha256>
 ```
 
-The 10% samples and their hashes are also published on October 30, 06:00 UTC, linked from speeddemon.dev.
+The full datasets and their expected hashes are also published at kickoff, October 30, 15:00 UTC, linked from speeddemon.dev.
 
 On Colima, keep the repo and the data under your home folder, or Docker cannot mount them.
 
