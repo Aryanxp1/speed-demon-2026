@@ -6,7 +6,7 @@ A working entry for all four tracks of [Speed Demon 2026](https://speeddemon.dev
 
 1. **Use this template** (the green button on GitHub) to create your repo. It can stay private until code freeze.
 2. **Install the [Speed Demon Board app](https://github.com/apps/speed-demon-board)** on that repo. It gets read-only access to the repos you pick and nothing else.
-3. **Register your team** on the submission form linked from speeddemon.dev, with the repo URL and the tracks you are entering.
+3. **Register your team** on the [submission form](https://tally.so/r/Ar7g9z), with the repo URL and the tracks you are entering.
 4. **Push to the `speed-demon` branch.** It is this template's default branch, so a plain `git push` does it. The board picks up each push, builds every `track-*` folder and runs it once on the full public dataset. Results appear on speeddemon.dev.
 5. **Make it fast.** Log every step in the track's `PERF.md`, with the board run ID that measured it. At code freeze (November 2, 15:00 UTC), make the repo public.
 
