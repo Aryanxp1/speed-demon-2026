@@ -480,19 +480,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .min(12)
         .max(1);
 
-    // Find chunk boundaries aligned to '\n' positions.
+    // Find chunk boundaries aligned to CRLF positions.
+    // The generator never writes CR inside quoted fields, so every "\r\n"
+    // marks the end of a complete record.
     let mut boundaries = Vec::with_capacity(num_threads + 1);
     boundaries.push(0usize);
     for t in 1..num_threads {
         let approx = t * file_size / num_threads;
-        let mut bp = approx;
-        while bp < file_size && file_data[bp] != b'\n' {
+        let mut bp = approx.max(boundaries[t - 1]);
+        while bp + 1 < file_size && !(file_data[bp] == b'\r' && file_data[bp + 1] == b'\n') {
             bp += 1;
         }
-        if bp < file_size {
-            bp += 1;
+        if bp + 1 < file_size {
+            boundaries.push(bp + 2); // start right after "\r\n"
+        } else {
+            boundaries.push(file_size);
         }
-        boundaries.push(bp);
     }
     boundaries.push(file_size);
 
