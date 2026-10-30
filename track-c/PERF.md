@@ -10,6 +10,7 @@ Every step from the reference to our optimized version, with measured metrics, a
 | **3** | Sliding-window chunked streaming (2 MB buffer). Slashes peak RSS from 240 MB to 45.4 MB ($8.1\times$ leaner than reference) and improves wall time to 1.20s due to L3 cache locality. | Unofficial local | 1.20 | 45.5 | 367 | 4.630 | 33.30 |
 | **4** | **Official Board Submission (Baseline v1.0)**: Evaluated on official scoring machine (Intel Core i5-13500, pinned 12 threads, 8 GB RAM). 100% byte-identical SHA-256 match. | **Official Board Run** | **0.926** | **88.0** | **367** | **4.378513** | **32.066** |
 | **5** | **Exact-Byte Distinct Name Table**: Replaced dual polynomial 64-bit hash (`hash128`) with `DistinctNameTable` — an open-addressing hash table backed by a contiguous `Vec<u8>` arena. Directly verifies raw slice bytes (`existing == name`), eliminating theoretical collision risk on unseen holdout distributions while retaining lean memory footprint (~90 MB) and sub-second speed. | Unofficial local | 1.21 | 90.2 | 430 | 4.410 | 32.20 |
+| **6** | **Parallel Multi-Threaded Ingest & AVX2 Structural Quote Scanning**: Split `records.csv` across up to 12 threads aligned to `\r\n` CRLF record boundaries (safe against multiline notes with embedded bare `\n`). Each thread maintains a thread-local `DistinctNameTable` and `CountryAgg` array; merged globally with exact byte deduplication. | Unofficial local | 2.17 | 328 | 650 | - | - |
 
 ---
 

@@ -12,6 +12,7 @@ Every step from the reference to our optimized version, with measured metrics, a
 | **4** | Multi-threaded Forward Dijkstra with single-pass ASCII parsing and in-memory CSR scatter. | Unofficial local | 2.71 | 170.8 | 266 | 4.790 | 34.00 |
 | **5** | **Official Board Submission (Baseline v1.0)**: Evaluated on official scoring machine (Intel Core i5-13500, pinned 12 threads, 8 GB RAM). 100% byte-identical SHA-256 match. | **Official Board Run** | **1.512** | **177.0** | **266** | **7.430230** | **43.550** |
 | **6** | Dynamic query scheduling via `AtomicUsize` work counter; interleaved 8-byte `EdgeTarget { to: u32, weight: u32 }` cache layout; out-of-bounds query node safety checks; epoch counter rollover protection. Replaced static chunking to eliminate thread straggler stalls on unbalanced query paths. Measured 23% reduction in CPU user time (17.88s $\to$ 13.83s). | Unofficial local | 2.38 | 170.8 | 295 | 5.080 | 35.80 |
+| **7** | **Monotone Radix Heap & 12 Hardware Threads**: Implemented 65-bucket RadixHeap exploiting Dijkstra's non-decreasing key property (O(1) amortized operations bucketed by highest differing bit, eliminating comparison overhead). Increased NUM_THREADS to 12 matching all available hardware threads on the official box. Full seed 1 verified byte-for-byte. | Unofficial local | 1.69 | 300 | 373 | - | - |
 
 ---
 
