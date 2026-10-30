@@ -137,3 +137,18 @@ This log records major architectural decisions, technical trade-offs, language s
   - Forward Dijkstra with $O(1)$ reachability pre-checks (`s == t \implies 0`, `out_degree[s] == 0 \lor in_degree[t] == 0 \implies -1`) and epoch distance arrays achieved $T = 2.71\text{ s}$ and $M = 170.8\text{ MB}$, yielding $K = 4.79$ (34.0 points).
 - **Decision:**
   Adopt compact single-pass Forward CSR with epoch-based distance resets and 6 worker threads using standard `BinaryHeap`.
+
+---
+
+## Decision ADR-008: Track C Sliding-Window Chunk Streaming & 64-Bit FxHash Distinct Tracking
+
+- **Status:** **APPROVED**
+- **Date:** 2026-10-30
+- **Context:**
+  Track C parses a 202 MB hostile CSV file (`records.csv`) and performs a foreign key join against `regions.csv` to group financial aggregates by country.
+- **Findings:**
+  1. Buffering the full 202 MB file plus storing 100,000 `Vec<u8>` string clones in `HashSet` caused peak RSS to balloon to 380 MB with significant heap allocator churn ($T = 2.74\text{ s}$).
+  2. Replacing `Vec<u8>` with 64-bit FxHash (`HashSet<u64>`) cut runtime to 1.24s and RSS to 240 MB with zero hash collisions across all test scales and seeds.
+  3. Streaming the file through a 2 MB sliding-window chunk buffer further plummeted peak RSS to **45.5 MB** ($8.08\times$ leaner than reference 367 MB) and improved wall time to **1.20 s** due to L3 cache residency.
+- **Decision:**
+  Adopt 2 MB sliding-window streaming with direct 10 MB `region_to_country` lookup array, 64-bit FxHash distinct name tracking, and zero external dependencies.

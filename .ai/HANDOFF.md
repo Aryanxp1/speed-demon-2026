@@ -2,7 +2,7 @@
 
 **Target Agent:** Codex (Implementation Engineer)  
 **Author:** Antigravity (Lead Systems Architect)  
-**Status:** Active Competition Execution — Transitioning to Phase 3: Track C (Join)  
+**Status:** Active Competition Execution — 3-Track Triad Complete; Staging Track B (Index)  
 
 ---
 
@@ -37,36 +37,31 @@ When implementing any task assigned by Antigravity:
 
 - **Phase 1: Track A (Ingest)**: Verified $K = 7.39$, 100% byte-identical SHA-256 (`495ca09682...`), $T = 0.65\text{ s}$, $M = 54.6\text{ MB}$.
 - **Phase 2: Track D (Traverse)**: Verified $K = 4.79$, 100% byte-identical SHA-256 (`a23dbdf0a3...`), $T = 2.71\text{ s}$, $M = 170.8\text{ MB}$.
+- **Phase 3: Track C (Join)**: Verified $K = 4.63$, 100% byte-identical SHA-256 (`d8088b1cd4...`), $T = 1.20\text{ s}$, $M = 45.5\text{ MB}$.
 
 ---
 
-## 3. Active Assignment: `TASK-C1` (Track C Hostile CSV Parser & Join Engine)
+## 3. Active Assignment: `TASK-B1` (Track B Inverted Index Engine)
 
-- **Track:** C (Join)
+- **Track:** B (Index)
 - **Status:** `READY_FOR_DEV`
 - **Files Owned:**
-  - `track-c/src/main.rs`
-  - `track-c/Cargo.toml`
-  - `track-c/Dockerfile`
-  - `track-c/.speed-demon.toml`
+  - `track-b/src/main.rs`
+  - `track-b/Cargo.toml`
+  - `track-b/Dockerfile`
+  - `track-b/.speed-demon.toml`
 - **Inputs:**
-  - `/data/customers.csv` (~10 MB, up to 100,000 customers).
-  - `/data/orders.csv` (~200 MB, up to 2,000,000 orders).
+  - `/data/corpus.txt` (~254 MB, ~1,000,000 documents).
+  - `/data/queries.txt` (50,000 queries: single terms, boolean AND/OR/NOT, exact phrases).
 - **Outputs:**
-  - `/out/aggregates.txt` (Aggregates grouped by `(region, currency)`).
+  - `/out/results.txt` (Document IDs matching queries, sorted).
 - **Specification Invariants:**
-  1. *Hostile CSV Handling:*
-     - Mid-file UTF-8 BOM (`\xEF\xBB\xBF`) appears at chunk boundaries or in line starts; must be stripped.
-     - Unescaped quotes inside description fields (e.g. `He said "hello"` without RFC 4180 escaping).
-     - Both CRLF (`\r\n`) and LF (`\n`) line endings occur in the same file.
-     - Unquoted leading/trailing whitespace around fields.
-  2. *Foreign Key Join:*
-     - Map `customer_id` from order to `customer.region`.
-     - Direct table or array lookup indexed by `customer_id` (size $\le 100,000 \implies$ flat array of `u8` region IDs, takes $<1\text{ MB}$!).
-  3. *Currency & Financial Arithmetic:*
-     - Amounts are decimal strings with 2 decimal places. Parse directly into exact `i64` integer cents (e.g. `$12.34 \to 1234$). Never use floating-point arithmetic.
-  4. *Zero External Crates ($D = 1.000$):*
-     - No external CSV parsers (banned and dependency penalty). Standard library byte scanner only.
-- **Verification Targets:**
-  - Sample Seed 1 expected hash: `11c20689b0...`
-  - Full Seed 1 expected hash: `d8088b1cd42ba5e56eebfd9981eeb5c3a3b77ce8e7ef9e6231940a02f37e4be6`
+  1. *Ahead-of-Time Query Vocabulary Filter:*
+     - Read `/data/queries.txt` FIRST.
+     - Collect set of query terms and phrases.
+     - While indexing `corpus.txt`, ignore terms that never appear in any query! (Massive memory reduction: index only query vocabulary).
+  2. *Compact Postings / Bitsets:*
+     - Documents are indexed dense $0 \dots N-1$.
+     - Flat posting lists of `u32` document IDs, or bitset vectors (`Vec<u64>`) for fast bitwise AND / OR / NOT.
+  3. *Zero External Crates ($D = 1.000$):*
+     - No external search engine or indexing crates.

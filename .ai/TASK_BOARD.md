@@ -1,6 +1,6 @@
 # Speed Demon 2026 — Task Board (`TASK_BOARD.md`)
 
-**Current Sprint:** Track C (Join) Engineering  
+**Current Sprint:** Track B (Index) or Optimization Pass  
 **Competition Status:** Hour 2 of 72  
 
 ---
@@ -27,16 +27,17 @@
    ├── TASK-D3: 6-Thread Query Parallelism & QuadHeap/Bidir Experiments [DONE]
    └── TASK-D4: Track D Multi-Scale & Multi-Seed Verification (Tiny, Sample, Full, 42, 999) [DONE]
    │
-[Phase 3: Track C — Join] (CURRENT FOCUS)
+[Phase 3: Track C — Join]
    │
-   ├── TASK-C1: Hostile CSV State Machine Parser (BOMs, Multiline, Escapes) [READY]
-   ├── TASK-C2: Direct Region Lookup & Integer Cents Aggregation [SCHEDULED]
-   └── TASK-C3: Track C Multi-Seed Verification [SCHEDULED]
+   ├── TASK-C1: Hostile CSV State Machine Parser (BOMs, Multiline, Escapes) [DONE]
+   ├── TASK-C2: Direct Region Lookup & Integer Cents Aggregation [DONE]
+   ├── TASK-C3: 64-bit FxHash Distinct Tracking & 2 MB Sliding-Window Buffer [DONE]
+   └── TASK-C4: Track C Multi-Scale & Multi-Seed Verification (Tiny, Sample, Full, 42, 999) [DONE]
    │
-[Phase 4: Track B — Index (Championship Hedge)]
+[Phase 4: Track B — Index (Championship Hedge / 4th Track)] (CURRENT FOCUS)
    │
-   ├── TASK-B1: Ahead-of-Time Query Vocabulary Filter [SCHEDULED]
-   └── TASK-B2: AVX2 Bitset Boolean & Anchor Phrase Evaluation [SCHEDULED]
+   ├── TASK-B1: Ahead-of-Time Query Vocabulary Filter [READY]
+   └── TASK-B2: Inverted Index & Fast Postings Intersection [SCHEDULED]
    │
 [Phase 5: Final Tuning & Freeze]
    │
@@ -45,15 +46,14 @@
 
 ---
 
-## Active Task: `TASK-C1` (Track C Hostile CSV Parser & Join Engine)
+## Active Task: `TASK-B1` (Track B Inverted Index Engine)
 
-- **Track:** C (Join)
+- **Track:** B (Index)
 - **Status:** `READY_FOR_DEV`
-- **Inputs:** `/data/customers.csv`, `/data/orders.csv`
-- **Outputs:** `/out/aggregates.txt`
+- **Inputs:** `/data/corpus.txt`, `/data/queries.txt`
+- **Outputs:** `/out/results.txt`
 - **Invariants:**
-  - Robust streaming CSV parser handling mid-file UTF-8 BOM, unescaped quotes in descriptions, `\r\n` line endings, unquoted whitespace, and integer scale factors for currency.
-  - Foreign key join on `customer_id` mapping to customer country/region.
+  - Inverted index built from corpus of documents.
+  - Boolean AND, OR, NOT and exact phrase queries.
   - Zero external crates ($D = 1.000$).
-  - Missing paths/unmatched records handled strictly per specification.
-- **Target Metrics:** $T < 0.25\text{ s}$, $M < 40\text{ MB}$, $D = 1.0$.
+- **Target Metrics:** $T < 1.0\text{ s}$, $M < 300\text{ MB}$, $D = 1.0$.
