@@ -10,6 +10,8 @@ Every step from the reference to our optimized version, with measured metrics, a
 | **3** | 6-thread parallel chunking with `std::thread::scope`, global mutex registry with thread-local read cache, nearest-rank `select_nth_unstable`, and custom integer formatting. | Unofficial local | 0.65 | 54.6 | 394 | 6.960 | 42.10 |
 | **4** | Architectural pruning & line consolidation: eliminated redundant integer formatters, unified numerical serializers, reduced code size from 394 to 263 lines (+11% gain on $S$ factor). | Unofficial local | 0.65 | 54.6 | 263 | 7.390 | 43.40 |
 | **5** | **Official Board Submission (Baseline v1.0)**: Executed on official scoring machine (Intel Core i5-13500, pinned 12 threads, 8 GB RAM). 100% byte-identical SHA-256 match. | **Official Board Run** | **0.292** | **61.0** | **263** | **10.284873** | **50.610** |
+| **6** | **Official Board Submission (v1.1)**: Improved line grouping & memory efficiency. | **Official Board Run** | **0.150** | **62.0** | **379** | **14.400088** | **57.918** |
+| **7** | **Zero-Copy Mmap Ingest, SIMD Vector Scanning, & Radix Bucketing**: Zero-copy `mmap` with AVX2 `match32`, SIMD digit parsing (`_mm_maddubs_epi16`), thread-local `EndpointTable` with hardware CRC32 (`_mm_crc32_u64`), fixed 16 KB `Block` arena, radix prefix-sum latency scattering with `madvise(MADV_DONTNEED)`, and dedicated streaming background writer thread. | Unofficial local WSL | 0.22 | 54.0 | 580 | ~39.8 | ~79.9 |
 
 ---
 

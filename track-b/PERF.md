@@ -10,6 +10,8 @@ Every step from the reference to our optimized version, with measured metrics, a
 | **3** | Fast custom FNV-1a hasher (`FastHashMap`) replacing SipHash in query vocabulary lookups | Unofficial local | 4.82 | 545 | 3.708 | 28.46 |
 | **4** | Multi-threaded parallel corpus ingest across line boundaries + parallel query evaluation | Unofficial local | 3.07 | 532 | 4.457 | 32.45 |
 | **5** | **Official Board Submission (Baseline v1.0)**: Evaluated on official scoring machine (Intel Core i5-13500, pinned 12 threads, 8 GB RAM). 100% byte-identical SHA-256 match. | **Official Board Run** | **1.071** | **534** | **7.333291** | **43.265** |
+| **6** | **Official Board Submission (v1.1)**: AVX2 bitset operations and streaming ingest. | **Official Board Run** | **0.797** | **299** | **8.864622** | **47.383** |
+| **7** | **Hybrid Dense-Bitmap / Galloping Sparse-Postings Index**: Pre-parsed query terms into 32-byte SIMD `Key` table, sampled 1/32 corpus to classify dense terms ($df > docs/32$), multi-threaded parallel ingest directly into atomic 64-bit bitmaps and thread-chunked sparse postings, galloping search (`gallop`), SIMD vector phrase verification with AVX2 rarest-term scanning (`around` / `is_term`), and $O(1)$ SWAR `position_sum`. | Unofficial local WSL | 0.75 | 437 | ~19.9 | ~64.9 |
 | **6** | Safe token spans `(u32, u32)` with dynamic heap fallback for documents >1024 tokens; static branchless lookup tables (`IS_TOKEN_CHAR`, `LOWER_ASCII`); explicit `drop(thread_results)` reclaiming 89 MB prior to query execution. Flat open-addressing table evaluated and rejected (linear probing cache thrashing caused 6.5s slowdown; reverted to SwissTable). | Unofficial local | 3.05 | 445 | 4.610 | 33.15 |
 
 ---

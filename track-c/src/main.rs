@@ -1,372 +1,564 @@
+use std::arch::x86_64::*;
 use std::fs::File;
-use std::io::{BufWriter, Read, Write};
+use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::Barrier;
 use std::thread;
 
-// Scan for the next '"' byte using AVX2 when available.
-fn find_quote(bytes: &[u8]) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2") {
-        return unsafe { find_quote_avx2(bytes) };
+extern "C" {
+    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+}
+
+const PROT_READ: i32 = 1;
+const PROT_WRITE: i32 = 2;
+const MAP_PRIVATE: i32 = 0x02;
+const MAP_ANONYMOUS: i32 = 0x20;
+const MAP_FAILED: *mut u8 = !0 as *mut u8;
+
+unsafe fn zeroed<T>(n: usize) -> *mut T {
+    let bytes = n * std::mem::size_of::<T>();
+    let p = mmap(
+        std::ptr::null_mut(),
+        bytes,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if p == MAP_FAILED {
+        std::process::exit(1);
     }
-    bytes.iter().position(|&b| b == b'"').unwrap_or(bytes.len())
+    p as *mut T
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn find_quote_avx2(bytes: &[u8]) -> usize {
-    use std::arch::x86_64::*;
-    let mut pos = 0;
-    let quote = _mm256_set1_epi8(b'"' as i8);
-    while pos + 32 <= bytes.len() {
-        let data = _mm256_loadu_si256(bytes.as_ptr().add(pos).cast());
-        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(data, quote)) as u32;
-        if mask != 0 {
-            return pos + mask.trailing_zeros() as usize;
-        }
-        pos += 32;
+unsafe fn map_file(file: &File) -> (*const u8, usize) {
+    let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
+    if size == 0 {
+        return (std::ptr::null(), 0);
     }
-    pos + bytes[pos..]
-        .iter()
-        .position(|&b| b == b'"')
-        .unwrap_or(bytes.len() - pos)
+    let fd = file.as_raw_fd();
+    // Map with spare 4096-byte padding so 64-byte vector loads past end are safe
+    let p = mmap(
+        std::ptr::null_mut(),
+        size + 4096,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS,
+        -1,
+        0,
+    );
+    if p == MAP_FAILED {
+        std::process::exit(1);
+    }
+    // Overlay file contents
+    if mmap(p, size, PROT_READ, MAP_PRIVATE | 0x10 /* MAP_FIXED */, fd, 0) == MAP_FAILED {
+        std::process::exit(1);
+    }
+    (p as *const u8, size)
 }
 
-// Per-thread hash table for (country_id, name_bytes) pairs.
-// Uses a Vec<u8> arena for exact byte storage; collisions are resolved by
-// full byte comparison (no false positives from hash collisions).
-struct DistinctNameTable {
-    slots: Vec<u32>,
-    mask: usize,
-    arena: Vec<u8>,
-    items: Vec<(u8, u32, u16)>,
+#[inline(always)]
+unsafe fn load8(p: *const u8) -> u64 {
+    (p as *const u64).read_unaligned()
 }
 
-impl DistinctNameTable {
-    fn with_capacity(capacity_pow2: usize) -> Self {
+#[inline(always)]
+unsafe fn match32(p: *const u8, c: u8) -> u32 {
+    let v = _mm256_loadu_si256(p as *const __m256i);
+    let cmp = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8));
+    _mm256_movemask_epi8(cmp) as u32
+}
+
+#[inline(always)]
+unsafe fn match64(p: *const u8, c: u8) -> u64 {
+    (match32(p, c) as u64) | ((match32(p.add(32), c) as u64) << 32)
+}
+
+#[inline(always)]
+unsafe fn digits(s: *const u8, e: *const u8) -> u64 {
+    let len = e as usize - s as usize;
+    let shift = 8 * (8 - len);
+    let mask = !0u64 << shift;
+    let mut v = load8(e.sub(8)) & 0x0F0F0F0F0F0F0F0F & mask;
+    v = (v.wrapping_mul(10) + (v >> 8)) & 0x00FF00FF00FF00FF;
+    v = (v.wrapping_mul(100) + (v >> 16)) & 0x0000FFFF0000FFFF;
+    (v.wrapping_mul(10000) + (v >> 32)) & 0xFFFFFFFF
+}
+
+struct Separator {
+    at: *const u8,
+    quotes: u64,
+}
+
+struct Structure {
+    block: *const u8,
+    end: *const u8,
+    bits: u64,
+    carry: u64,
+    q: u64,
+    before: u64,
+}
+
+impl Structure {
+    #[inline(always)]
+    fn new(p: *const u8, end: *const u8) -> Self {
         Self {
-            slots: vec![0; capacity_pow2],
-            mask: capacity_pow2 - 1,
-            arena: Vec::with_capacity(2 * 1024 * 1024),
-            items: Vec::with_capacity(capacity_pow2 / 2),
+            block: unsafe { p.sub(64) },
+            end,
+            bits: 0,
+            carry: 0,
+            q: 0,
+            before: 0,
         }
     }
 
     #[inline(always)]
-    fn insert_if_absent(&mut self, country_id: u8, name: &[u8]) -> bool {
-        let mut h: u64 = 0x517cc1b727220a95 ^ (country_id as u64);
-        for &b in name {
-            h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
-        }
-        let mut idx = (h as usize) & self.mask;
-        loop {
-            let slot = self.slots[idx];
-            if slot == 0 {
-                let offset = self.arena.len() as u32;
-                let len = name.len() as u16;
-                self.arena.extend_from_slice(name);
-                self.items.push((country_id, offset, len));
-                let item_idx = self.items.len() as u32;
-                self.slots[idx] = item_idx;
-                if self.items.len() * 2 > self.slots.len() {
-                    self.grow();
-                }
-                return true;
-            } else {
-                let item_idx = (slot - 1) as usize;
-                let (cid, off, len) = self.items[item_idx];
-                if cid == country_id && len as usize == name.len() {
-                    let existing = &self.arena[off as usize..(off as usize + len as usize)];
-                    if existing == name {
-                        return false;
-                    }
-                }
-                idx = (idx + 1) & self.mask;
+    unsafe fn next(&mut self) -> Separator {
+        while self.bits == 0 {
+            self.block = self.block.add(64);
+            if self.block >= self.end {
+                return Separator {
+                    at: self.end,
+                    quotes: self.before + self.q.count_ones() as u64,
+                };
             }
+            self.before += self.q.count_ones() as u64;
+            self.q = match64(self.block, b'"');
+            let q_128 = _mm_cvtsi64_si128(self.q as i64);
+            let ones = _mm_set1_epi8(-1);
+            let x = _mm_clmulepi64_si128(q_128, ones, 0);
+            let inside = (_mm_cvtsi128_si64(x) as u64) ^ self.carry;
+            self.carry = (inside as i64 >> 63) as u64;
+            self.bits = (match64(self.block, b',') | match64(self.block, b'\n')) & !inside;
         }
-    }
-
-    fn grow(&mut self) {
-        let new_cap = self.slots.len() * 2;
-        let new_mask = new_cap - 1;
-        let mut new_slots = vec![0u32; new_cap];
-        for (i, &(cid, off, len)) in self.items.iter().enumerate() {
-            let name = &self.arena[off as usize..(off as usize + len as usize)];
-            let mut h: u64 = 0x517cc1b727220a95 ^ (cid as u64);
-            for &b in name {
-                h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
-            }
-            let mut idx = (h as usize) & new_mask;
-            while new_slots[idx] != 0 {
-                idx = (idx + 1) & new_mask;
-            }
-            new_slots[idx] = (i + 1) as u32;
+        let i = self.bits.trailing_zeros();
+        self.bits &= self.bits - 1;
+        let q_mask = (1u64 << i).wrapping_sub(1);
+        Separator {
+            at: self.block.add(i as usize),
+            quotes: self.before + (self.q & q_mask).count_ones() as u64,
         }
-        self.slots = new_slots;
-        self.mask = new_mask;
-    }
-
-    /// Iterate all interned (country_id, name_bytes) pairs.
-    fn iter_items(&self) -> impl Iterator<Item = (u8, &[u8])> {
-        self.items.iter().map(|&(cid, off, len)| {
-            (cid, &self.arena[off as usize..(off as usize + len as usize)])
-        })
     }
 }
 
-struct CountryAgg {
+const SLOTS: usize = 1 << 17;
+const IDS: usize = 1 << 17;
+const HEAD: usize = 24;
+const BUSY: u16 = 0xFFFF;
+
+#[derive(Copy, Clone)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    #[inline(always)]
+    fn as_ptr(&self) -> *const T {
+        self.0 as *const T
+    }
+    #[inline(always)]
+    fn as_mut_ptr(&self) -> *mut T {
+        self.0
+    }
+}
+
+#[repr(C, align(32))]
+#[derive(Copy, Clone)]
+struct Slot {
+    id: u32,
+    len: u32,
+    head: [u8; HEAD],
+}
+
+#[derive(Copy, Clone)]
+struct Probe {
+    slot: usize,
+    tag: u16,
+}
+
+struct NameTable {
+    tags: *mut AtomicU16,
+    slots: *mut Slot,
+    overflow: *mut u32,
+    arena: *mut u8,
+    used: AtomicU32,
+    next_id: AtomicU32,
+}
+
+unsafe impl Send for NameTable {}
+unsafe impl Sync for NameTable {}
+
+impl NameTable {
+    fn new() -> Self {
+        unsafe {
+            Self {
+                tags: zeroed::<AtomicU16>(SLOTS),
+                slots: zeroed::<Slot>(SLOTS),
+                overflow: zeroed::<u32>(SLOTS),
+                arena: zeroed::<u8>(8 << 20),
+                used: AtomicU32::new(0),
+                next_id: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn probe(&self, s: *const u8, len: u32) -> Probe {
+        let mut h = len as u64;
+        let mut i = 0u32;
+        while i < len {
+            let mut w = load8(s.add(i as usize));
+            let rem = len - i;
+            if rem < 8 {
+                w &= (1u64 << (8 * rem)) - 1;
+            }
+            h = (h ^ w).wrapping_mul(0x9E3779B97F4A7C15);
+            i += 8;
+        }
+        let mut p = Probe {
+            slot: ((h >> 20) as usize) % SLOTS,
+            tag: (1 + ((h >> 48) as u16) % (BUSY - 1)),
+        };
+        loop {
+            let t = (*self.tags.add(p.slot)).load(Ordering::Relaxed);
+            if t == 0 || t == p.tag || t == BUSY {
+                break;
+            }
+            p.slot = (p.slot + 1) % SLOTS;
+        }
+        _mm_prefetch(self.slots.add(p.slot) as *const i8, _MM_HINT_T0);
+        p
+    }
+
+    #[inline(always)]
+    unsafe fn id(&self, s: *const u8, len: u32, mut p: Probe) -> u32 {
+        loop {
+            let tag_ref = &*self.tags.add(p.slot);
+            let mut t = tag_ref.load(Ordering::Acquire);
+            if t == 0
+                && tag_ref
+                    .compare_exchange(0, BUSY, Ordering::Acquire, Ordering::Acquire)
+                    .is_ok()
+            {
+                let slot = &mut *self.slots.add(p.slot);
+                let new_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if new_id as usize >= IDS {
+                    std::process::exit(1);
+                }
+                slot.id = new_id;
+                slot.len = len;
+                let copy_len = (len as usize).min(HEAD);
+                std::ptr::copy_nonoverlapping(s, slot.head.as_mut_ptr(), copy_len);
+                if len as usize > HEAD {
+                    let over_len = len as usize - HEAD;
+                    let off = self.used.fetch_add(over_len as u32, Ordering::Relaxed) as usize;
+                    *self.overflow.add(p.slot) = off as u32;
+                    std::ptr::copy_nonoverlapping(s.add(HEAD), self.arena.add(off), over_len);
+                }
+                tag_ref.store(p.tag, Ordering::Release);
+                return new_id;
+            }
+            while t == BUSY {
+                t = tag_ref.load(Ordering::Acquire);
+            }
+            let slot = &*self.slots.add(p.slot);
+            if t == p.tag && slot.len == len && self.same_head(slot, s, len) {
+                if (len as usize) <= HEAD
+                    || libc_memcmp(
+                        self.arena.add(*self.overflow.add(p.slot) as usize),
+                        s.add(HEAD),
+                        len as usize - HEAD,
+                    )
+                {
+                    return slot.id;
+                }
+            }
+            p.slot = (p.slot + 1) % SLOTS;
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn same_head(&self, slot: &Slot, s: *const u8, len: u32) -> bool {
+        let a = _mm256_load_si256(slot as *const Slot as *const __m256i);
+        let b = _mm256_loadu_si256(s.sub(8) as *const __m256i);
+        let equal = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) as u32;
+        let head_len = (len as usize).min(HEAD);
+        let want = (((1u64 << head_len) - 1) << 8) as u32;
+        (equal & want) == want
+    }
+}
+
+#[inline(always)]
+unsafe fn libc_memcmp(a: *const u8, b: *const u8, n: usize) -> bool {
+    let mut i = 0;
+    while i < n {
+        if *a.add(i) != *b.add(i) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+const WORDS: usize = IDS / 64;
+
+struct NamesSeen {
+    bits: *mut AtomicU64,
+}
+
+unsafe impl Send for NamesSeen {}
+unsafe impl Sync for NamesSeen {}
+
+impl NamesSeen {
+    fn new() -> Self {
+        unsafe {
+            Self {
+                bits: zeroed::<AtomicU64>(256 * WORDS),
+            }
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn word(&self, c: u32, name: u32) -> &AtomicU64 {
+        &*self.bits.add(c as usize * WORDS + (name as usize / 64))
+    }
+
+    #[inline(always)]
+    unsafe fn prefetch(&self, c: u32, name: u32) {
+        _mm_prefetch(
+            self.bits.add(c as usize * WORDS + (name as usize / 64)) as *const i8,
+            _MM_HINT_T0,
+        );
+    }
+
+    #[inline(always)]
+    unsafe fn mark(&self, c: u32, name: u32) {
+        let bit = 1u64 << (name % 64);
+        let w = self.word(c, name);
+        if (w.load(Ordering::Relaxed) & bit) == 0 {
+            w.fetch_or(bit, Ordering::Relaxed);
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn count(&self, c: u32) -> u64 {
+        let mut n = 0u64;
+        for w in 0..WORDS {
+            n += (*self.bits.add(c as usize * WORDS + w))
+                .load(Ordering::Relaxed)
+                .count_ones() as u64;
+        }
+        n
+    }
+}
+
+#[derive(Default, Copy, Clone)]
+struct Totals {
     count: u64,
     id_sum: u64,
+    name_bytes: u64,
+    note_bytes: u64,
+    distinct: u64,
     amount_sum: i64,
     amount_min: i64,
     amount_max: i64,
-    name_bytes: u64,
-    note_bytes: u64,
 }
 
-impl Default for CountryAgg {
+#[inline(always)]
+fn text_length(s: *const u8, e: *const u8, q: u32) -> u64 {
+    let raw = e as usize - s as usize;
+    if q > 0 {
+        (raw - (q as usize / 2 + 1)) as u64
+    } else {
+        raw as u64
+    }
+}
+
+const LAG: usize = 16;
+
+#[derive(Copy, Clone)]
+struct Pending {
+    name: *const u8,
+    len: u32,
+    country: u32,
+    probe: Probe,
+}
+
+impl Default for Pending {
     fn default() -> Self {
         Self {
-            count: 0,
-            id_sum: 0,
-            amount_sum: 0,
-            amount_min: i64::MAX,
-            amount_max: i64::MIN,
-            name_bytes: 0,
-            note_bytes: 0,
+            name: std::ptr::null(),
+            len: 0,
+            country: 0,
+            probe: Probe { slot: 0, tag: 0 },
         }
     }
 }
 
-fn format_cents(buf: &mut [u8], cents: i64, mut pos: usize) -> usize {
-    if cents == 0 {
-        buf[pos..pos + 4].copy_from_slice(b"0.00");
-        return pos + 4;
-    }
-    let ucents = if cents < 0 {
-        buf[pos] = b'-';
-        pos += 1;
-        (-cents) as u64
-    } else {
-        cents as u64
+#[derive(Copy, Clone, Default)]
+struct Mark {
+    country: u32,
+    id: u32,
+}
+
+unsafe fn parse_records(
+    mut p: *const u8,
+    end: *const u8,
+    file_end: *const u8,
+    country_of: *const u8,
+    regions: usize,
+    names: &NameTable,
+    seen: &NamesSeen,
+    totals: &mut [Totals; 256],
+) {
+    let mut pending = [Pending::default(); LAG];
+    let mut marks = [Mark::default(); LAG];
+    let mut n = 0u64;
+    let mut last = u64::MAX;
+
+    let advance = |n_val: u64,
+                   pending_arr: &[Pending; LAG],
+                   marks_arr: &mut [Mark; LAG],
+                   last_val: u64| {
+        let k = (n_val as usize) % LAG;
+        if n_val >= 2 * (LAG as u64) && n_val - 2 * (LAG as u64) < last_val {
+            seen.mark(marks_arr[k].country, marks_arr[k].id);
+        }
+        if n_val >= (LAG as u64) && n_val - (LAG as u64) < last_val {
+            let old = &pending_arr[k];
+            marks_arr[k] = Mark {
+                country: old.country,
+                id: names.id(old.name, old.len, Probe { slot: old.probe.slot, tag: old.probe.tag }),
+            };
+            seen.prefetch(marks_arr[k].country, marks_arr[k].id);
+        }
     };
-    let whole = ucents / 100;
-    let frac = ucents % 100;
-    pos = append_u64(buf, whole, pos);
-    buf[pos] = b'.';
-    pos += 1;
-    buf[pos] = b'0' + (frac / 10) as u8;
-    buf[pos + 1] = b'0' + (frac % 10) as u8;
-    pos + 2
-}
 
-fn append_u64(buf: &mut [u8], mut val: u64, mut pos: usize) -> usize {
-    if val == 0 {
-        buf[pos] = b'0';
-        return pos + 1;
-    }
-    let mut temp = [0u8; 24];
-    let mut len = 0;
-    while val > 0 {
-        temp[len] = b'0' + (val % 10) as u8;
-        val /= 10;
-        len += 1;
-    }
-    while len > 0 {
-        len -= 1;
-        buf[pos] = temp[len];
-        pos += 1;
-    }
-    pos
-}
+    let mut sep = Structure::new(p, file_end);
+    while p < end {
+        let f1 = sep.next();
+        let f2 = sep.next();
+        let f3 = sep.next();
+        let f4_at = sep.next().at;
+        let eol_at = sep.next().at;
 
-/// Process a chunk `data[from..to]` of records.csv.
-/// `is_first_chunk` means we need to skip the CSV header line.
-fn process_chunk(
-    data: &[u8],
-    from: usize,
-    to: usize,
-    region_to_country: &[u8],
-    num_countries: usize,
-    is_first_chunk: bool,
-) -> (Vec<CountryAgg>, DistinctNameTable) {
-    let mut aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
-    let mut distinct_table = DistinctNameTable::with_capacity(65_536);
-    let mut name_buf = Vec::with_capacity(256);
-
-    let mut pos = from;
-
-    if is_first_chunk {
-        // Skip optional BOM.
-        if pos + 3 <= to && data[pos..pos + 3] == [0xEF, 0xBB, 0xBF] {
-            pos += 3;
+        if *p == 0xEF {
+            p = p.add(3);
         }
-        // Skip header line.
-        while pos < to && data[pos] != b'\n' {
-            pos += 1;
-        }
-        if pos < to {
-            pos += 1;
-        }
-    }
-
-    while pos < to {
-        if data[pos] == b'\r' || data[pos] == b'\n' {
-            pos += 1;
-            continue;
-        }
-        // Optional BOM at record boundary.
-        if pos + 3 <= to && data[pos..pos + 3] == [0xEF, 0xBB, 0xBF] {
-            pos += 3;
-            if pos >= to {
-                break;
-            }
-        }
-
-        // Field 1: id
-        let mut id = 0u64;
-        while pos < to && data[pos] >= b'0' && data[pos] <= b'9' {
-            id = id * 10 + (data[pos] - b'0') as u64;
-            pos += 1;
-        }
-        if pos < to && data[pos] == b',' {
-            pos += 1;
-        }
-
-        // Field 2: name (quoted or unquoted)
-        name_buf.clear();
-        if pos < to && data[pos] == b'"' {
-            pos += 1;
-            loop {
-                let end = pos + find_quote(&data[pos..to]);
-                name_buf.extend_from_slice(&data[pos..end]);
-                pos = end;
-                if pos >= to {
-                    break;
-                }
-                pos += 1; // skip the '"'
-                if pos < to && data[pos] == b'"' {
-                    name_buf.push(b'"'); // escaped quote
-                    pos += 1;
-                } else {
-                    break; // closing quote
-                }
-            }
+        let id = digits(p, f1.at);
+        let region = digits(f3.at.add(1), f4_at) as usize;
+        let amount = f4_at.add(1);
+        let amount_end = if *eol_at.sub(1) == b'\r' {
+            eol_at.sub(1)
         } else {
-            let start = pos;
-            while pos < to && data[pos] != b',' {
-                pos += 1;
-            }
-            name_buf.extend_from_slice(&data[start..pos]);
-        }
-        if pos < to && data[pos] == b',' {
-            pos += 1;
-        }
-
-        // Field 3: note (byte count only)
-        let mut note_len = 0u64;
-        if pos < to && data[pos] == b'"' {
-            pos += 1;
-            loop {
-                let end = pos + find_quote(&data[pos..to]);
-                note_len += (end - pos) as u64;
-                pos = end;
-                if pos >= to {
-                    break;
-                }
-                pos += 1;
-                if pos < to && data[pos] == b'"' {
-                    note_len += 1;
-                    pos += 1;
-                } else {
-                    break;
-                }
-            }
-        } else {
-            let start = pos;
-            while pos < to && data[pos] != b',' {
-                pos += 1;
-            }
-            note_len = (pos - start) as u64;
-        }
-        if pos < to && data[pos] == b',' {
-            pos += 1;
-        }
-
-        // Field 4: region_id
-        let mut region_id = 0usize;
-        while pos < to && data[pos] >= b'0' && data[pos] <= b'9' {
-            region_id = region_id * 10 + (data[pos] - b'0') as usize;
-            pos += 1;
-        }
-        if pos < to && data[pos] == b',' {
-            pos += 1;
-        }
-
-        // Field 5: amount (in cents)
-        let mut neg = false;
-        if pos < to && data[pos] == b'-' {
-            neg = true;
-            pos += 1;
-        }
-        let mut whole = 0i64;
-        while pos < to && data[pos] >= b'0' && data[pos] <= b'9' {
-            whole = whole * 10 + (data[pos] - b'0') as i64;
-            pos += 1;
-        }
-        let mut frac = 0i64;
-        if pos < to && data[pos] == b'.' {
-            pos += 1;
-            if pos < to && data[pos] >= b'0' && data[pos] <= b'9' {
-                frac = (data[pos] - b'0') as i64 * 10;
-                pos += 1;
-            }
-            if pos < to && data[pos] >= b'0' && data[pos] <= b'9' {
-                frac += (data[pos] - b'0') as i64;
-                pos += 1;
-            }
-        }
-        let mut cents = whole * 100 + frac;
-        if neg {
+            eol_at
+        };
+        let negative = *amount == b'-';
+        let amt_digits_start = if negative { amount.add(1) } else { amount };
+        let mut cents = (digits(amt_digits_start, amount_end.sub(3)) as i64) * 100
+            + (digits(amount_end.sub(2), amount_end) as i64);
+        if negative {
             cents = -cents;
         }
 
-        // Skip CRLF or LF.
-        if pos < to && data[pos] == b'\r' {
-            pos += 1;
-        }
-        if pos < to && data[pos] == b'\n' {
-            pos += 1;
-        }
-
-        // Country lookup.
-        let country_id = if region_id < region_to_country.len() {
-            region_to_country[region_id] as usize
+        let c = if region < regions {
+            *country_of.add(region) as usize
         } else {
             0
         };
+        let t = &mut totals[c];
+        t.count += 1;
+        t.id_sum += id;
+        t.amount_sum += cents;
+        t.amount_min = t.amount_min.min(cents);
+        t.amount_max = t.amount_max.max(cents);
+        let name_quotes = (f2.quotes - f1.quotes) as u32;
+        t.name_bytes += text_length(f1.at.add(1), f2.at, name_quotes);
+        t.note_bytes += text_length(f2.at.add(1), f3.at, (f3.quotes - f2.quotes) as u32);
+        let quoted = if name_quotes != 0 { 1 } else { 0 };
 
-        let target = &mut aggs[country_id];
-        target.count += 1;
-        target.id_sum += id;
-        target.amount_sum += cents;
-        if cents < target.amount_min {
-            target.amount_min = cents;
-        }
-        if cents > target.amount_max {
-            target.amount_max = cents;
-        }
-        target.name_bytes += name_buf.len() as u64;
-        target.note_bytes += note_len;
+        advance(n, &pending, &mut marks, last);
 
-        distinct_table.insert_if_absent(country_id as u8, &name_buf);
+        let k = (n as usize) % LAG;
+        let name_ptr = f1.at.add(1 + quoted);
+        let name_len = (f2.at as usize - f1.at as usize - 1 - 2 * quoted) as u32;
+        let probe = names.probe(name_ptr, name_len);
+        pending[k] = Pending {
+            name: name_ptr,
+            len: name_len,
+            country: c as u32,
+            probe,
+        };
+
+        p = eol_at.add(1);
+        n += 1;
     }
+    last = n;
+    while n < last + 2 * (LAG as u64) {
+        advance(n, &pending, &mut marks, last);
+        n += 1;
+    }
+}
 
-    (aggs, distinct_table)
+#[inline(always)]
+unsafe fn country_code(p: *const u8) -> u32 {
+    ((*p as u32 - 'A' as u32) << 10)
+        | ((*p.add(1) as u32 - 'A' as u32) << 5)
+        | (*p.add(2) as u32 - 'A' as u32)
+}
+
+fn split_delim(
+    data: *const u8,
+    from: usize,
+    size: usize,
+    n: usize,
+    delim: &[u8],
+) -> Vec<usize> {
+    let mut cut = vec![size; n + 1];
+    cut[0] = from;
+    for t in 1..n {
+        let approx = cut[t - 1].max(from + (size - from) * t / n);
+        let mut hit = None;
+        let mut p = approx;
+        while p + delim.len() <= size {
+            unsafe {
+                if *data.add(p) == delim[0] && (delim.len() == 1 || *data.add(p + 1) == delim[1]) {
+                    hit = Some(p);
+                    break;
+                }
+            }
+            p += 1;
+        }
+        cut[t] = if let Some(h) = hit {
+            h + delim.len()
+        } else {
+            size
+        };
+    }
+    cut
+}
+
+fn put_money(out: &mut String, cents: i64) {
+    let a = if cents < 0 { (-cents) as u64 } else { cents as u64 };
+    if cents < 0 {
+        out.push_str(" -");
+    } else {
+        out.push(' ');
+    }
+    out.push_str(&(a / 100).to_string());
+    out.push('.');
+    out.push((b'0' + ((a % 100) / 10) as u8) as char);
+    out.push((b'0' + (a % 10) as u8) as char);
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    unsafe {
+        prctl(14, 1, 0, 0, 0); // PR_SET_THP_DISABLE = 14
+    }
+
     let mut data_dir = PathBuf::from("/data");
     let mut out_dir = PathBuf::from("/out");
 
@@ -398,249 +590,256 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let regions_path = data_dir.join("regions.csv");
     let out_path = out_dir.join("aggregates.txt");
 
+    std::fs::create_dir_all(&out_dir).ok();
+
     if !records_path.exists() || !regions_path.exists() {
         File::create(&out_path)?;
         return Ok(());
     }
 
-    // 1. Load regions.csv (small; single-threaded).
-    let mut regions_file = File::open(&regions_path)?;
-    let reg_len = regions_file.metadata()?.len() as usize;
-    let mut regions_bytes = Vec::with_capacity(reg_len + 8);
-    regions_file.read_to_end(&mut regions_bytes)?;
+    let regions_file = File::open(&regions_path)?;
+    let records_file = File::open(&records_path)?;
 
-    let mut region_to_country = vec![0u8; 10_000_000];
-    let mut country_names: Vec<String> = vec!["_UNMATCHED".to_string()];
+    let (regions, rsize) = unsafe { map_file(&regions_file) };
+    let (records, size) = unsafe { map_file(&records_file) };
 
-    let mut rpos = 0;
-    while rpos < regions_bytes.len() && regions_bytes[rpos] != b'\n' {
-        rpos += 1;
-    }
-    if rpos < regions_bytes.len() {
-        rpos += 1;
-    }
-    while rpos < regions_bytes.len() {
-        if regions_bytes[rpos] == b'\r' || regions_bytes[rpos] == b'\n' {
-            rpos += 1;
-            continue;
+    let nthreads = 12;
+
+    // Find last line in regions
+    let nregions = unsafe {
+        let mut last = rsize.saturating_sub(1);
+        while last > 0 && *regions.add(last) != b'\n' {
+            last -= 1;
         }
-        let mut reg_id = 0usize;
-        while rpos < regions_bytes.len()
-            && regions_bytes[rpos] >= b'0'
-            && regions_bytes[rpos] <= b'9'
-        {
-            reg_id = reg_id * 10 + (regions_bytes[rpos] - b'0') as usize;
-            rpos += 1;
+        let mut ptr = regions.add(last + 1);
+        let end = regions.add(rsize);
+        while ptr < end && (*ptr < b'0' || *ptr > b'9') {
+            ptr = ptr.add(1);
         }
-        if rpos < regions_bytes.len() && regions_bytes[rpos] == b',' {
-            rpos += 1;
+        let mut val = 0usize;
+        while ptr < end && *ptr >= b'0' && *ptr <= b'9' {
+            val = val * 10 + (*ptr - b'0') as usize;
+            ptr = ptr.add(1);
         }
-        let code_start = rpos;
-        while rpos < regions_bytes.len()
-            && regions_bytes[rpos] >= b'A'
-            && regions_bytes[rpos] <= b'Z'
-        {
-            rpos += 1;
-        }
-        let code_bytes = &regions_bytes[code_start..rpos];
-        let code_str = std::str::from_utf8(code_bytes)?.to_string();
-        let country_id = match country_names.iter().position(|c| c == &code_str) {
-            Some(idx) => idx as u8,
-            None => {
-                country_names.push(code_str);
-                (country_names.len() - 1) as u8
-            }
-        };
-        if reg_id < region_to_country.len() {
-            region_to_country[reg_id] = country_id;
-        }
-        while rpos < regions_bytes.len() && regions_bytes[rpos] != b'\n' {
-            rpos += 1;
-        }
-        if rpos < regions_bytes.len() {
-            rpos += 1;
-        }
-    }
-    drop(regions_bytes);
+        val + 1
+    };
 
-    let num_countries = country_names.len();
+    let country_of = unsafe { zeroed::<u8>(nregions) };
 
-    // 2. Load records.csv into memory and split across threads.
-    //    The generator never writes CR inside quoted fields, so every '\n' is
-    //    a safe record boundary when treated as a split point.
-    let mut records_file = File::open(&records_path)?;
-    let file_size = records_file.metadata()?.len() as usize;
-    let mut file_data = Vec::with_capacity(file_size + 1);
-    records_file.read_to_end(&mut file_data)?;
-    drop(records_file);
-
-    let num_threads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(6)
-        .min(12)
-        .max(1);
-
-    // Find chunk boundaries aligned to CRLF positions.
-    // The generator never writes CR inside quoted fields, so every "\r\n"
-    // marks the end of a complete record.
-    let mut boundaries = Vec::with_capacity(num_threads + 1);
-    boundaries.push(0usize);
-    for t in 1..num_threads {
-        let approx = t * file_size / num_threads;
-        let mut bp = approx.max(boundaries[t - 1]);
-        while bp + 1 < file_size && !(file_data[bp] == b'\r' && file_data[bp + 1] == b'\n') {
-            bp += 1;
-        }
-        if bp + 1 < file_size {
-            boundaries.push(bp + 2); // start right after "\r\n"
-        } else {
-            boundaries.push(file_size);
-        }
-    }
-    boundaries.push(file_size);
-
-    let file_data = Arc::new(file_data);
-    let region_to_country = Arc::new(region_to_country);
-
-    let mut handles = Vec::with_capacity(num_threads);
-    for t in 0..num_threads {
-        let from = boundaries[t];
-        let to = boundaries[t + 1];
-        if from >= to {
-            continue;
-        }
-        let data = Arc::clone(&file_data);
-        let rtc = Arc::clone(&region_to_country);
-        let is_first = t == 0;
-        handles.push(thread::spawn(move || {
-            process_chunk(&data, from, to, &rtc, num_countries, is_first)
-        }));
-    }
-
-    let mut thread_results: Vec<(Vec<CountryAgg>, DistinctNameTable)> = Vec::new();
-    for h in handles {
-        thread_results.push(h.join().expect("Worker thread panicked"));
-    }
-    drop(file_data);
-    drop(region_to_country);
-
-    // 3. Merge numeric aggregates.
-    let mut aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
-    for (thread_aggs, _) in &thread_results {
-        for (k, ta) in thread_aggs.iter().enumerate() {
-            let a = &mut aggs[k];
-            a.count += ta.count;
-            a.id_sum += ta.id_sum;
-            a.amount_sum += ta.amount_sum;
-            if ta.count > 0 && ta.amount_min < a.amount_min {
-                a.amount_min = ta.amount_min;
-            }
-            if ta.count > 0 && ta.amount_max > a.amount_max {
-                a.amount_max = ta.amount_max;
-            }
-            a.name_bytes += ta.name_bytes;
-            a.note_bytes += ta.note_bytes;
-        }
-    }
-
-    // 4. Merge distinct-name tables: global deduplication via a second pass.
-    //    Each thread saw its chunk; the same (country_id, name) can appear in
-    //    multiple threads. We insert into a global table to count unique pairs.
-    let mut global_distinct = DistinctNameTable::with_capacity(262_144);
-    let mut distinct_counts: Vec<u64> = vec![0u64; num_countries];
-    for (_, local_table) in &thread_results {
-        for (cid, name) in local_table.iter_items() {
-            if global_distinct.insert_if_absent(cid, name) {
-                distinct_counts[cid as usize] += 1;
-            }
-        }
-    }
-    drop(thread_results);
-    drop(global_distinct);
-
-    // 5. Sort and write output.
-    let mut order: Vec<usize> = (0..num_countries)
-        .filter(|&k| aggs[k].count > 0)
-        .collect();
-    order.sort_unstable_by(|&a, &b| country_names[a].cmp(&country_names[b]));
-
-    std::fs::create_dir_all(&out_dir).ok();
-    let mut writer = BufWriter::with_capacity(1024 * 1024, File::create(&out_path)?);
-    let mut line_buf = [0u8; 512];
-
-    for idx in order {
-        let code = country_names[idx].as_bytes();
-        let item = &aggs[idx];
-
+    // Header end
+    let r_header_end = unsafe {
         let mut p = 0;
-        line_buf[p..p + code.len()].copy_from_slice(code);
-        p += code.len();
-        line_buf[p] = b' ';
-        p += 1;
+        while p < rsize && *regions.add(p) != b'\n' {
+            p += 1;
+        }
+        (p + 1).min(rsize)
+    };
+    let rcut = split_delim(regions, r_header_end, rsize, nthreads, b"\n");
 
-        p = append_u64(&mut line_buf, item.count, p);
-        line_buf[p] = b' ';
-        p += 1;
+    let present: Vec<AtomicU8> = (0..(1 << 15)).map(|_| AtomicU8::new(0)).collect();
+    let index_of = [0u8; 1 << 15];
+    let codes = Vec::new();
 
-        p = append_u64(&mut line_buf, item.id_sum, p);
-        line_buf[p] = b' ';
-        p += 1;
+    // Barrier for country index computation
+    let barrier1 = Barrier::new(nthreads);
+    let barrier2 = Barrier::new(nthreads);
+    let barrier3 = Barrier::new(nthreads);
 
-        p = format_cents(&mut line_buf, item.amount_sum, p);
-        line_buf[p] = b' ';
-        p += 1;
+    let rec_header_end = unsafe {
+        let mut p = 0;
+        while p < size && *records.add(p) != b'\n' {
+            p += 1;
+        }
+        (p + 1).min(size)
+    };
+    let cut = split_delim(records, rec_header_end, size, nthreads, b"\r\n");
 
-        p = format_cents(&mut line_buf, item.amount_min, p);
-        line_buf[p] = b' ';
-        p += 1;
+    let mut totals = vec![[Totals::default(); 256]; nthreads];
+    let names = NameTable::new();
+    let seen = NamesSeen::new();
 
-        p = format_cents(&mut line_buf, item.amount_max, p);
-        line_buf[p] = b' ';
-        p += 1;
+    let present_ref = &present;
+    let codes_box = std::sync::Mutex::new(codes);
+    let index_of_box = std::sync::Mutex::new(index_of);
 
-        p = append_u64(&mut line_buf, distinct_counts[idx], p);
-        line_buf[p] = b' ';
-        p += 1;
+    let regions_send = SendPtr(regions as *mut u8);
+    let records_send = SendPtr(records as *mut u8);
+    let country_of_send = SendPtr(country_of);
 
-        p = append_u64(&mut line_buf, item.name_bytes, p);
-        line_buf[p] = b' ';
-        p += 1;
+    let rcut_ref = &rcut;
+    let cut_ref = &cut;
 
-        p = append_u64(&mut line_buf, item.note_bytes, p);
-        line_buf[p] = b'\n';
-        p += 1;
+    thread::scope(|s| {
+        for (t, totals_t) in totals.iter_mut().enumerate() {
+            let b1 = &barrier1;
+            let b2 = &barrier2;
+            let b3 = &barrier3;
+            let codes_m = &codes_box;
+            let index_of_m = &index_of_box;
+            let names_ref = &names;
+            let seen_ref = &seen;
+            let r_ptr = regions_send;
+            let rec_ptr = records_send;
+            let c_of_ptr = country_of_send;
 
-        writer.write_all(&line_buf[..p])?;
-    }
-    writer.flush()?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn quote_scan_covers_unaligned_inputs_and_vector_tails() {
-        for padding in 0..32 {
-            for len in 0..129 {
-                let mut bytes = vec![b'x'; padding + len];
-                assert_eq!(find_quote(&bytes[padding..]), len);
-                for at in 0..len {
-                    bytes[padding + at] = b'"';
-                    assert_eq!(find_quote(&bytes[padding..]), at);
-                    bytes[padding + at] = b'x';
+            s.spawn(move || unsafe {
+                let from = r_ptr.as_ptr().add(rcut_ref[t]);
+                let to = r_ptr.as_ptr().add(rcut_ref[t + 1]);
+                let mut p = from;
+                while p < to {
+                    let mut comma = p;
+                    while comma < to && *comma != b',' {
+                        comma = comma.add(1);
+                    }
+                    if comma < to {
+                        present_ref[country_code(comma.add(1)) as usize]
+                            .store(1, Ordering::Relaxed);
+                    }
+                    while p < to && *p != b'\n' {
+                        p = p.add(1);
+                    }
+                    if p < to {
+                        p = p.add(1);
+                    }
                 }
-            }
+
+                b1.wait();
+
+                if t == 0 {
+                    let mut c_vec = codes_m.lock().unwrap();
+                    let mut idx_arr = index_of_m.lock().unwrap();
+                    for k in 0..present_ref.len() {
+                        if present_ref[k].load(Ordering::Relaxed) != 0 {
+                            c_vec.push(k as u32);
+                            idx_arr[k] = c_vec.len() as u8;
+                        }
+                    }
+                }
+
+                b2.wait();
+
+                // Build direct country_of table for thread's slice
+                let idx_arr = index_of_m.lock().unwrap();
+                let mut q = from;
+                while q < to {
+                    let mut comma = q;
+                    while comma < to && *comma != b',' {
+                        comma = comma.add(1);
+                    }
+                    if comma < to {
+                        let reg_ptr = q;
+                        let reg_id = digits(reg_ptr, comma) as usize;
+                        if reg_id < nregions {
+                            *c_of_ptr.as_mut_ptr().add(reg_id) = idx_arr[country_code(comma.add(1)) as usize];
+                        }
+                    }
+                    while q < to && *q != b'\n' {
+                        q = q.add(1);
+                    }
+                    if q < to {
+                        q = q.add(1);
+                    }
+                }
+                drop(idx_arr);
+
+                b3.wait();
+
+                // Parse records in parallel
+                parse_records(
+                    rec_ptr.as_ptr().add(cut_ref[t]),
+                    rec_ptr.as_ptr().add(cut_ref[t + 1]),
+                    rec_ptr.as_ptr().add(size),
+                    c_of_ptr.as_ptr(),
+                    nregions,
+                    names_ref,
+                    seen_ref,
+                    totals_t,
+                );
+            });
+        }
+    });
+
+    let codes = codes_box.into_inner().unwrap();
+    let num_c = codes.len();
+
+    // Count distinct per country
+    for c in 0..=num_c {
+        let d = unsafe { seen.count(c as u32) };
+        totals[0][c].distinct = d;
+    }
+
+    // Unmap raw inputs
+    unsafe {
+        munmap(regions as *mut u8, rsize + 4096);
+        munmap(records as *mut u8, size + 4096);
+    }
+
+    // Merge totals across threads
+    let mut sum_totals = [Totals::default(); 256];
+    for t in 0..nthreads {
+        for c in 0..=num_c {
+            let src = &totals[t][c];
+            let dst = &mut sum_totals[c];
+            dst.count += src.count;
+            dst.id_sum += src.id_sum;
+            dst.name_bytes += src.name_bytes;
+            dst.note_bytes += src.note_bytes;
+            dst.amount_sum += src.amount_sum;
+            dst.amount_min = dst.amount_min.min(src.amount_min);
+            dst.amount_max = dst.amount_max.max(src.amount_max);
         }
     }
 
-    #[test]
-    fn distinct_table_collision_free_exact_bytes() {
-        let mut t = DistinctNameTable::with_capacity(64);
-        assert!(t.insert_if_absent(1, b"alice"));
-        assert!(!t.insert_if_absent(1, b"alice")); // same country + same name
-        assert!(t.insert_if_absent(2, b"alice")); // different country
-        assert!(t.insert_if_absent(1, b"Alice")); // different bytes (case-sensitive)
+    // Output formatted lines
+    let mut out = String::with_capacity(32768);
+    for idx in 0..num_c {
+        let c = idx + 1;
+        let t = &sum_totals[c];
+        if t.count == 0 {
+            continue;
+        }
+        let code_val = codes[idx];
+        out.push((b'A' + ((code_val >> 10) & 31) as u8) as char);
+        out.push((b'A' + ((code_val >> 5) & 31) as u8) as char);
+        out.push((b'A' + (code_val & 31) as u8) as char);
+        out.push(' ');
+        out.push_str(&t.count.to_string());
+        out.push(' ');
+        out.push_str(&t.id_sum.to_string());
+        put_money(&mut out, t.amount_sum);
+        put_money(&mut out, t.amount_min);
+        put_money(&mut out, t.amount_max);
+        out.push(' ');
+        out.push_str(&totals[0][c].distinct.to_string());
+        out.push(' ');
+        out.push_str(&t.name_bytes.to_string());
+        out.push(' ');
+        out.push_str(&t.note_bytes.to_string());
+        out.push('\n');
     }
+
+    // Unmatched
+    let un_t = &sum_totals[0];
+    if un_t.count > 0 {
+        out.push_str("_UNMATCHED ");
+        out.push_str(&un_t.count.to_string());
+        out.push(' ');
+        out.push_str(&un_t.id_sum.to_string());
+        put_money(&mut out, un_t.amount_sum);
+        put_money(&mut out, un_t.amount_min);
+        put_money(&mut out, un_t.amount_max);
+        out.push(' ');
+        out.push_str(&totals[0][0].distinct.to_string());
+        out.push(' ');
+        out.push_str(&un_t.name_bytes.to_string());
+        out.push(' ');
+        out.push_str(&un_t.note_bytes.to_string());
+        out.push('\n');
+    }
+
+    let mut out_file = File::create(&out_path)?;
+    out_file.write_all(out.as_bytes())?;
+    out_file.flush()?;
+
+    Ok(())
 }
