@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
@@ -12,17 +10,51 @@ struct HeapItem {
     node: u32,
 }
 
-impl Ord for HeapItem {
-    #[inline(always)]
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.dist.cmp(&self.dist)
-    }
+// Dijkstra emits nondecreasing distance keys. Bucket by the highest
+// differing bit from the last popped key instead of comparing heap paths.
+struct RadixHeap {
+    buckets: [Vec<HeapItem>; 65],
+    last: u64,
+    len: usize,
 }
 
-impl PartialOrd for HeapItem {
-    #[inline(always)]
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+impl RadixHeap {
+    fn new() -> Self {
+        Self {
+            buckets: std::array::from_fn(|_| Vec::new()),
+            last: 0,
+            len: 0,
+        }
+    }
+    fn clear(&mut self) {
+        for bucket in &mut self.buckets {
+            bucket.clear();
+        }
+        self.last = 0;
+        self.len = 0;
+    }
+    fn push(&mut self, item: HeapItem) {
+        debug_assert!(item.dist >= self.last);
+        let bucket = (64 - (item.dist ^ self.last).leading_zeros()) as usize;
+        self.buckets[bucket].push(item);
+        self.len += 1;
+    }
+    fn pop(&mut self) -> Option<HeapItem> {
+        if self.len == 0 {
+            return None;
+        }
+        if self.buckets[0].is_empty() {
+            let i = (1..65).find(|&i| !self.buckets[i].is_empty()).unwrap();
+            let mut entries = std::mem::take(&mut self.buckets[i]);
+            self.last = entries.iter().map(|item| item.dist).min().unwrap();
+            for item in entries.drain(..) {
+                let bucket = (64 - (item.dist ^ self.last).leading_zeros()) as usize;
+                self.buckets[bucket].push(item);
+            }
+            self.buckets[i] = entries;
+        }
+        self.len -= 1;
+        self.buckets[0].pop()
     }
 }
 
@@ -161,7 +193,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let u = e.u as usize;
         let idx = cursor[u] as usize;
         cursor[u] += 1;
-        edges[idx] = EdgeTarget { to: e.v, weight: e.w };
+        edges[idx] = EdgeTarget {
+            to: e.v,
+            weight: e.w,
+        };
     }
     drop(cursor);
     drop(deg);
@@ -188,7 +223,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_queries = queries.len();
     let mut answers = vec![-1i64; num_queries];
 
-    const NUM_THREADS: usize = 6;
+    // The scoring box has 12 hardware threads (6 P-cores × 2); use all of them.
+    const NUM_THREADS: usize = 12;
     let query_counter = AtomicUsize::new(0);
 
     let offsets_ref = &offsets;
@@ -202,7 +238,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..NUM_THREADS {
             s.spawn(|| {
                 let ans_ptr = answers_ptr as *mut i64;
-                let mut heap = BinaryHeap::with_capacity(32768);
+                let mut heap = RadixHeap::new();
                 let mut visited_epoch = vec![0u32; n];
                 let mut dist = vec![0u64; n];
                 let mut cur_epoch = 0u32;
@@ -216,19 +252,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let (sq, tq) = queries_ref[q_idx];
 
                     if (sq as usize) >= n || (tq as usize) >= n {
-                        unsafe { *ans_ptr.add(q_idx) = -1; }
+                        unsafe {
+                            *ans_ptr.add(q_idx) = -1;
+                        }
                         continue;
                     }
                     if sq == tq {
-                        unsafe { *ans_ptr.add(q_idx) = 0; }
+                        unsafe {
+                            *ans_ptr.add(q_idx) = 0;
+                        }
                         continue;
                     }
                     if offsets_ref[sq as usize] == offsets_ref[sq as usize + 1] {
-                        unsafe { *ans_ptr.add(q_idx) = -1; }
+                        unsafe {
+                            *ans_ptr.add(q_idx) = -1;
+                        }
                         continue;
                     }
                     if !has_in_ref[tq as usize] {
-                        unsafe { *ans_ptr.add(q_idx) = -1; }
+                        unsafe {
+                            *ans_ptr.add(q_idx) = -1;
+                        }
                         continue;
                     }
 
@@ -288,4 +332,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     writer.flush()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radix_heap_matches_comparison_heap_with_monotone_insertions() {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut radix = RadixHeap::new();
+        let mut reference = BinaryHeap::new();
+        let mut rng = 42u64;
+        for round in 0..3 {
+            radix.clear();
+            reference.clear();
+            for key in [0, 0, 1, 255, 256, u32::MAX as u64, u64::MAX] {
+                radix.push(HeapItem { dist: key, node: 0 });
+                reference.push(Reverse(key));
+            }
+            for _ in 0..2000 {
+                let expected = reference.pop().unwrap().0;
+                assert_eq!(radix.pop().unwrap().dist, expected);
+                for _ in 0..2 {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let key = expected.saturating_add(rng % 1024);
+                    radix.push(HeapItem {
+                        dist: key,
+                        node: round,
+                    });
+                    reference.push(Reverse(key));
+                }
+            }
+            while let Some(Reverse(expected)) = reference.pop() {
+                assert_eq!(radix.pop().unwrap().dist, expected);
+            }
+            assert!(radix.pop().is_none());
+        }
+    }
 }

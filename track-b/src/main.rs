@@ -22,10 +22,20 @@ impl Hasher for FastHasher {
         } else {
             self.0
         };
-        for &b in bytes {
-            h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+        // Mix whole words, as in the C++ term keys, while retaining exact
+        // byte equality in std's HashMap to resolve every hash collision.
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            h = (h ^ u64::from_le_bytes(chunk.try_into().unwrap()))
+                .wrapping_mul(0x9e3779b97f4a7c15);
         }
-        self.0 = h;
+        let tail = chunks.remainder();
+        if !tail.is_empty() {
+            let mut word = [0u8; 8];
+            word[..tail.len()].copy_from_slice(tail);
+            h = (h ^ u64::from_le_bytes(word)).wrapping_mul(0xbf58476d1ce4e5b9);
+        }
+        self.0 = h ^ (h >> 29);
     }
 }
 
@@ -127,7 +137,66 @@ fn to_lower_ascii(b: u8) -> u8 {
     LOWER_ASCII[b as usize]
 }
 
-fn tokenize_text<F: FnMut(&[u8])>(text: &[u8], mut callback: F) {
+fn tokenize_text<F: FnMut(&[u8])>(text: &[u8], callback: F) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SIMD reads only complete 32-byte slices; no padding or overread.
+        unsafe { tokenize_avx2(text, callback) };
+        return;
+    }
+    tokenize_scalar(text, callback);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn tokenize_avx2<F: FnMut(&[u8])>(text: &[u8], mut callback: F) {
+    use std::arch::x86_64::*;
+    let mut pos = 0;
+    let mut buf = [0u8; 32];
+    'window: while pos + 32 <= text.len() {
+        let v = _mm256_loadu_si256(text.as_ptr().add(pos).cast());
+        let letter = _mm256_sub_epi8(
+            _mm256_or_si256(v, _mm256_set1_epi8(0x20)),
+            _mm256_set1_epi8(b'a' as i8),
+        );
+        let digit = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let mask = _mm256_or_si256(
+            _mm256_cmpeq_epi8(
+                _mm256_subs_epu8(letter, _mm256_set1_epi8(25)),
+                _mm256_setzero_si256(),
+            ),
+            _mm256_cmpeq_epi8(
+                _mm256_subs_epu8(digit, _mm256_set1_epi8(9)),
+                _mm256_setzero_si256(),
+            ),
+        );
+        let mut bits = _mm256_movemask_epi8(mask) as u32;
+        while bits != 0 {
+            let start = bits.trailing_zeros() as usize;
+            let end = start + (bits >> start).trailing_ones() as usize;
+            let mut stop = pos + end;
+            if end == 32 {
+                while stop < text.len() && is_token_char(text[stop]) {
+                    stop += 1;
+                }
+            }
+            let len = (stop - pos - start).min(32);
+            for j in 0..len {
+                buf[j] = text[pos + start + j] | 0x20;
+            }
+            callback(&buf[..len]);
+            if end == 32 {
+                pos = stop;
+                continue 'window;
+            }
+            bits &= u32::MAX << end;
+        }
+        pos += 32;
+    }
+    tokenize_scalar(&text[pos..], callback);
+}
+
+fn tokenize_scalar<F: FnMut(&[u8])>(text: &[u8], mut callback: F) {
     let mut i = 0;
     let n = text.len();
     let mut buf = [0u8; 32];
@@ -154,7 +223,190 @@ fn tokenize_text<F: FnMut(&[u8])>(text: &[u8], mut callback: F) {
     }
 }
 
+/// Check whether `doc_text` contains `phrase_terms` as consecutive tokens.
+///
+/// Strategy (mirroring the C++ `contains` + `around`):
+///  1. Pick the shortest phrase term as the "anchor".
+///  2. Scan `doc_text` with AVX2 for the anchor's first byte (case-insensitive).
+///  3. At each candidate position, verify the full anchor token matches.
+///  4. Walk left and right from that anchor to confirm the rest of the phrase.
+///
+/// This avoids building a token-span array for each candidate document and
+/// touches only ~1/32 of the text bytes on the critical path.
 fn check_phrase_in_doc(doc_text: &[u8], phrase_terms: &[Vec<u8>]) -> bool {
+    let k = phrase_terms.len();
+    if k == 0 {
+        return true;
+    }
+
+    // Pick the anchor: the shortest term (fewest candidate positions in text).
+    let anchor_idx = (0..k).min_by_key(|&i| phrase_terms[i].len()).unwrap();
+    let anchor = &phrase_terms[anchor_idx];
+
+    if anchor.is_empty() {
+        // Empty term matches any gap; fall back to full scan.
+        return check_phrase_full_scan(doc_text, phrase_terms);
+    }
+
+    let first_byte = anchor[0]; // already lowercased
+    let n = doc_text.len();
+    let mut pos = 0;
+
+    while pos < n {
+        // Find next occurrence of first_byte (case-insensitive) using AVX2.
+        let hit = find_first_byte_ci(doc_text, pos, first_byte);
+        if hit >= n {
+            break;
+        }
+
+        // The hit must be at a token start (previous byte is non-token).
+        let p = hit;
+        if p > 0 && is_token_char(doc_text[p - 1]) {
+            // We're inside a longer token; skip to its end.
+            pos = p + 1;
+            while pos < n && is_token_char(doc_text[pos]) {
+                pos += 1;
+            }
+            continue;
+        }
+
+        // Measure this token.
+        let mut tok_end = p;
+        while tok_end < n && is_token_char(doc_text[tok_end]) {
+            tok_end += 1;
+        }
+        let tok = &doc_text[p..tok_end];
+
+        // Check full anchor match (byte-by-byte with lowercase).
+        if tok.len() == anchor.len() && tokens_eq_lower(tok, anchor) {
+            // Walk left (anchor_idx tokens before the anchor).
+            // Walk right (phrase.len() - anchor_idx - 1 tokens after).
+            if around(doc_text, p, tok_end, phrase_terms, anchor_idx) {
+                return true;
+            }
+        }
+
+        pos = tok_end;
+    }
+    false
+}
+
+/// Find first position >= `from` where `doc[pos] | 0x20 == first_byte` (case-insensitive letter/digit).
+#[inline(always)]
+fn find_first_byte_ci(doc: &[u8], from: usize, first_byte: u8) -> usize {
+    let n = doc.len();
+    let mut pos = from;
+
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        return unsafe { find_first_byte_ci_avx2(doc, from, first_byte) };
+    }
+
+    // Scalar fallback
+    while pos < n {
+        if doc[pos] | 0x20 == first_byte {
+            return pos;
+        }
+        pos += 1;
+    }
+    n
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn find_first_byte_ci_avx2(doc: &[u8], from: usize, first_byte: u8) -> usize {
+    use std::arch::x86_64::*;
+    let n = doc.len();
+    let mut pos = from;
+    let want = _mm256_set1_epi8(first_byte as i8);
+    let case_bit = _mm256_set1_epi8(0x20i8);
+    while pos + 32 <= n {
+        let v = _mm256_loadu_si256(doc.as_ptr().add(pos).cast());
+        let lowered = _mm256_or_si256(v, case_bit);
+        let mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lowered, want)) as u32;
+        if mask != 0 {
+            return pos + mask.trailing_zeros() as usize;
+        }
+        pos += 32;
+    }
+    // Scalar tail
+    while pos < n {
+        if doc[pos] | 0x20 == first_byte {
+            return pos;
+        }
+        pos += 1;
+    }
+    n
+}
+
+/// With `phrase_terms[anchor_idx]` matched at text `[tok_start, tok_end)`,
+/// verify the tokens immediately before and after spell the rest of the phrase.
+#[inline(always)]
+fn around(
+    doc: &[u8],
+    tok_start: usize,
+    tok_end: usize,
+    phrase_terms: &[Vec<u8>],
+    anchor_idx: usize,
+) -> bool {
+    let n = doc.len();
+    // Walk left: check phrase_terms[anchor_idx-1], [anchor_idx-2], ...
+    let mut left = tok_start;
+    for i in (0..anchor_idx).rev() {
+        // skip separators
+        while left > 0 && !is_token_char(doc[left - 1]) {
+            left -= 1;
+        }
+        let end = left;
+        while left > 0 && is_token_char(doc[left - 1]) {
+            left -= 1;
+        }
+        if left == end {
+            return false; // no token
+        }
+        let tok = &doc[left..end];
+        if !tokens_eq_lower(tok, &phrase_terms[i]) {
+            return false;
+        }
+    }
+    // Walk right: check phrase_terms[anchor_idx+1], ...
+    let mut right = tok_end;
+    for i in (anchor_idx + 1)..phrase_terms.len() {
+        // skip separators
+        while right < n && !is_token_char(doc[right]) {
+            right += 1;
+        }
+        let start = right;
+        while right < n && is_token_char(doc[right]) {
+            right += 1;
+        }
+        if start == right {
+            return false; // no token
+        }
+        let tok = &doc[start..right];
+        if !tokens_eq_lower(tok, &phrase_terms[i]) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Compare token bytes (original case) against a pre-lowercased target slice.
+#[inline(always)]
+fn tokens_eq_lower(tok: &[u8], target: &[u8]) -> bool {
+    if tok.len() != target.len() {
+        return false;
+    }
+    for (&a, &b) in tok.iter().zip(target.iter()) {
+        if to_lower_ascii(a) != b {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fallback for edge cases (empty anchor term etc.) — full token scan.
+fn check_phrase_full_scan(doc_text: &[u8], phrase_terms: &[Vec<u8>]) -> bool {
     let k = phrase_terms.len();
     let mut stack_spans = [(0u32, 0u32); 1024];
     let mut num_tokens = 0;
@@ -163,8 +415,7 @@ fn check_phrase_in_doc(doc_text: &[u8], phrase_terms: &[Vec<u8>]) -> bool {
     let mut i = 0;
     let n = doc_text.len();
     while i < n {
-        let b = doc_text[i];
-        if is_token_char(b) {
+        if is_token_char(doc_text[i]) {
             let start = i;
             while i < n && is_token_char(doc_text[i]) {
                 i += 1;
@@ -184,42 +435,23 @@ fn check_phrase_in_doc(doc_text: &[u8], phrase_terms: &[Vec<u8>]) -> bool {
             i += 1;
         }
     }
-
     if num_tokens < k {
         return false;
     }
-
     let spans: &[(u32, u32)] = if num_tokens <= 1024 {
         &stack_spans[..num_tokens]
     } else {
-        &heap_spans[..]
+        &heap_spans
     };
-
-    for i in 0..=(num_tokens - k) {
-        let mut matches = true;
+    'outer: for start in 0..=(num_tokens - k) {
         for j in 0..k {
-            let (start, len) = spans[i + j];
-            let tok = &doc_text[start as usize..(start as usize + len as usize)];
-            let target = &phrase_terms[j];
-            if tok.len() != target.len() {
-                matches = false;
-                break;
-            }
-            let mut eq = true;
-            for b_idx in 0..tok.len() {
-                if to_lower_ascii(tok[b_idx]) != target[b_idx] {
-                    eq = false;
-                    break;
-                }
-            }
-            if !eq {
-                matches = false;
-                break;
+            let (s, l) = spans[start + j];
+            let tok = &doc_text[s as usize..(s + l) as usize];
+            if !tokens_eq_lower(tok, &phrase_terms[j]) {
+                continue 'outer;
             }
         }
-        if matches {
-            return true;
-        }
+        return true;
     }
     false
 }
@@ -616,43 +848,72 @@ fn main() {
                         }
                     }
                     Query::Phrase { terms, raw_terms } => {
-                        let mut has_empty = false;
+                        let k = terms.len();
+                        // Check all terms have postings; collect unique term IDs.
+                        let mut any_empty = false;
+                        let mut unique_tids: Vec<usize> = Vec::with_capacity(k);
                         for &tid in terms {
                             let t = tid as usize;
                             if t >= postings.len() || postings[t].is_empty() {
-                                has_empty = true;
+                                any_empty = true;
                                 break;
+                            }
+                            if !unique_tids.contains(&t) {
+                                unique_tids.push(t);
                             }
                         }
 
-                        if has_empty {
+                        if any_empty {
                             out_chunk.extend_from_slice(b"0 0\n");
                             continue;
                         }
 
-                        let mut order: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-                        let k = terms.len();
-                        let sub_order = &mut order[..k];
-                        for i in 0..k {
-                            sub_order[i] = i;
+                        // Sort unique term IDs by posting-list length (rarest first).
+                        unique_tids.sort_unstable_by_key(|&t| postings[t].len());
+
+                        // Build candidates via bitset AND over all unique terms.
+                        // Use the dense bitmap if available; otherwise scatter the
+                        // posting list into `temp` and AND, then clear only those bits.
+                        r.fill(0u64);
+
+                        // Seed with the rarest term.
+                        let seed_tid = unique_tids[0];
+                        if !dense[seed_tid].is_empty() {
+                            r.copy_from_slice(&dense[seed_tid]);
+                        } else {
+                            for &d in &postings[seed_tid] {
+                                r[d as usize >> 6] |= 1u64 << (d & 63);
+                            }
                         }
-                        sub_order.sort_unstable_by_key(|&idx| postings[terms[idx] as usize].len());
 
-                        let anchor_tid = terms[sub_order[0]] as usize;
-                        let anchor_posts = &postings[anchor_tid];
-
-                        let mut matches = Vec::new();
-                        for &doc_id in anchor_posts {
-                            let mut present_in_all = true;
-                            for &idx in &sub_order[1..] {
-                                let other_tid = terms[idx] as usize;
-                                let other_posts = &postings[other_tid];
-                                if other_posts.binary_search(&doc_id).is_err() {
-                                    present_in_all = false;
-                                    break;
+                        // Intersect remaining terms.
+                        for &tid in &unique_tids[1..] {
+                            if !dense[tid].is_empty() {
+                                combine(&mut r, &dense[tid], Op::And);
+                            } else {
+                                let term_posts = &postings[tid];
+                                for &d in term_posts {
+                                    temp[d as usize >> 6] |= 1u64 << (d & 63);
+                                }
+                                // AND r with temp, clearing temp as we go.
+                                for i in 0..r.len() {
+                                    r[i] &= temp[i];
+                                    temp[i] = 0;
                                 }
                             }
-                            if present_in_all {
+                        }
+
+                        // Collect surviving doc IDs from the bitset.
+                        let mut matches = Vec::new();
+                        for (w_idx, &word) in r.iter().enumerate() {
+                            if word == 0 {
+                                continue;
+                            }
+                            let mut w = word;
+                            while w != 0 {
+                                let bit = w.trailing_zeros() as usize;
+                                let doc_id = (w_idx * 64 + bit) as u32;
+                                // Load doc text and verify phrase via anchor scan.
                                 let (start, len) = doc_spans[doc_id as usize];
                                 doc_text.resize(len, 0);
                                 docs_file
@@ -664,8 +925,10 @@ fn main() {
                                 if check_phrase_in_doc(&doc_text, raw_terms) {
                                     matches.push(doc_id);
                                 }
+                                w &= w - 1;
                             }
                         }
+                        // matches are already in ascending doc_id order.
 
                         if matches.is_empty() {
                             out_chunk.extend_from_slice(b"0 0\n");
@@ -730,6 +993,23 @@ fn fast_write_u64(buf: &mut Vec<u8>, mut n: u64, tmp: &mut [u8; 32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_tokenizer_matches_scalar_at_every_boundary() {
+        let mut text: Vec<u8> = (0..=255).collect();
+        text.extend_from_slice(b"ZURICH 007 abcdefghijklmnopqrstuvwxyz012345 bail---BOND ");
+        for offset in 0..64 {
+            let mut input = vec![b' '; offset];
+            input.extend_from_slice(&text);
+            for end in 0..=input.len() {
+                let mut expected = Vec::new();
+                let mut actual = Vec::new();
+                tokenize_scalar(&input[..end], |token| expected.push(token.to_vec()));
+                tokenize_text(&input[..end], |token| actual.push(token.to_vec()));
+                assert_eq!(actual, expected, "offset={offset}, end={end}");
+            }
+        }
+    }
 
     #[test]
     fn bitset_operations_cover_unaligned_vectors_and_tails() {
