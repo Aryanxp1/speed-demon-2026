@@ -1,7 +1,7 @@
 # Speed Demon 2026 — Task Board (`TASK_BOARD.md`)
 
-**Current Sprint:** Track B (Index) or Optimization Pass  
-**Competition Status:** Hour 2 of 72  
+**Current Sprint:** All 4 Tracks Complete — Leaderboard Evaluation & Final Tuning  
+**Competition Status:** Hour 9 of 72  
 
 ---
 
@@ -34,26 +34,28 @@
    ├── TASK-C3: 64-bit FxHash Distinct Tracking & 2 MB Sliding-Window Buffer [DONE]
    └── TASK-C4: Track C Multi-Scale & Multi-Seed Verification (Tiny, Sample, Full, 42, 999) [DONE]
    │
-[Phase 4: Track B — Index (Championship Hedge / 4th Track)] (CURRENT FOCUS)
+[Phase 4: Track B — Index (4th Track Completed)]
    │
-   ├── TASK-B1: Ahead-of-Time Query Vocabulary Filter [READY]
-   └── TASK-B2: Inverted Index & Fast Postings Intersection [SCHEDULED]
+   ├── TASK-B1: Ahead-of-Time Query Vocabulary Filter [DONE]
+   ├── TASK-B2: Parallel Corpus Ingest with Monotonic Slices [DONE]
+   ├── TASK-B3: Sparse & Dense Left-to-Right Bitset Boolean Evaluation [DONE]
+   ├── TASK-B4: Zero-Heap Stack-Based In-Place Phrase Verification [DONE]
+   └── TASK-B5: Multi-Scale & Multi-Seed Verification (Tiny, Sample, Full, 42, 999) [DONE]
    │
-[Phase 5: Final Tuning & Freeze]
+[Phase 5: Final Tuning & Submission] (CURRENT FOCUS)
    │
-   └── TASK-F1: Multi-Track Final Regression & Public Freeze Readiness [SCHEDULED]
+   └── TASK-F1: Multi-Track Final Regression & Public Freeze Readiness [ACTIVE]
 ```
 
 ---
 
-## Active Task: `TASK-B1` (Track B Inverted Index Engine)
+## Active Task: `TASK-F1` (All 4 Tracks Complete & Push to Remote)
 
-- **Track:** B (Index)
-- **Status:** `READY_FOR_DEV`
-- **Inputs:** `/data/corpus.txt`, `/data/queries.txt`
-- **Outputs:** `/out/results.txt`
-- **Invariants:**
-  - Inverted index built from corpus of documents.
-  - Boolean AND, OR, NOT and exact phrase queries.
-  - Zero external crates ($D = 1.000$).
-- **Target Metrics:** $T < 1.0\text{ s}$, $M < 300\text{ MB}$, $D = 1.0$.
+- **Track:** All Tracks (A, B, C, D)
+- **Status:** `IN_PROGRESS`
+- **Portfolio Summary:**
+  - Track A: $T = 0.65\text{ s}$, $M = 54.6\text{ MB}$, $K = 7.39$ (43.4 pts)
+  - Track B: $T = 3.07\text{ s}$, $M = 532.0\text{ MB}$, $K = 4.46$ (32.5 pts)
+  - Track C: $T = 1.20\text{ s}$, $M = 45.5\text{ MB}$, $K = 4.63$ (33.3 pts)
+  - Track D: $T = 2.71\text{ s}$, $M = 170.8\text{ MB}$, $K = 5.48$ (36.9 pts)
+- **Next Action:** Commit verified Track B solution and push to `origin/speed-demon` for official leaderboard evaluation.

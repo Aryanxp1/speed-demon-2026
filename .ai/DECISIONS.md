@@ -152,3 +152,24 @@ This log records major architectural decisions, technical trade-offs, language s
   3. Streaming the file through a 2 MB sliding-window chunk buffer further plummeted peak RSS to **45.5 MB** ($8.08\times$ leaner than reference 367 MB) and improved wall time to **1.20 s** due to L3 cache residency.
 - **Decision:**
   Adopt 2 MB sliding-window streaming with direct 10 MB `region_to_country` lookup array, 64-bit FxHash distinct name tracking, and zero external dependencies.
+
+
+---
+
+## ADR-005: Track B Architecture — AOT Query Vocabulary Filter, Parallel Boundary Ingest, Left-to-Right Bitsets, and Ascending df Candidate Phrase Verification
+
+- **Status:** Accepted & Verified
+- **Date:** 2026-10-31
+- **Context:**
+  Track B (Index) requires indexing a 254 MB legal corpus (250,000 documents, 36M tokens) and answering 50,000 queries (31k boolean, 19k phrase) under a single measured wall clock timer. The Python reference consumes 56.35s and 2.20 GB RSS.
+- **Decision:**
+  1. **AOT Query Vocabulary Filtering:** Parse `queries.txt` before ingesting the corpus. Filter corpus tokens against an internal fast FNV-1a query term table (`FastHashMap`), ignoring >87% of non-queried corpus words during ingest.
+  2. **Parallel Ingest with Monotonic Slices:** Read `docs.txt` and divide across worker threads along newline boundaries. Each thread emits strictly ascending document IDs for observed query terms; merging across threads is a linear concatenation that produces sorted posting lists with zero sorting cost.
+  3. **Left-to-Right Boolean Evaluation:** Evaluated with dense 64-bit word bitsets (`[u64; words_count]`). For terms with document frequency $df < 256$, bit-set and bit-clear operations are performed directly in $O(df)$ time, bypassing 3,907-word loops.
+  4. **Ascending df Candidate Phrase Verification:** For each phrase query $t_1 \dots t_k$, sort terms by document frequency ascending and intersect against the rarest anchor term first, filtering candidates down to median 1 document. Verify candidate documents in-place using stack-allocated token window with zero heap allocations.
+- **Consequences:**
+  - Wall time dropped from 56.35s to **3.07s** (18.35x speedup).
+  - Peak memory dropped from 2,200 MB to **532 MB** (4.13x leaner).
+  - Unofficial local $K = 4.457$ (32.45 speed points).
+  - 100% byte-identical SHA-256 match across tiny, sample, full (`f86973c210...`), seed 42, and seed 999.
+  - Zero external runtime dependencies ($D = 1.000$).
