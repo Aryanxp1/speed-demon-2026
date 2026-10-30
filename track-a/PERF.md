@@ -2,13 +2,14 @@
 
 Every step from the reference to our optimized version, with measured metrics, architectural rationale, and verified SHA-256 correctness.
 
-| Step | Change | Run ID | T (s) | M (MB) | S (lines) | Local K | Machine Points |
+| Step | Change | Run ID / Context | T (s) | M (MB) | S (lines) | K | Points |
 |---|---|---|---|---|---|---|---|
-| **0** | The reference, unchanged (CPython 3.13) | `ref-fsn1` | 32.05 | 228.0 | 56 | 1.00 | 0.0 |
-| **1** | Single-threaded zero-dependency Rust baseline (`BufReader`, dynamic endpoint interner, bucket array) | `local-baseline` | 0.81 | 28.0 | 140 | 8.37 | 46.1 |
-| **2** | Full-file buffer ingest (`fs::read`). *Reverted/Adjusted*: Wall time improved slightly to 0.75s, but peak RSS increased to 260 MB (exceeding reference memory), causing the memory multiplier $(M_{\text{ref}}/M)^{0.20}$ to drop from 1.52 to 0.97 (-36% penalty). Replaced with streaming chunk buffer. | `local-exp-mmap` | 0.75 | 260.0 | 165 | 5.82 | 38.2 |
-| **3** | 6-thread parallel chunking with `std::thread::scope`, global mutex registry with thread-local read cache (zero lock contention on 99.9% of lines), nearest-rank `select_nth_unstable` percentile selection, and custom integer formatting. | `local-opt-v1` | 0.65 | 54.6 | 394 | 6.96 | 42.1 |
-| **4** | Architectural pruning & line consolidation: eliminated redundant integer formatters, unified numerical serializers, reduced code size from 394 to 263 lines (+11% gain on $S$ factor). 100% verified across tiny, sample, full, and holdout seeds (42, 999). | `local-opt-v2` | 0.65 | 54.6 | 263 | 7.39 | 43.4 |
+| **0** | Official scoring box Python reference | `calibration-seed1.json` | 32.05 | 228.0 | 56 | 1.000 | 0.00 |
+| **1** | Single-threaded zero-dependency Rust baseline (`BufReader`, dynamic endpoint interner, bucket array) | Unofficial local | 0.81 | 28.0 | 140 | 8.370 | 46.10 |
+| **2** | Full-file buffer ingest (`fs::read`). *Reverted/Adjusted*: Peak RSS increased to 260 MB, penalized memory score. Replaced with streaming chunk buffer. | Unofficial local | 0.75 | 260.0 | 165 | 5.820 | 38.20 |
+| **3** | 6-thread parallel chunking with `std::thread::scope`, global mutex registry with thread-local read cache, nearest-rank `select_nth_unstable`, and custom integer formatting. | Unofficial local | 0.65 | 54.6 | 394 | 6.960 | 42.10 |
+| **4** | Architectural pruning & line consolidation: eliminated redundant integer formatters, unified numerical serializers, reduced code size from 394 to 263 lines (+11% gain on $S$ factor). | Unofficial local | 0.65 | 54.6 | 263 | 7.390 | 43.40 |
+| **5** | **Official Board Submission (Baseline v1.0)**: Executed on official scoring machine (Intel Core i5-13500, pinned 12 threads, 8 GB RAM). 100% byte-identical SHA-256 match. | **Official Board Run** | **0.292** | **61.0** | **263** | **10.284873** | **50.610** |
 
 ---
 
@@ -41,3 +42,13 @@ Every step from the reference to our optimized version, with measured metrics, a
   - Consolidated duplicate integer serialization routines.
   - Verified edge cases and holdout generalization against seeds 1, 42, and 999 across tiny, sample, and full scales.
 - **Result:** Code lines reduced from 394 to 263 lines without performance loss. Local $K = 7.39$.
+
+### Step 5: Official Board Verification & Metrics
+- **Environment:** Dedicated official benchmark host (Intel i5-13500, 6 P-cores @ 2.5 GHz turbo off, 8 GB memory limit, Linux offline container).
+- **Official Result:**
+  - $T = \mathbf{0.292\text{ s}}$ ($109.8\times$ faster than 32.05s reference).
+  - $M = \mathbf{61.0\text{ MB}}$ ($3.74\times$ leaner than 228.0 MB reference).
+  - $K = \mathbf{10.284873}$.
+  - **Points Earned:** $\mathbf{50.610}$ machine points.
+- **Correctness:** 100% SHA-256 match on full public dataset (`495ca09682542a981a8ba214a1a659fb221ee54fe66d8ba609fca940aa415ef4`).
+

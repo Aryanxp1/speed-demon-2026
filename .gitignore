@@ -4,5 +4,8 @@ data/
 official-repo/
 official-starter/
 target/
+**/target/
+test_data/
 *.log
 *.log.txt
+

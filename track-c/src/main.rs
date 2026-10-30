@@ -1,17 +1,77 @@
-use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
 
-#[inline(always)]
-fn hash128(bytes: &[u8]) -> (u64, u64) {
-    let mut h1: u64 = 0x517cc1b727220a95;
-    let mut h2: u64 = 0x9e3779b97f4a7c15;
-    for &b in bytes {
-        h1 = (h1.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
-        h2 = (h2.rotate_left(7) ^ (b as u64)).wrapping_mul(0x9e3779b97f4a7c15);
+struct DistinctNameTable {
+    slots: Vec<u32>,
+    mask: usize,
+    arena: Vec<u8>,
+    items: Vec<(u8, u32, u16)>,
+}
+
+impl DistinctNameTable {
+    fn with_capacity(capacity_pow2: usize) -> Self {
+        Self {
+            slots: vec![0; capacity_pow2],
+            mask: capacity_pow2 - 1,
+            arena: Vec::with_capacity(2 * 1024 * 1024),
+            items: Vec::with_capacity(capacity_pow2 / 2),
+        }
     }
-    (h1, h2)
+
+    #[inline(always)]
+    fn insert_if_absent(&mut self, country_id: u8, name: &[u8]) -> bool {
+        let mut h: u64 = 0x517cc1b727220a95 ^ (country_id as u64);
+        for &b in name {
+            h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        }
+        let mut idx = (h as usize) & self.mask;
+        loop {
+            let slot = self.slots[idx];
+            if slot == 0 {
+                let offset = self.arena.len() as u32;
+                let len = name.len() as u16;
+                self.arena.extend_from_slice(name);
+                self.items.push((country_id, offset, len));
+                let item_idx = self.items.len() as u32;
+                self.slots[idx] = item_idx;
+                if self.items.len() * 2 > self.slots.len() {
+                    self.grow();
+                }
+                return true;
+            } else {
+                let item_idx = (slot - 1) as usize;
+                let (cid, off, len) = self.items[item_idx];
+                if cid == country_id && len as usize == name.len() {
+                    let existing = &self.arena[off as usize..(off as usize + len as usize)];
+                    if existing == name {
+                        return false;
+                    }
+                }
+                idx = (idx + 1) & self.mask;
+            }
+        }
+    }
+
+    fn grow(&mut self) {
+        let new_cap = self.slots.len() * 2;
+        let new_mask = new_cap - 1;
+        let mut new_slots = vec![0u32; new_cap];
+        for (i, &(cid, off, len)) in self.items.iter().enumerate() {
+            let name = &self.arena[off as usize..(off as usize + len as usize)];
+            let mut h: u64 = 0x517cc1b727220a95 ^ (cid as u64);
+            for &b in name {
+                h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+            }
+            let mut idx = (h as usize) & new_mask;
+            while new_slots[idx] != 0 {
+                idx = (idx + 1) & new_mask;
+            }
+            new_slots[idx] = (i + 1) as u32;
+        }
+        self.slots = new_slots;
+        self.mask = new_mask;
+    }
 }
 
 struct CountryAgg {
@@ -20,7 +80,7 @@ struct CountryAgg {
     amount_sum: i64,
     amount_min: i64,
     amount_max: i64,
-    names: HashSet<(u64, u64)>,
+    distinct_names: u64,
     name_bytes: u64,
     note_bytes: u64,
 }
@@ -33,7 +93,7 @@ impl Default for CountryAgg {
             amount_sum: 0,
             amount_min: i64::MAX,
             amount_max: i64::MIN,
-            names: HashSet::new(),
+            distinct_names: 0,
             name_bytes: 0,
             note_bytes: 0,
         }
@@ -206,6 +266,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut name_buf = Vec::with_capacity(256);
+    let mut distinct_table = DistinctNameTable::with_capacity(262_144);
 
     loop {
         // If close to buffer end and not EOF, slide remaining bytes to front and read more
@@ -356,8 +417,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target.name_bytes += name_buf.len() as u64;
         target.note_bytes += note_len;
 
-        let h128 = hash128(&name_buf);
-        target.names.insert(h128);
+        if distinct_table.insert_if_absent(country_id as u8, &name_buf) {
+            target.distinct_names += 1;
+        }
     }
 
     // 3. Collect and sort output groups by country code ascending
@@ -398,7 +460,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         line_buf[p] = b' ';
         p += 1;
 
-        p = append_u64(&mut line_buf, item.names.len() as u64, p);
+        p = append_u64(&mut line_buf, item.distinct_names, p);
         line_buf[p] = b' ';
         p += 1;
 

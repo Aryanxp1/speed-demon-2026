@@ -3,6 +3,7 @@ use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -26,7 +27,13 @@ impl PartialOrd for HeapItem {
 }
 
 #[derive(Copy, Clone)]
-struct Edge {
+struct EdgeTarget {
+    to: u32,
+    weight: u32,
+}
+
+#[derive(Copy, Clone)]
+struct RawEdge {
     u: u32,
     v: u32,
     w: u32,
@@ -104,6 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queries_path = data_dir.join("queries.txt");
     let out_path = out_dir.join("distances.txt");
 
+    std::fs::create_dir_all(&out_dir).ok();
+
     if !graph_path.exists() || !queries_path.exists() {
         File::create(&out_path)?;
         return Ok(());
@@ -129,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if u != v {
             deg[u as usize] += 1;
             has_in[v as usize] = true;
-            raw_edges.push(Edge { u, v, w });
+            raw_edges.push(RawEdge { u, v, w });
         }
     }
     drop(graph_bytes);
@@ -145,16 +154,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_valid = cur as usize;
 
     let mut cursor = offsets[..n].to_vec();
-    let mut edges_to = vec![0u32; total_valid];
-    let mut edges_weight = vec![0u32; total_valid];
+    let mut edges = vec![EdgeTarget { to: 0, weight: 0 }; total_valid];
 
-    // Fast in-memory scatter into CSR arrays
+    // Interleaved 8-byte edge targets in CSR array
     for e in raw_edges {
         let u = e.u as usize;
         let idx = cursor[u] as usize;
         cursor[u] += 1;
-        edges_to[idx] = e.v;
-        edges_weight[idx] = e.w;
+        edges[idx] = EdgeTarget { to: e.v, weight: e.w };
     }
     drop(cursor);
     drop(deg);
@@ -181,39 +188,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_queries = queries.len();
     let mut answers = vec![-1i64; num_queries];
 
-    // 3. Parallel query execution across 6 worker threads using Forward Dijkstra
     const NUM_THREADS: usize = 6;
-    let chunk_size = (num_queries + NUM_THREADS - 1) / NUM_THREADS;
+    let query_counter = AtomicUsize::new(0);
+
+    let offsets_ref = &offsets;
+    let edges_ref = &edges;
+    let has_in_ref = &has_in;
+    let queries_ref = &queries;
+
+    let answers_ptr = answers.as_mut_ptr() as usize;
 
     thread::scope(|s| {
-        for (t_idx, ans_chunk) in answers.chunks_mut(chunk_size).enumerate() {
-            let start_q = t_idx * chunk_size;
-            let q_slice = &queries[start_q..start_q + ans_chunk.len()];
-            let offsets_ref = &offsets;
-            let edges_to_ref = &edges_to;
-            let edges_weight_ref = &edges_weight;
-            let has_in_ref = &has_in;
-
-            s.spawn(move || {
+        for _ in 0..NUM_THREADS {
+            s.spawn(|| {
+                let ans_ptr = answers_ptr as *mut i64;
                 let mut heap = BinaryHeap::with_capacity(32768);
                 let mut visited_epoch = vec![0u32; n];
                 let mut dist = vec![0u64; n];
                 let mut cur_epoch = 0u32;
 
-                for (out_ans, &(sq, tq)) in ans_chunk.iter_mut().zip(q_slice) {
+                loop {
+                    let q_idx = query_counter.fetch_add(1, AtomicOrdering::Relaxed);
+                    if q_idx >= num_queries {
+                        break;
+                    }
+
+                    let (sq, tq) = queries_ref[q_idx];
+
+                    if (sq as usize) >= n || (tq as usize) >= n {
+                        unsafe { *ans_ptr.add(q_idx) = -1; }
+                        continue;
+                    }
                     if sq == tq {
-                        *out_ans = 0;
+                        unsafe { *ans_ptr.add(q_idx) = 0; }
                         continue;
                     }
                     if offsets_ref[sq as usize] == offsets_ref[sq as usize + 1] {
-                        *out_ans = -1;
+                        unsafe { *ans_ptr.add(q_idx) = -1; }
                         continue;
                     }
                     if !has_in_ref[tq as usize] {
-                        *out_ans = -1;
+                        unsafe { *ans_ptr.add(q_idx) = -1; }
                         continue;
                     }
 
+                    if cur_epoch == u32::MAX {
+                        visited_epoch.fill(0);
+                        cur_epoch = 0;
+                    }
                     cur_epoch += 1;
                     heap.clear();
 
@@ -234,10 +256,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         let start = offsets_ref[u_idx] as usize;
                         let end = offsets_ref[u_idx + 1] as usize;
-                        for e_idx in start..end {
-                            let v = edges_to_ref[e_idx];
+                        for edge in &edges_ref[start..end] {
+                            let v = edge.to;
                             let v_idx = v as usize;
-                            let nd = d + edges_weight_ref[e_idx] as u64;
+                            let nd = d + edge.weight as u64;
 
                             if visited_epoch[v_idx] != cur_epoch || nd < dist[v_idx] {
                                 dist[v_idx] = nd;
@@ -246,7 +268,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    *out_ans = found;
+
+                    unsafe {
+                        *ans_ptr.add(q_idx) = found;
+                    }
                 }
             });
         }

@@ -45,19 +45,44 @@ enum Query {
     },
 }
 
+const IS_TOKEN_CHAR: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        if (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') || (b >= b'A' && b <= b'Z') {
+            table[i] = true;
+        }
+        i += 1;
+    }
+    table
+};
+
+const LOWER_ASCII: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let b = i as u8;
+        if b >= b'A' && b <= b'Z' {
+            table[i] = b + 32;
+        } else {
+            table[i] = b;
+        }
+        i += 1;
+    }
+    table
+};
+
 #[inline(always)]
 fn is_token_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
+    IS_TOKEN_CHAR[b as usize]
 }
 
 #[inline(always)]
 fn to_lower_ascii(b: u8) -> u8 {
-    if b.is_ascii_uppercase() {
-        b + 32
-    } else {
-        b
-    }
+    LOWER_ASCII[b as usize]
 }
+
 
 fn tokenize_text<F: FnMut(&[u8])>(text: &[u8], mut callback: F) {
     let mut i = 0;
@@ -88,12 +113,13 @@ fn tokenize_text<F: FnMut(&[u8])>(text: &[u8], mut callback: F) {
 
 fn check_phrase_in_doc(doc_text: &[u8], phrase_terms: &[Vec<u8>]) -> bool {
     let k = phrase_terms.len();
-    let mut token_spans = [(0u16, 0u16); 1024];
+    let mut stack_spans = [(0u32, 0u32); 1024];
     let mut num_tokens = 0;
+    let mut heap_spans: Vec<(u32, u32)> = Vec::new();
 
     let mut i = 0;
     let n = doc_text.len();
-    while i < n && num_tokens < 1024 {
+    while i < n {
         let b = doc_text[i];
         if is_token_char(b) {
             let start = i;
@@ -101,7 +127,15 @@ fn check_phrase_in_doc(doc_text: &[u8], phrase_terms: &[Vec<u8>]) -> bool {
                 i += 1;
             }
             let len = i - start;
-            token_spans[num_tokens] = (start as u16, len as u16);
+            if num_tokens < 1024 {
+                stack_spans[num_tokens] = (start as u32, len as u32);
+            } else if num_tokens == 1024 {
+                heap_spans.reserve(1024);
+                heap_spans.extend_from_slice(&stack_spans);
+                heap_spans.push((start as u32, len as u32));
+            } else {
+                heap_spans.push((start as u32, len as u32));
+            }
             num_tokens += 1;
         } else {
             i += 1;
@@ -112,10 +146,16 @@ fn check_phrase_in_doc(doc_text: &[u8], phrase_terms: &[Vec<u8>]) -> bool {
         return false;
     }
 
+    let spans: &[(u32, u32)] = if num_tokens <= 1024 {
+        &stack_spans[..num_tokens]
+    } else {
+        &heap_spans[..]
+    };
+
     for i in 0..=(num_tokens - k) {
         let mut matches = true;
         for j in 0..k {
-            let (start, len) = token_spans[i + j];
+            let (start, len) = spans[i + j];
             let tok = &doc_text[start as usize..(start as usize + len as usize)];
             let target = &phrase_terms[j];
             if tok.len() != target.len() {
@@ -362,6 +402,7 @@ fn main() {
             postings[term_id].append(&mut p[term_id]);
         }
     }
+    drop(thread_results);
 
     let num_docs = total_docs;
     let words_count = (num_docs + 63) / 64;

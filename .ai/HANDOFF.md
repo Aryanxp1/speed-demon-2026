@@ -2,7 +2,7 @@
 
 **Target Agent:** Codex (Implementation Engineer)  
 **Author:** Antigravity (Lead Systems Architect)  
-**Status:** Active Competition Execution — 3-Track Triad Complete; Staging Track B (Index)  
+**Status:** All 4 Tracks Live on Leaderboard (Score: 45.686) — Holdout Hardening & Optimization Pass Complete  
 
 ---
 
@@ -19,9 +19,9 @@ When implementing any task assigned by Antigravity:
    - Use only the Rust standard library (`std`).
    - Concurrency must use `std::thread::scope` or `std::sync` primitives.
 3. **Correctness Before Speed:**
-   - Always run verification against `tiny` and `sample` datasets first:
+   - Always run verification against `tiny`, `sample`, and `full` datasets:
      ```bash
-     python check.py <track> --data .data/<track>/sample-seed1 --expected <sha256>
+     python check.py <track> --data /path/to/data --expected <sha256>
      ```
    - If the SHA-256 differs by even one byte, the task is **NOT COMPLETE**. Debug immediately.
 4. **Log Benchmark Measurements:**
@@ -35,33 +35,19 @@ When implementing any task assigned by Antigravity:
 
 ## 2. Completed Milestones
 
-- **Phase 1: Track A (Ingest)**: Verified $K = 7.39$, 100% byte-identical SHA-256 (`495ca09682...`), $T = 0.65\text{ s}$, $M = 54.6\text{ MB}$.
-- **Phase 2: Track D (Traverse)**: Verified $K = 4.79$, 100% byte-identical SHA-256 (`a23dbdf0a3...`), $T = 2.71\text{ s}$, $M = 170.8\text{ MB}$.
-- **Phase 3: Track C (Join)**: Verified $K = 4.63$, 100% byte-identical SHA-256 (`d8088b1cd4...`), $T = 1.20\text{ s}$, $M = 45.5\text{ MB}$.
+- **Track A (Ingest)**: Official Score: **50.610 pts** ($T = 0.292\text{ s}$, $M = 61.0\text{ MB}$, $K = 10.284873$). 100% byte-identical SHA-256 (`495ca09682...`).
+- **Track B (Index)**: Official Score: **43.265 pts** ($T = 1.071\text{ s}$, $M = 534.0\text{ MB}$, $K = 7.333291$). 100% byte-identical SHA-256 (`f86973c210...`).
+- **Track C (Join)**: Official Score: **32.066 pts** ($T = 0.926\text{ s}$, $M = 88.0\text{ MB}$, $K = 4.378513$). 100% byte-identical SHA-256 (`d8088b1cd4...`). Hardened with `DistinctNameTable` arena.
+- **Track D (Traverse)**: Official Score: **43.550 pts** ($T = 1.512\text{ s}$, $M = 177.0\text{ MB}$, $K = 7.430230$). 100% byte-identical SHA-256 (`a23dbdf0a3...`). Hardened with dynamic atomic scheduling and interleaved 8-byte edge CSR.
 
 ---
 
-## 3. Active Assignment: `TASK-B1` (Track B Inverted Index Engine)
+## 3. Current Staged Work & Next Actions
 
-- **Track:** B (Index)
-- **Status:** `READY_FOR_DEV`
-- **Files Owned:**
-  - `track-b/src/main.rs`
-  - `track-b/Cargo.toml`
-  - `track-b/Dockerfile`
-  - `track-b/.speed-demon.toml`
-- **Inputs:**
-  - `/data/corpus.txt` (~254 MB, ~1,000,000 documents).
-  - `/data/queries.txt` (50,000 queries: single terms, boolean AND/OR/NOT, exact phrases).
-- **Outputs:**
-  - `/out/results.txt` (Document IDs matching queries, sorted).
-- **Specification Invariants:**
-  1. *Ahead-of-Time Query Vocabulary Filter:*
-     - Read `/data/queries.txt` FIRST.
-     - Collect set of query terms and phrases.
-     - While indexing `corpus.txt`, ignore terms that never appear in any query! (Massive memory reduction: index only query vocabulary).
-  2. *Compact Postings / Bitsets:*
-     - Documents are indexed dense $0 \dots N-1$.
-     - Flat posting lists of `u32` document IDs, or bitset vectors (`Vec<u64>`) for fast bitwise AND / OR / NOT.
-  3. *Zero External Crates ($D = 1.000$):*
-     - No external search engine or indexing crates.
+- **Task Status:** Sprint 2 (Holdout Hardening & Leaderboard Synchronization) complete across all tracks.
+- **Verified Code Changes:**
+  - `track-b/src/main.rs`: Holdout phrase span safety `(u32, u32)` with stack/heap fallback; branchless static ASCII lookup tables; intermediate memory reclamation.
+  - `track-c/src/main.rs`: Exact byte deduplication arena `DistinctNameTable` guaranteeing holdout collision immunity.
+  - `track-d/src/main.rs`: Dynamic atomic work pool `AtomicUsize`; interleaved 8-byte edge target CSR; node query bounds and epoch rollover safety.
+  - Documentation, README, and `PERF.md` files updated across all tracks.
+- **Next Action:** Request user authorization to commit and push to `origin/speed-demon`.

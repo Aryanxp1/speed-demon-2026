@@ -33,21 +33,23 @@ $$K = \left(\frac{T_{\text{ref}}}{T}\right)^{0.50} \times \min\left(\frac{M_{\te
 - **$S$ (Source Code Lines):** Non-comment, non-blank lines counted by `scc` after canonical formatting (`rustfmt`). Weight: **0.15 (capped at 1.0×)**.
 - **$D$ (Dependencies):** $1 + \text{count of direct non-stdlib dependencies}$. Weight: **0.15 (capped at 1.0×)**.
 
-### Target Performance Matrix by Track
+### Official Falkenstein Baseline & Target Performance Matrix by Track
 
-| Metric | Track A (Ingest) | Track D (Traverse) | Track C (Join) | Track B (Index) |
+| Metric | Track A (Ingest) | Track D (Traverse) | Track B (Index) | Track C (Join) |
 |---|---|---|---|---|
-| **$T_{\text{ref}}$ (Reference)** | 32.05 s | 72.69 s | 14.44 s | 56.35 s |
-| **Target $T$** | **0.08 s** | **0.08 s** | **0.08 s** | **0.60 s** |
-| **Speedup Ratio ($T_{\text{ref}} / T$)** | ~400× | ~900× | ~180× | ~94× |
-| **$M_{\text{ref}}$ (Reference)** | 228 MB | 893 MB | 367 MB | 2.20 GB |
-| **Target $M$** | **35 MB** | **110 MB** | **25 MB** | **150 MB** |
-| **Memory Ratio ($M_{\text{ref}} / M$)** | 6.5× | 8.1× | 14.7× | 14.6× |
-| **$S_{\text{ref}}$ (Reference Lines)** | 56 lines | 43 lines | 108 lines | 91 lines |
-| **Target $S$ (Lines)** | ~120 lines | ~140 lines | ~180 lines | ~220 lines |
-| **Target $D$ (Dependencies)** | **1.0 (0 deps)** | **1.0 (0 deps)** | **1.0 (0 deps)** | **1.0 (0 deps)** |
-| **Projected $K$** | **~26.5** | **~35.2** | **~21.8** | **~16.4** |
-| **Projected Speed Score** | **71.1 / 100** | **77.3 / 100** | **66.9 / 100** | **60.7 / 100** |
+| **$T_{\text{ref}}$ (Box Reference)** | 32.047 s | 72.693 s | 56.352 s | 14.442 s |
+| **Official Box Measured $T$** | **0.292 s** | **1.512 s** | **1.071 s** | **0.926 s** |
+| **Speedup Ratio ($T_{\text{ref}} / T$)** | **109.8×** | **48.1×** | **52.6×** | **15.6×** |
+| **$M_{\text{ref}}$ (Box Reference)** | 228 MB | 893 MB | 2.20 GB | 367 MB |
+| **Official Box Measured $M$** | **61 MB** | **177 MB** | **534 MB** | **88 MB** |
+| **Memory Ratio ($M_{\text{ref}} / M$)** | 3.74× | 5.04× | 4.12× | 4.17× |
+| **$S_{\text{ref}}$ (Reference Lines)** | 56 lines | 43 lines | 91 lines | 108 lines |
+| **Official Box $K$** | **10.285** | **7.430** | **7.333** | **4.379** |
+| **Official Machine Points** | **50.610** | **43.550** | **43.265** | **32.066** |
+| **Optimization Target $T$** | ~0.20 s | **< 0.80 s** | **< 0.50 s** | < 0.60 s |
+| **Optimization Target $M$** | ~50 MB | **< 120 MB** | **< 280 MB** | < 60 MB |
+| **Optimization Target $K$** | ~12.5 | **> 12.0** | **> 11.5** | > 6.0 |
+| **Optimization Target Points** | ~55.0 pts | **> 54.0 pts** | **> 53.0 pts** | > 39.0 pts |
 
 ---
 

@@ -156,20 +156,52 @@ This log records major architectural decisions, technical trade-offs, language s
 
 ---
 
-## ADR-005: Track B Architecture — AOT Query Vocabulary Filter, Parallel Boundary Ingest, Left-to-Right Bitsets, and Ascending df Candidate Phrase Verification
+## ADR-009: Track C Exact-Byte Collision-Proof Verification (`DistinctNameTable` Arena)
 
-- **Status:** Accepted & Verified
+- **Status:** **APPROVED & IMPLEMENTED**
 - **Date:** 2026-10-31
 - **Context:**
-  Track B (Index) requires indexing a 254 MB legal corpus (250,000 documents, 36M tokens) and answering 50,000 queries (31k boolean, 19k phrase) under a single measured wall clock timer. The Python reference consumes 56.35s and 2.20 GB RSS.
+  Previous implementations used 64-bit and dual-polynomial hashes for distinct name tracking. While collision-free on seed 1, hash-based deduplication carries theoretical birthday-paradox collision risks on unseen holdout distributions with arbitrary name sets.
 - **Decision:**
-  1. **AOT Query Vocabulary Filtering:** Parse `queries.txt` before ingesting the corpus. Filter corpus tokens against an internal fast FNV-1a query term table (`FastHashMap`), ignoring >87% of non-queried corpus words during ingest.
-  2. **Parallel Ingest with Monotonic Slices:** Read `docs.txt` and divide across worker threads along newline boundaries. Each thread emits strictly ascending document IDs for observed query terms; merging across threads is a linear concatenation that produces sorted posting lists with zero sorting cost.
-  3. **Left-to-Right Boolean Evaluation:** Evaluated with dense 64-bit word bitsets (`[u64; words_count]`). For terms with document frequency $df < 256$, bit-set and bit-clear operations are performed directly in $O(df)$ time, bypassing 3,907-word loops.
-  4. **Ascending df Candidate Phrase Verification:** For each phrase query $t_1 \dots t_k$, sort terms by document frequency ascending and intersect against the rarest anchor term first, filtering candidates down to median 1 document. Verify candidate documents in-place using stack-allocated token window with zero heap allocations.
+  Replace hash-only sets with `DistinctNameTable`: an open-addressing hash table backed by a contiguous `Vec<u8>` string arena storing `(country_id, offset, len)` tuples. On hash hits, directly compare raw slice bytes `&arena[off..off+len] == name`.
 - **Consequences:**
-  - Wall time dropped from 56.35s to **3.07s** (18.35x speedup).
-  - Peak memory dropped from 2,200 MB to **532 MB** (4.13x leaner).
-  - Unofficial local $K = 4.457$ (32.45 speed points).
-  - 100% byte-identical SHA-256 match across tiny, sample, full (`f86973c210...`), seed 42, and seed 999.
-  - Zero external runtime dependencies ($D = 1.000$).
+  - Guarantees 100% collision-proof correctness on any unseen holdout seed.
+  - Keeps peak RSS extremely lean (~90 MB) by avoiding thousands of separate heap allocations.
+  - Maintains sub-second execution (0.926s on official scoring machine, 32.066 points).
+
+---
+
+## ADR-010: Track D Dynamic Atomic Work Scheduling & Interleaved Edge Targets
+
+- **Status:** **APPROVED & IMPLEMENTED**
+- **Date:** 2026-10-31
+- **Context:**
+  Static chunking (`chunks_mut(chunk_size)`) across 6 worker threads caused thread starvation and idle straggler stalls because Dijkstra search latencies vary drastically across queries (some finish in 5 steps; others explore 50,000 nodes). Furthermore, separate `edges_to` and `edges_weight` arrays incurred dual cache misses during relaxation.
+- **Decision:**
+  1. Implement dynamic work scheduling via an `AtomicUsize` query counter. Threads dynamically fetch the next query with `query_counter.fetch_add(1, Relaxed)`.
+  2. Interleave destination vertex and edge weight into `struct EdgeTarget { to: u32, weight: u32 }` (8 bytes) in a single contiguous CSR array.
+  3. Add out-of-bounds vertex guards (`sq >= n || tq >= n`) and epoch counter rollover handling.
+  4. Retain epoch counter arrays: an experiment replacing epoch resets with a `touched: Vec<u32>` reset array caused a 63% CPU slowdown (13.8s $\to$ 22.6s) and was immediately rejected.
+- **Consequences:**
+  - Total user CPU time decreased by **23%** (17.88s $\to$ 13.83s).
+  - Eliminates thread idle time on unbalanced query workloads.
+  - Verified 100% byte-identical SHA-256 match.
+
+---
+
+## ADR-011: Track B Holdout Phrase Span Safety & Static Branchless Tables
+
+- **Status:** **APPROVED & IMPLEMENTED**
+- **Date:** 2026-10-31
+- **Context:**
+  Fixed `[(u16, u16); 1024]` token spans in the phrase verifier posed integer truncation risks if document offsets exceeded 65,535 bytes or document token counts exceeded 1,024. Ingest also had branch mispredictions during token character classification.
+- **Decision:**
+  1. Upgrade token spans to `(u32, u32)` with stack allocation for documents $\le 1024$ tokens and automatic dynamic heap fallback for longer documents.
+  2. Introduce 256-byte compile-time static lookup tables `IS_TOKEN_CHAR` and `LOWER_ASCII` to eliminate conditional branches in the tokenization hot loop.
+  3. Explicitly drop thread-local intermediate postings (`drop(thread_results)`) immediately after concatenation, reclaiming ~89 MB before query evaluation.
+  4. Flat open-addressing table (`FlatTermTable`) was benchmarked and rejected: linear probing across 8.4 MB caused cache thrashing (6.50s wall time vs 3.07s baseline). Retained SwissTable `FastHashMap`.
+- **Consequences:**
+  - Complete safety against arbitrary holdout document lengths.
+  - Memory reclaimed before query evaluation begins.
+  - Verified 100% byte-identical SHA-256 match across all seeds.
+
