@@ -9,16 +9,18 @@ Our solution is a zero-runtime-dependency Rust engine ($D = 1.000$) designed aro
 1. **Ahead-of-Time (AOT) Query Vocabulary Filtering:**
    Because all 50,000 queries are known at startup, we parse `queries.txt` before ingesting the corpus. Across the 250,000 documents and 36 million tokens, only 75,747 distinct terms are queried (out of 609,833 total vocabulary terms). By matching tokens against an internal fast FNV-1a query term table during ingest, over 87% of corpus vocabulary is ignored, avoiding redundant memory allocations and drastically compressing index construction.
 
-2. **Parallel Ingest with Sorted Monotonic Postings:**
-   The 254 MB `docs.txt` is memory-buffered and divided along newline boundaries across CPU worker threads. Each worker thread parses documents and emits strictly ascending document IDs for observed query terms. Because thread boundaries partition document ID ranges ($0..N-1$), merging thread postings is a linear concatenation that produces strictly ascending posting lists with zero sorting overhead. Thread-local intermediate postings are explicitly dropped (`drop(thread_results)`) immediately after concatenation, reclaiming ~89 MB before query execution.
+2. **Parallel Streaming Ingest with Sorted Monotonic Postings:**
+   Lex divides `docs.txt` at newline boundaries and reads each range through a worker-local 1 MiB buffer. A reusable line buffer grows for long documents. Each worker emits ascending document IDs; merging concatenates posting lists without sorting and immediately releases each consumed worker allocation. Only document file offsets and lengths are retained, rather than a 254 MB corpus copy. Phrase workers reread candidates through independent file handles after all term filters pass.
 
 3. **High-Throughput Left-to-Right Boolean & Phrase Query Processing:**
-   - **Boolean Queries:** Evaluated strictly left-to-right according to specification grammar. For terms with document frequency $df < 256$, bit-set and bit-clear operations are performed directly in $O(df)$ time, bypassing full 3,907-word bitset iterations. Only when large sets intersect are dense 64-bit word bitsets used.
+   - **Boolean Queries:** Evaluated strictly left-to-right. Frequent terms (`df >= max(256, 4 * bitset_words)`) also have cached bitmaps, each costing at most half its posting-list bytes. Runtime-dispatched AVX2 combines four words at a time for AND, OR, and binary NOT, with unaligned loads, scalar tails, and a scalar fallback. Sparse operands retain direct posting operations; uncached AND operands of at least 256 documents use a reusable temporary bitmap.
    - **Phrase Queries:** For each phrase query $t_1 \dots t_k$, terms are sorted by document frequency ascending. Candidate documents are filtered by intersecting against the rarest anchor term first, quickly narrowing candidates down to a tiny set (median 1, 99th percentile 5).
-   - **Safe In-Place Verification:** Each candidate document is verified in-place using stack-allocated `(u32, u32)` token spans for documents up to 1,024 tokens, with automatic dynamic heap fallback for unusually long holdout documents. Pre-computed 256-byte static lookup tables (`IS_TOKEN_CHAR` and `LOWER_ASCII`) eliminate branch mispredictions during tokenization.
+   - **Phrase Verification:** Each candidate is read into a reusable worker buffer and verified using stack-allocated `(u32, u32)` token spans for up to 1,024 tokens, with dynamic heap fallback for longer documents. Static ASCII tables preserve the specified byte-based tokenization.
    - **Parallel Query Execution:** All 50,000 queries are evaluated in parallel across worker threads, formatting results directly into pre-allocated memory buffers.
 
 ## Performance Metrics (Official Board Seed 1 Full)
+
+These are historical board measurements, not measurements of the current streaming version. See `PERF.md` for the 2026-10-31 local before/after measurements and verification limits.
 
 - **Reference Wall Time ($T_{\text{ref}}$):** 56.35 s
 - **Official Measured Wall Time ($T$):** 1.071 s (52.6x speedup)

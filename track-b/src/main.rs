@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -17,7 +17,11 @@ impl Hasher for FastHasher {
     }
     #[inline(always)]
     fn write(&mut self, bytes: &[u8]) {
-        let mut h = if self.0 == 0 { 0xcbf29ce484222325 } else { self.0 };
+        let mut h = if self.0 == 0 {
+            0xcbf29ce484222325
+        } else {
+            self.0
+        };
         for &b in bytes {
             h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
         }
@@ -32,6 +36,46 @@ enum Op {
     And,
     Or,
     Not,
+}
+
+fn combine_scalar(acc: &mut [u64], rhs: &[u64], op: Op) {
+    assert_eq!(acc.len(), rhs.len());
+    for (a, &b) in acc.iter_mut().zip(rhs) {
+        *a = match op {
+            Op::And => *a & b,
+            Op::Or => *a | b,
+            Op::Not => *a & !b,
+        };
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn combine_avx2(acc: &mut [u64], rhs: &[u64], op: Op) {
+    use std::arch::x86_64::*;
+    assert_eq!(acc.len(), rhs.len());
+    let end = acc.len() / 4 * 4;
+    for i in (0..end).step_by(4) {
+        // Both slices contain four words here; unaligned loads support Vec<u64>.
+        let a = _mm256_loadu_si256(acc.as_ptr().add(i).cast());
+        let b = _mm256_loadu_si256(rhs.as_ptr().add(i).cast());
+        let result = match op {
+            Op::And => _mm256_and_si256(a, b),
+            Op::Or => _mm256_or_si256(a, b),
+            Op::Not => _mm256_andnot_si256(b, a),
+        };
+        _mm256_storeu_si256(acc.as_mut_ptr().add(i).cast(), result);
+    }
+    combine_scalar(&mut acc[end..], &rhs[end..], op);
+}
+
+fn bitset_combiner() -> fn(&mut [u64], &[u64], Op) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // The runtime check guards every call, including in generic CPU builds.
+        return |acc, rhs, op| unsafe { combine_avx2(acc, rhs, op) };
+    }
+    combine_scalar
 }
 
 enum Query {
@@ -82,7 +126,6 @@ fn is_token_char(b: u8) -> bool {
 fn to_lower_ascii(b: u8) -> u8 {
     LOWER_ASCII[b as usize]
 }
-
 
 fn tokenize_text<F: FnMut(&[u8])>(text: &[u8], mut callback: F) {
     let mut i = 0;
@@ -221,7 +264,10 @@ fn parse_queries(queries_bytes: &[u8]) -> ParsedQueries {
 
         if line.starts_with(b"BOOL ") {
             let rest = &line[5..];
-            let parts: Vec<&[u8]> = rest.split(|&b| b == b' ').filter(|s| !s.is_empty()).collect();
+            let parts: Vec<&[u8]> = rest
+                .split(|&b| b == b' ')
+                .filter(|s| !s.is_empty())
+                .collect();
             let mut terms = Vec::with_capacity((parts.len() + 1) / 2);
             let mut ops = Vec::with_capacity(parts.len() / 2);
 
@@ -241,7 +287,10 @@ fn parse_queries(queries_bytes: &[u8]) -> ParsedQueries {
             queries.push(Query::Bool { terms, ops });
         } else if line.starts_with(b"PHRASE \"") && line.ends_with(b"\"") {
             let inner = &line[8..line.len() - 1];
-            let parts: Vec<&[u8]> = inner.split(|&b| b == b' ').filter(|s| !s.is_empty()).collect();
+            let parts: Vec<&[u8]> = inner
+                .split(|&b| b == b' ')
+                .filter(|s| !s.is_empty())
+                .collect();
             let mut terms = Vec::with_capacity(parts.len());
             let mut raw_terms = Vec::with_capacity(parts.len());
             for part in parts {
@@ -294,14 +343,9 @@ fn main() {
     let num_query_terms = parsed.term_to_id.len();
 
     let docs_path = data_dir.join("docs.txt");
-    let mut docs_bytes = Vec::new();
-    File::open(&docs_path)
-        .unwrap_or_else(|e| panic!("Failed to open {:?}: {}", docs_path, e))
-        .read_to_end(&mut docs_bytes)
-        .expect("Failed to read docs.txt");
-
-    let docs_len = docs_bytes.len();
-    let arc_docs_bytes = Arc::new(docs_bytes);
+    let docs_file = File::open(&docs_path).expect("Failed to open docs.txt");
+    let docs_len = docs_file.metadata().expect("Failed to stat docs.txt").len();
+    let mut boundary_reader = BufReader::new(docs_file);
     let arc_term_to_id = Arc::new(parsed.term_to_id);
 
     let num_threads = thread::available_parallelism()
@@ -312,15 +356,14 @@ fn main() {
     let mut chunk_boundaries = Vec::with_capacity(num_threads + 1);
     chunk_boundaries.push(0);
     for t in 1..num_threads {
-        let approx = t * docs_len / num_threads;
-        let mut pos = approx;
-        while pos < docs_len && arc_docs_bytes[pos] != b'\n' {
-            pos += 1;
-        }
-        if pos < docs_len {
-            pos += 1;
-        }
-        chunk_boundaries.push(pos);
+        let approx = t as u64 * docs_len / num_threads as u64;
+        boundary_reader
+            .seek(SeekFrom::Start(approx))
+            .expect("Failed to seek docs.txt");
+        let skipped = boundary_reader
+            .skip_until(b'\n')
+            .expect("Failed to find document boundary");
+        chunk_boundaries.push(approx + skipped as u64);
     }
     chunk_boundaries.push(docs_len);
 
@@ -332,36 +375,47 @@ fn main() {
             continue;
         }
 
-        let docs = Arc::clone(&arc_docs_bytes);
+        let docs_path = docs_path.clone();
         let term_to_id = Arc::clone(&arc_term_to_id);
 
         ingest_handles.push(thread::spawn(move || {
+            let mut file = File::open(docs_path).expect("Failed to open docs.txt");
+            file.seek(SeekFrom::Start(start_pos))
+                .expect("Failed to seek document chunk");
+            let mut reader = BufReader::with_capacity(1 << 20, file.take(end_pos - start_pos));
+            let mut line = Vec::new();
             let mut local_doc_spans = Vec::new();
             let mut local_postings: Vec<Vec<u32>> = vec![Vec::new(); num_query_terms];
             let mut last_seen: Vec<u32> = vec![u32::MAX; num_query_terms];
 
             let mut line_start = start_pos;
             while line_start < end_pos {
-                let mut line_end = line_start;
-                while line_end < end_pos && docs[line_end] != b'\n' {
-                    line_end += 1;
-                }
+                line.clear();
+                let read = reader
+                    .read_until(b'\n', &mut line)
+                    .expect("Failed to read document");
+                assert_ne!(read, 0, "Unexpected end of docs.txt");
+                let line_end = line.len() - usize::from(line.ends_with(b"\n"));
 
-                let mut tab_pos = line_start;
-                while tab_pos < line_end && docs[tab_pos] != b'\t' {
+                let mut tab_pos = 0;
+                while tab_pos < line_end && line[tab_pos] != b'\t' {
                     tab_pos += 1;
                 }
 
                 let mut doc_id: u32 = 0;
-                for &b in &docs[line_start..tab_pos] {
+                for &b in &line[..tab_pos] {
                     doc_id = doc_id * 10 + (b - b'0') as u32;
                 }
 
-                let text_start = if tab_pos < line_end { tab_pos + 1 } else { line_end };
+                let text_start = if tab_pos < line_end {
+                    tab_pos + 1
+                } else {
+                    line_end
+                };
                 let text_len = line_end - text_start;
 
-                local_doc_spans.push((doc_id, text_start as u32, text_len as u32));
-                let doc_text = &docs[text_start..line_end];
+                local_doc_spans.push((doc_id, line_start + text_start as u64, text_len));
+                let doc_text = &line[text_start..line_end];
 
                 tokenize_text(doc_text, |tok| {
                     if let Some(&term_id) = term_to_id.get(tok) {
@@ -373,7 +427,7 @@ fn main() {
                     }
                 });
 
-                line_start = line_end + 1;
+                line_start += read as u64;
             }
             (local_doc_spans, local_postings)
         }));
@@ -387,7 +441,7 @@ fn main() {
         thread_results.push((spans, postings));
     }
 
-    let mut doc_spans: Vec<(u32, u32)> = vec![(0, 0); total_docs];
+    let mut doc_spans: Vec<(u64, usize)> = vec![(0, 0); total_docs];
     for (spans, _) in &thread_results {
         for &(doc_id, text_start, text_len) in spans {
             doc_spans[doc_id as usize] = (text_start, text_len);
@@ -399,13 +453,31 @@ fn main() {
         let cap: usize = thread_results.iter().map(|(_, p)| p[term_id].len()).sum();
         postings[term_id].reserve_exact(cap);
         for (_, p) in &mut thread_results {
-            postings[term_id].append(&mut p[term_id]);
+            // Release each worker allocation as soon as its contents are merged.
+            postings[term_id].extend_from_slice(&std::mem::take(&mut p[term_id]));
         }
     }
     drop(thread_results);
 
     let num_docs = total_docs;
     let words_count = (num_docs + 63) / 64;
+
+    // Cache only frequent terms: a bitmap costs at most half its posting bytes.
+    // Sparse lists remain available for phrase candidate filtering.
+    let dense: Vec<Vec<u64>> = postings
+        .iter()
+        .map(|posts| {
+            if posts.len() < (words_count * 4).max(256) {
+                return Vec::new();
+            }
+            let mut bits = vec![0u64; words_count];
+            for &d in posts {
+                bits[d as usize >> 6] |= 1u64 << (d & 63);
+            }
+            bits
+        })
+        .collect();
+    let arc_dense = Arc::new(dense);
 
     let arc_doc_spans = Arc::new(doc_spans);
     let arc_postings = Arc::new(postings);
@@ -423,12 +495,18 @@ fn main() {
             break;
         }
 
-        let docs_bytes = Arc::clone(&arc_docs_bytes);
+        let docs_path = docs_path.clone();
         let doc_spans = Arc::clone(&arc_doc_spans);
         let postings = Arc::clone(&arc_postings);
+        let dense = Arc::clone(&arc_dense);
         let queries = Arc::clone(&arc_queries);
 
         handles.push(thread::spawn(move || {
+            // Read only candidates that survived every phrase term's posting filter.
+            // Each worker owns its file cursor and reuses one document buffer.
+            let mut docs_file = File::open(docs_path).expect("Failed to open phrase corpus");
+            let mut doc_text = Vec::new();
+            let combine = bitset_combiner();
             let mut out_chunk = Vec::with_capacity((q_end - q_start) * 48);
             let mut r = vec![0u64; words_count];
             let mut temp = vec![0u64; words_count];
@@ -440,8 +518,12 @@ fn main() {
                         r.fill(0);
                         let first_tid = terms[0] as usize;
                         if first_tid < postings.len() {
-                            for &d in &postings[first_tid] {
-                                r[d as usize >> 6] |= 1u64 << (d & 63);
+                            if !dense[first_tid].is_empty() {
+                                r.copy_from_slice(&dense[first_tid]);
+                            } else {
+                                for &d in &postings[first_tid] {
+                                    r[d as usize >> 6] |= 1u64 << (d & 63);
+                                }
                             }
                         }
 
@@ -453,6 +535,8 @@ fn main() {
                                     Op::Or => {}
                                     Op::Not => {}
                                 }
+                            } else if !dense[tid].is_empty() {
+                                combine(&mut r, &dense[tid], op);
                             } else {
                                 let term_posts = &postings[tid];
                                 match op {
@@ -485,9 +569,7 @@ fn main() {
                                             for &d in term_posts {
                                                 temp[d as usize >> 6] |= 1u64 << (d & 63);
                                             }
-                                            for i in 0..words_count {
-                                                r[i] &= temp[i];
-                                            }
+                                            combine(&mut r, &temp, Op::And);
                                             for &d in term_posts {
                                                 temp[d as usize >> 6] = 0;
                                             }
@@ -572,8 +654,14 @@ fn main() {
                             }
                             if present_in_all {
                                 let (start, len) = doc_spans[doc_id as usize];
-                                let doc_text = &docs_bytes[start as usize..(start + len) as usize];
-                                if check_phrase_in_doc(doc_text, raw_terms) {
+                                doc_text.resize(len, 0);
+                                docs_file
+                                    .seek(SeekFrom::Start(start))
+                                    .expect("Failed to seek phrase candidate");
+                                docs_file
+                                    .read_exact(&mut doc_text)
+                                    .expect("Failed to read phrase candidate");
+                                if check_phrase_in_doc(&doc_text, raw_terms) {
                                     matches.push(doc_id);
                                 }
                             }
@@ -614,7 +702,9 @@ fn main() {
         chunks.push(chunk);
     }
     for chunk in chunks {
-        writer.write_all(&chunk).expect("Failed to write results chunk");
+        writer
+            .write_all(&chunk)
+            .expect("Failed to write results chunk");
     }
     writer.flush().expect("Failed to flush results.txt");
 }
@@ -634,5 +724,42 @@ fn fast_write_u64(buf: &mut Vec<u8>, mut n: u64, tmp: &mut [u8; 32]) {
     while pos > 0 {
         pos -= 1;
         buf.push(tmp[pos]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitset_operations_cover_unaligned_vectors_and_tails() {
+        let combine = bitset_combiner();
+        for len in (0..70).chain([3907, 4097]) {
+            let a: Vec<u64> = (0..len + 2)
+                .map(|i| (i as u64).wrapping_mul(0x9e3779b97f4a7c15))
+                .collect();
+            let b: Vec<u64> = a.iter().map(|x| x.rotate_left(17) ^ u64::MAX).collect();
+            for op in [Op::And, Op::Or, Op::Not] {
+                let mut actual = a.clone();
+                let mut expected = a.clone();
+                combine_scalar(&mut expected[1..len + 1], &b[1..len + 1], op);
+                combine(&mut actual[1..len + 1], &b[1..len + 1], op);
+                assert_eq!(actual, expected, "len={len}, op={op:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn phrases_preserve_repetition_ascii_rules_and_heap_fallback() {
+        let terms = vec![b"bail".to_vec(), b"bail".to_vec(), b"bond".to_vec()];
+        assert!(check_phrase_in_doc("BAIL—bail, BOND".as_bytes(), &terms));
+        assert!(!check_phrase_in_doc(b"bail bond", &terms));
+        let mut long = b"x ".repeat(1100);
+        long.extend_from_slice(b"bail bail bond");
+        assert!(check_phrase_in_doc(&long, &terms));
+        assert!(!check_phrase_in_doc(
+            "Zürich".as_bytes(),
+            &[b"zurich".to_vec()]
+        ));
     }
 }
