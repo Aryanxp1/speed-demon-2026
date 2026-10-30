@@ -4,12 +4,14 @@ use std::io::{BufWriter, Read, Write};
 use std::path::PathBuf;
 
 #[inline(always)]
-fn fxhash64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0x517cc1b727220a95;
+fn hash128(bytes: &[u8]) -> (u64, u64) {
+    let mut h1: u64 = 0x517cc1b727220a95;
+    let mut h2: u64 = 0x9e3779b97f4a7c15;
     for &b in bytes {
-        h = (h.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        h1 = (h1.rotate_left(5) ^ (b as u64)).wrapping_mul(0x517cc1b727220a95);
+        h2 = (h2.rotate_left(7) ^ (b as u64)).wrapping_mul(0x9e3779b97f4a7c15);
     }
-    h
+    (h1, h2)
 }
 
 struct CountryAgg {
@@ -18,7 +20,7 @@ struct CountryAgg {
     amount_sum: i64,
     amount_min: i64,
     amount_max: i64,
-    names: HashSet<u64>,
+    names: HashSet<(u64, u64)>,
     name_bytes: u64,
     note_bytes: u64,
 }
@@ -181,7 +183,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_countries = country_names.len();
     let mut aggs: Vec<CountryAgg> = (0..num_countries).map(|_| CountryAgg::default()).collect();
 
-    // 2. Stream records.csv in a 2 MB sliding window buffer (Peak RSS < 20 MB)
+    // 2. Stream records.csv in a 2 MB sliding window buffer (Peak RSS < 50 MB)
     let mut file = File::open(&records_path)?;
     const CHUNK_SIZE: usize = 2 * 1024 * 1024;
     const MAX_RECORD_LEN: usize = 64 * 1024;
@@ -353,8 +355,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         target.name_bytes += name_buf.len() as u64;
         target.note_bytes += note_len;
-        let name_hash = fxhash64(&name_buf);
-        target.names.insert(name_hash);
+
+        let h128 = hash128(&name_buf);
+        target.names.insert(h128);
     }
 
     // 3. Collect and sort output groups by country code ascending

@@ -1,2 +1,8 @@
 .out/
 data/
+.data/
+official-repo/
+official-starter/
+target/
+*.log
+*.log.txt
