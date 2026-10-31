@@ -55,9 +55,10 @@ inline u64 money(const char* s, const char* e) {
 inline const char* find(const char* p, char c) {
   __m256i tgt = _mm256_set1_epi8(c);
   for (;; p += 64) {
-    u64 m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)p), tgt));
-    u64 m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(p + 32)), tgt));
-    if (u64 m = m0 | (m1 << 32)) return p + __builtin_ctzll(m);
+    u32 m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)p), tgt));
+    if (m0) return p + __builtin_ctz(m0);
+    u32 m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(p + 32)), tgt));
+    if (m1) return p + 32 + __builtin_ctz(m1);
   }
 }
 inline const char* comma_after(const char* p) {
