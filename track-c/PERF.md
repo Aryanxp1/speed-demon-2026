@@ -53,3 +53,34 @@ Every step from the reference to our optimized version, with measured metrics, a
   - Dynamically resizes at 50% load factor.
 - **Result:** Complete collision immunity guaranteed on any holdout dataset. Retains lean memory footprint (~90 MB) and sub-second wall time. 100% verified across tiny, sample, full, seed 42, and seed 999.
 
+
+## 2026-10-31 — Lex: repair `22347ff` correctness
+
+**Correction to the historical Step 5 claims above:** the CLMUL implementation at `22347ff` fails local tiny, sample and full correctness. Its prior estimated score and correctness claims do not validate that commit. The older arena implementation described separately above is not the current implementation. No new official score has been measured.
+
+The reproduced primary failure was final-region parsing: a trailing LF caused the parser to read after the final row and allocate a region map of length one. All records became `_UNMATCHED`. The fix finds the last nonempty row. Existing region chunk splitting already aligns to LF; boundary tests cover 1–31 workers. Additional fixes initialize amount extrema correctly and inspect a competing writer's published name after a failed compare-exchange, preventing duplicate IDs for equal names.
+
+The fast name table and ID bitmap capacity are now 524,288. Bounded probing spills into exact-byte standard-library maps/sets if capacity is exhausted. Long-name suffixes reference the immutable input mapping, removing the unchecked 8 MiB arena. AVX2/PCLMUL target attributes and Docker flags are explicit; unsupported CPUs receive an error. The Linux THP-disable prctl constant is corrected. These changes improve robustness without claiming unlimited holdout capacity or performance.
+
+Local environment: WSL2, i7-12700H, CPUs 0–11, Linux musl release, x86-64-v3 plus PCLMUL. RSS includes mapped input pages; it is not equivalent to official container memory accounting.
+
+| Dataset / version | Wall time (s) | Peak RSS (KiB) | Correctness |
+|---|---:|---:|---|
+| Tiny baseline | .02 | 1796 | FAIL |
+| Sample baseline | .06 | 25228 | FAIL |
+| Full baseline | .41 | 202748 | FAIL |
+| Tiny fixed | .01 | 1996 | PASS |
+| Sample fixed | .05 | 41832 | PASS |
+| Full fixed, five serial runs | .15, .06, .06, .06, .06 | 220588, 220672, 220736, 220416, 220736 | PASS every run |
+
+Fixed full trimmed mean: .060 s, maximum RSS: 226.03 decimal MB. An earlier verification run took .25 s / 220608 KiB; cache and scheduling effects are substantial. Invalid baseline timings are recorded for diagnosis only, not a valid speedup comparison. The fixes were measured as one correctness repair, not isolated performance optimizations.
+
+| Dataset | Verified SHA-256 |
+|---|---|
+| Tiny | `e4e43bc39920e9d446c3fcd700fdd35b3959e9495c6aaa738491df38a1aed733` |
+| Sample | `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66` |
+| Full | `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536` |
+| Seed 42 tiny | `7d151bcd945ddf65dcddaa4b956f75435d638a411bddb7cdb42f4fb7e2d8e816` |
+| Seed 999 sample | `62e7f211aa5d71f593a5fa718e0ca8279b71fd1b716d0879112d550c6d3ab77d` |
+
+Seed 42 and 999 initial verification measurements: .02 s / 1960 KiB and .05 s / 42240 KiB respectively. Both match reference output byte for byte. Official WORKED and RULES handwritten fixtures also pass, covering quoted fields, BOMs, multiline notes and amount extrema. Three new unit tests pass for region boundaries/extrema, concurrent deduplication, and exhausted-table fallback. Dev/release checks deny warnings. Docker validation and the live board rerun remain outstanding; the 72+ target is unverified. Local scripts and binaries are in ignored `.data/lex_directive`, measurements in `/home/aryan/speeddemon_data/lex-directive`.

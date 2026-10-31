@@ -151,3 +151,29 @@ taskset -c 0-11 /usr/bin/time -f '%e %M' ./solution \
 sha256sum /tmp/lex-b-out/results.txt
 ```
 
+
+## 2026-10-31 — Lex: compact postings and query batches (baseline `22347ff`)
+
+These are local WSL2 measurements on an i7-12700H, pinned to CPUs 0–11, using a release Linux musl executable with `x86-64-v3`. `/usr/bin/time` reports elapsed seconds and peak RSS in KiB. Decimal MB below includes resident mapped input pages and is not directly comparable with the board's reported 236 MB. Docker/official scoring was not available; no new score is claimed.
+
+Sparse postings now use u16 document offsets relative to each ingest partition. Temporary bucket records also shrink from two u32 words to one. Consuming buckets during scatter releases temporary allocations sooner. A partition exceeding 65,536 documents selects the u32 fallback; no document IDs are truncated. Queries decode sparse segments into reusable worker scratch. Existing AVX2 dense operations remain in use.
+
+| Variant | Five full wall times (s) | Five peak RSS values (KiB) | Trimmed mean T (s) | Maximum RSS (MB) |
+|---|---|---|---:|---:|
+| Baseline, batch 16 | .66, .44, .43, .39, .43 | 437936, 437556, 437088, 437560, 437836 | .4333 | 448.45 |
+| Compact, batch 16 | .59, .46, .44, .42, .44 | 341068, 340364, 340572, 341240, 339988 | .4467 | 349.43 |
+| Compact, batch 32 | .62, .44, .43, .40, .38 | 339952, 340356, 341172, 340932, 340820 | .4233 | 349.36 |
+| Compact, batch 64 (retained) | .59, .39, .40, .38, .43 | 339984, 340424, 339688, 339936, 340780 | .4067 | 348.96 |
+
+Trimmed means discard one minimum and maximum. Runs were serial, with no separate warmup; the first-run effect and normal scheduling noise are visible. Batch 64 has the best observed mean, not a demonstrated universal advantage. Final tiny: .01 s / 2008 KiB; sample: .08 s / 31724 KiB. All timed tiny/sample/full outputs match expected bytes/hashes. Extra seeds 42 and 999 also match the reference hashes listed above.
+
+Temporary instrumented source copies separately measured index construction and combined Boolean/phrase query execution (three alternating baseline/final runs, milliseconds):
+
+| Phase | Baseline | Final |
+|---|---|---|
+| Index construction | 320.859, 203.575, 223.509 | 183.687, 187.416, 183.373 |
+| All queries | 50.369, 52.385, 56.696 | 55.209, 75.488, 58.612 |
+
+These diagnostic builds used rustc opt-level 3 and are not the timed Cargo binaries above. Compression trades extra query decoding for lower index memory and faster construction. The earlier Boolean/phrase breakdown in this file belongs to the older streaming implementation, not this baseline.
+
+Two new unit tests pass: the exact u16 maximum, u32 fallback, multi-partition reconstruction, and empty partitions. All four manifests retain empty dependencies; all four tracks pass dev/release checks with warnings denied. Sources, executables and diagnostic scripts are retained locally under ignored `.data/lex_directive`; benchmark JSON is under `/home/aryan/speeddemon_data/lex-directive`. Full output remains `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.

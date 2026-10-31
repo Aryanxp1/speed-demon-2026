@@ -1,10 +1,11 @@
 use std::arch::x86_64::*;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Barrier;
+use std::sync::{Barrier, Mutex};
 use std::thread;
 
 extern "C" {
@@ -54,7 +55,15 @@ unsafe fn map_file(file: &File) -> (*const u8, usize) {
         std::process::exit(1);
     }
     // Overlay file contents
-    if mmap(p, size, PROT_READ, MAP_PRIVATE | 0x10 /* MAP_FIXED */, fd, 0) == MAP_FAILED {
+    if mmap(
+        p,
+        size,
+        PROT_READ,
+        MAP_PRIVATE | 0x10, /* MAP_FIXED */
+        fd,
+        0,
+    ) == MAP_FAILED
+    {
         std::process::exit(1);
     }
     (p as *const u8, size)
@@ -106,7 +115,7 @@ impl Structure {
     #[inline(always)]
     fn new(p: *const u8, end: *const u8) -> Self {
         Self {
-            block: unsafe { p.sub(64) },
+            block: p.wrapping_sub(64),
             end,
             bits: 0,
             carry: 0,
@@ -115,10 +124,10 @@ impl Structure {
         }
     }
 
-    #[inline(always)]
+    #[target_feature(enable = "avx2,pclmulqdq")]
     unsafe fn next(&mut self) -> Separator {
         while self.bits == 0 {
-            self.block = self.block.add(64);
+            self.block = self.block.wrapping_add(64);
             if self.block >= self.end {
                 return Separator {
                     at: self.end,
@@ -144,8 +153,8 @@ impl Structure {
     }
 }
 
-const SLOTS: usize = 1 << 17;
-const IDS: usize = 1 << 17;
+const SLOTS: usize = 1 << 19;
+const IDS: usize = 1 << 19;
 const HEAD: usize = 24;
 const BUSY: u16 = 0xFFFF;
 
@@ -182,9 +191,8 @@ struct Probe {
 struct NameTable {
     tags: *mut AtomicU16,
     slots: *mut Slot,
-    overflow: *mut u32,
-    arena: *mut u8,
-    used: AtomicU32,
+    overflow: *mut *const u8,
+    spill: Mutex<HashMap<Vec<u8>, u32>>,
     next_id: AtomicU32,
 }
 
@@ -197,9 +205,8 @@ impl NameTable {
             Self {
                 tags: zeroed::<AtomicU16>(SLOTS),
                 slots: zeroed::<Slot>(SLOTS),
-                overflow: zeroed::<u32>(SLOTS),
-                arena: zeroed::<u8>(8 << 20),
-                used: AtomicU32::new(0),
+                overflow: zeroed::<*const u8>(SLOTS),
+                spill: Mutex::new(HashMap::new()),
                 next_id: AtomicU32::new(0),
             }
         }
@@ -222,7 +229,7 @@ impl NameTable {
             slot: ((h >> 20) as usize) % SLOTS,
             tag: (1 + ((h >> 48) as u16) % (BUSY - 1)),
         };
-        loop {
+        for _ in 0..SLOTS {
             let t = (*self.tags.add(p.slot)).load(Ordering::Relaxed);
             if t == 0 || t == p.tag || t == BUSY {
                 break;
@@ -235,31 +242,31 @@ impl NameTable {
 
     #[inline(always)]
     unsafe fn id(&self, s: *const u8, len: u32, mut p: Probe) -> u32 {
-        loop {
+        for _ in 0..SLOTS {
             let tag_ref = &*self.tags.add(p.slot);
             let mut t = tag_ref.load(Ordering::Acquire);
-            if t == 0
-                && tag_ref
-                    .compare_exchange(0, BUSY, Ordering::Acquire, Ordering::Acquire)
-                    .is_ok()
-            {
-                let slot = &mut *self.slots.add(p.slot);
-                let new_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-                if new_id as usize >= IDS {
-                    std::process::exit(1);
+            if t == 0 {
+                match tag_ref.compare_exchange(0, BUSY, Ordering::Acquire, Ordering::Acquire) {
+                    Ok(_) => {
+                        let slot = &mut *self.slots.add(p.slot);
+                        slot.id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                        slot.len = len;
+                        std::ptr::copy_nonoverlapping(
+                            s,
+                            slot.head.as_mut_ptr(),
+                            (len as usize).min(HEAD),
+                        );
+                        if len as usize > HEAD {
+                            // Input mapping stays alive until all name lookups finish.
+                            *self.overflow.add(p.slot) = s.add(HEAD);
+                        }
+                        tag_ref.store(p.tag, Ordering::Release);
+                        return slot.id;
+                    }
+                    // A competing writer owns this slot. Inspect its published
+                    // name before advancing, otherwise the same name gets two IDs.
+                    Err(observed) => t = observed,
                 }
-                slot.id = new_id;
-                slot.len = len;
-                let copy_len = (len as usize).min(HEAD);
-                std::ptr::copy_nonoverlapping(s, slot.head.as_mut_ptr(), copy_len);
-                if len as usize > HEAD {
-                    let over_len = len as usize - HEAD;
-                    let off = self.used.fetch_add(over_len as u32, Ordering::Relaxed) as usize;
-                    *self.overflow.add(p.slot) = off as u32;
-                    std::ptr::copy_nonoverlapping(s.add(HEAD), self.arena.add(off), over_len);
-                }
-                tag_ref.store(p.tag, Ordering::Release);
-                return new_id;
             }
             while t == BUSY {
                 t = tag_ref.load(Ordering::Acquire);
@@ -267,17 +274,19 @@ impl NameTable {
             let slot = &*self.slots.add(p.slot);
             if t == p.tag && slot.len == len && self.same_head(slot, s, len) {
                 if (len as usize) <= HEAD
-                    || libc_memcmp(
-                        self.arena.add(*self.overflow.add(p.slot) as usize),
-                        s.add(HEAD),
-                        len as usize - HEAD,
-                    )
+                    || libc_memcmp(*self.overflow.add(p.slot), s.add(HEAD), len as usize - HEAD)
                 {
                     return slot.id;
                 }
             }
             p.slot = (p.slot + 1) % SLOTS;
         }
+        // Only used once every fast slot is occupied. Exact bytes and the
+        // mutex ensure bounded probing and deterministic deduplication.
+        let mut spill = self.spill.lock().unwrap();
+        *spill
+            .entry(std::slice::from_raw_parts(s, len as usize).to_vec())
+            .or_insert_with(|| self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
     #[inline(always)]
@@ -307,6 +316,7 @@ const WORDS: usize = IDS / 64;
 
 struct NamesSeen {
     bits: *mut AtomicU64,
+    spill: Mutex<HashSet<(u32, u32)>>,
 }
 
 unsafe impl Send for NamesSeen {}
@@ -317,6 +327,7 @@ impl NamesSeen {
         unsafe {
             Self {
                 bits: zeroed::<AtomicU64>(256 * WORDS),
+                spill: Mutex::new(HashSet::new()),
             }
         }
     }
@@ -328,6 +339,9 @@ impl NamesSeen {
 
     #[inline(always)]
     unsafe fn prefetch(&self, c: u32, name: u32) {
+        if name as usize >= IDS {
+            return;
+        }
         _mm_prefetch(
             self.bits.add(c as usize * WORDS + (name as usize / 64)) as *const i8,
             _MM_HINT_T0,
@@ -336,6 +350,10 @@ impl NamesSeen {
 
     #[inline(always)]
     unsafe fn mark(&self, c: u32, name: u32) {
+        if name as usize >= IDS {
+            self.spill.lock().unwrap().insert((c, name));
+            return;
+        }
         let bit = 1u64 << (name % 64);
         let w = self.word(c, name);
         if (w.load(Ordering::Relaxed) & bit) == 0 {
@@ -351,11 +369,17 @@ impl NamesSeen {
                 .load(Ordering::Relaxed)
                 .count_ones() as u64;
         }
-        n
+        n + self
+            .spill
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&(country, _)| country == c)
+            .count() as u64
     }
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Copy, Clone)]
 struct Totals {
     count: u64,
     id_sum: u64,
@@ -365,6 +389,33 @@ struct Totals {
     amount_sum: i64,
     amount_min: i64,
     amount_max: i64,
+}
+
+impl Default for Totals {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            id_sum: 0,
+            name_bytes: 0,
+            note_bytes: 0,
+            distinct: 0,
+            amount_sum: 0,
+            amount_min: i64::MAX,
+            amount_max: i64::MIN,
+        }
+    }
+}
+
+// regions.csv is sorted by ID. Ignore the final LF before locating its last row.
+fn region_count(bytes: &[u8]) -> usize {
+    let last = bytes
+        .rsplit(|&b| b == b'\n')
+        .find(|line| !line.is_empty())
+        .unwrap_or(&[]);
+    last.iter()
+        .take_while(|b| b.is_ascii_digit())
+        .fold(0usize, |v, &b| v * 10 + (b - b'0') as usize)
+        + 1
 }
 
 #[inline(always)]
@@ -419,23 +470,28 @@ unsafe fn parse_records(
     let mut n = 0u64;
     let mut last = u64::MAX;
 
-    let advance = |n_val: u64,
-                   pending_arr: &[Pending; LAG],
-                   marks_arr: &mut [Mark; LAG],
-                   last_val: u64| {
-        let k = (n_val as usize) % LAG;
-        if n_val >= 2 * (LAG as u64) && n_val - 2 * (LAG as u64) < last_val {
-            seen.mark(marks_arr[k].country, marks_arr[k].id);
-        }
-        if n_val >= (LAG as u64) && n_val - (LAG as u64) < last_val {
-            let old = &pending_arr[k];
-            marks_arr[k] = Mark {
-                country: old.country,
-                id: names.id(old.name, old.len, Probe { slot: old.probe.slot, tag: old.probe.tag }),
-            };
-            seen.prefetch(marks_arr[k].country, marks_arr[k].id);
-        }
-    };
+    let advance =
+        |n_val: u64, pending_arr: &[Pending; LAG], marks_arr: &mut [Mark; LAG], last_val: u64| {
+            let k = (n_val as usize) % LAG;
+            if n_val >= 2 * (LAG as u64) && n_val - 2 * (LAG as u64) < last_val {
+                seen.mark(marks_arr[k].country, marks_arr[k].id);
+            }
+            if n_val >= (LAG as u64) && n_val - (LAG as u64) < last_val {
+                let old = &pending_arr[k];
+                marks_arr[k] = Mark {
+                    country: old.country,
+                    id: names.id(
+                        old.name,
+                        old.len,
+                        Probe {
+                            slot: old.probe.slot,
+                            tag: old.probe.tag,
+                        },
+                    ),
+                };
+                seen.prefetch(marks_arr[k].country, marks_arr[k].id);
+            }
+        };
 
     let mut sep = Structure::new(p, file_end);
     while p < end {
@@ -510,13 +566,7 @@ unsafe fn country_code(p: *const u8) -> u32 {
         | (*p.add(2) as u32 - 'A' as u32)
 }
 
-fn split_delim(
-    data: *const u8,
-    from: usize,
-    size: usize,
-    n: usize,
-    delim: &[u8],
-) -> Vec<usize> {
+fn split_delim(data: *const u8, from: usize, size: usize, n: usize, delim: &[u8]) -> Vec<usize> {
     let mut cut = vec![size; n + 1];
     cut[0] = from;
     for t in 1..n {
@@ -542,7 +592,11 @@ fn split_delim(
 }
 
 fn put_money(out: &mut String, cents: i64) {
-    let a = if cents < 0 { (-cents) as u64 } else { cents as u64 };
+    let a = if cents < 0 {
+        (-cents) as u64
+    } else {
+        cents as u64
+    };
     if cents < 0 {
         out.push_str(" -");
     } else {
@@ -555,8 +609,11 @@ fn put_money(out: &mut String, cents: i64) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("pclmulqdq") {
+        return Err("Track C requires AVX2 and PCLMULQDQ".into());
+    }
     unsafe {
-        prctl(14, 1, 0, 0, 0); // PR_SET_THP_DISABLE = 14
+        prctl(41, 1, 0, 0, 0); // Linux PR_SET_THP_DISABLE
     }
 
     let mut data_dir = PathBuf::from("/data");
@@ -605,24 +662,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let nthreads = 12;
 
-    // Find last line in regions
-    let nregions = unsafe {
-        let mut last = rsize.saturating_sub(1);
-        while last > 0 && *regions.add(last) != b'\n' {
-            last -= 1;
-        }
-        let mut ptr = regions.add(last + 1);
-        let end = regions.add(rsize);
-        while ptr < end && (*ptr < b'0' || *ptr > b'9') {
-            ptr = ptr.add(1);
-        }
-        let mut val = 0usize;
-        while ptr < end && *ptr >= b'0' && *ptr <= b'9' {
-            val = val * 10 + (*ptr - b'0') as usize;
-            ptr = ptr.add(1);
-        }
-        val + 1
-    };
+    let nregions = region_count(unsafe { std::slice::from_raw_parts(regions, rsize) });
 
     let country_of = unsafe { zeroed::<u8>(nregions) };
 
@@ -730,7 +770,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let reg_ptr = q;
                         let reg_id = digits(reg_ptr, comma) as usize;
                         if reg_id < nregions {
-                            *c_of_ptr.as_mut_ptr().add(reg_id) = idx_arr[country_code(comma.add(1)) as usize];
+                            *c_of_ptr.as_mut_ptr().add(reg_id) =
+                                idx_arr[country_code(comma.add(1)) as usize];
                         }
                     }
                     while q < to && *q != b'\n' {
@@ -842,4 +883,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     out_file.flush()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_region_and_chunk_boundaries() {
+        for ending in ["", "\n"] {
+            let text = format!("region_id,country\n1,AAA\n1234567,BBB{ending}");
+            assert_eq!(region_count(text.as_bytes()), 1234568);
+            for threads in 1..32 {
+                let from = text.find('\n').unwrap() + 1;
+                let cuts = split_delim(text.as_ptr(), from, text.len(), threads, b"\n");
+                assert_eq!(cuts[0], from);
+                assert_eq!(*cuts.last().unwrap(), text.len());
+                for pair in cuts.windows(2) {
+                    assert!(pair[0] <= pair[1]);
+                    if pair[0] < text.len() {
+                        assert_eq!(text.as_bytes()[pair[0] - 1], b'\n');
+                    }
+                }
+            }
+        }
+        assert_eq!(Totals::default().amount_min, i64::MAX);
+        assert_eq!(Totals::default().amount_max, i64::MIN);
+    }
+
+    #[test]
+    fn concurrent_names_have_one_id_even_after_failed_claims() {
+        let table = NameTable::new();
+        let barrier = Barrier::new(12);
+        let data: Vec<Vec<u8>> = (0..256)
+            .map(|i| {
+                let mut bytes = vec![0; 8];
+                bytes
+                    .extend_from_slice(format!("name-{i:04}-with-a-long-shared-prefix").as_bytes());
+                bytes.extend_from_slice(&[0; 64]);
+                bytes
+            })
+            .collect();
+        thread::scope(|scope| {
+            let handles: Vec<_> = (0..12)
+                .map(|_| {
+                    scope.spawn(|| {
+                        data.iter()
+                            .map(|bytes| unsafe {
+                                let p = bytes.as_ptr().add(8);
+                                let len = (bytes.len() - 72) as u32;
+                                let probe = table.probe(p, len);
+                                barrier.wait();
+                                table.id(p, len, probe)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            let ids: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            for other in &ids[1..] {
+                assert_eq!(ids[0], *other);
+            }
+        });
+        assert_eq!(table.next_id.load(Ordering::Relaxed), 256);
+    }
+
+    #[test]
+    fn full_fast_table_spills_without_losing_distinct_names() {
+        let table = NameTable::new();
+        let seen = NamesSeen::new();
+        let bytes = [b'x'; 80];
+        unsafe {
+            for slot in 0..SLOTS {
+                (*table.tags.add(slot)).store(1, Ordering::Relaxed);
+            }
+            table.next_id.store(IDS as u32, Ordering::Relaxed);
+            let a = table.id(bytes.as_ptr().add(8), 8, Probe { slot: 0, tag: 2 });
+            let b = table.id(bytes.as_ptr().add(8), 8, Probe { slot: 0, tag: 2 });
+            assert_eq!(a, b);
+            seen.mark(3, a);
+            seen.mark(3, b);
+            assert_eq!(seen.count(3), 1);
+            assert_eq!(seen.count(4), 0);
+        }
+    }
 }

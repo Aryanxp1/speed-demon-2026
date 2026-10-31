@@ -231,14 +231,8 @@ unsafe fn token_bytes_256(q: *const u8) -> u32 {
     let letter = _mm256_sub_epi8(lower_v, _mm256_set1_epi8(b'a' as i8));
     let digit = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
     let zero = _mm256_setzero_si256();
-    let is_letter = _mm256_cmpeq_epi8(
-        _mm256_subs_epu8(letter, _mm256_set1_epi8(25)),
-        zero,
-    );
-    let is_digit = _mm256_cmpeq_epi8(
-        _mm256_subs_epu8(digit, _mm256_set1_epi8(9)),
-        zero,
-    );
+    let is_letter = _mm256_cmpeq_epi8(_mm256_subs_epu8(letter, _mm256_set1_epi8(25)), zero);
+    let is_digit = _mm256_cmpeq_epi8(_mm256_subs_epu8(digit, _mm256_set1_epi8(9)), zero);
     let in_set = _mm256_or_si256(is_letter, is_digit);
     _mm256_movemask_epi8(in_set) as u32
 }
@@ -294,7 +288,11 @@ unsafe fn for_each_token<F: FnMut(u32)>(
         while t < e && LOWER.t[*t as usize] != 0 {
             t = t.add(1);
         }
-        m &= if after != 0 { !0u64 << after.trailing_zeros() } else { 0 };
+        m &= if after != 0 {
+            !0u64 << after.trailing_zeros()
+        } else {
+            0
+        };
         if t > q.add(64) {
             q = t;
             fresh = true;
@@ -308,7 +306,11 @@ unsafe fn for_each_token<F: FnMut(u32)>(
         while i < 4 {
             let b = if len > 8 * i { (len - 8 * i).min(8) } else { 0 };
             let w = (s.add(8 * i) as *const u64).read_unaligned();
-            let mask = if b == 8 { !0u64 } else { (1u64 << (8 * b)).wrapping_sub(1) };
+            let mask = if b == 8 {
+                !0u64
+            } else {
+                (1u64 << (8 * b)).wrapping_sub(1)
+            };
             k.w[i] = (w | 0x2020202020202020) & mask;
             i += 1;
         }
@@ -398,7 +400,8 @@ struct Index {
     first: Vec<u32>,
     start: Vec<u32>,
     seg_end: Vec<Vec<u32>>,
-    post: Vec<u32>,
+    post: Vec<u16>,
+    wide_post: Vec<u32>,
     text: Vec<u32>,
 }
 
@@ -494,8 +497,10 @@ fn build_index(
                         tx = tx.add(1);
                     }
                     let d_idx = doc as usize;
-                    *tx_ptr.as_ptr().cast_mut().add(2 * d_idx) = (tx as usize - b_ptr.as_ptr() as usize) as u32;
-                    *tx_ptr.as_ptr().cast_mut().add(2 * d_idx + 1) = (nl as usize - b_ptr.as_ptr() as usize) as u32;
+                    *tx_ptr.as_ptr().cast_mut().add(2 * d_idx) =
+                        (tx as usize - b_ptr.as_ptr() as usize) as u32;
+                    *tx_ptr.as_ptr().cast_mut().add(2 * d_idx + 1) =
+                        (nl as usize - b_ptr.as_ptr() as usize) as u32;
 
                     for_each_token(tx, nl, terms_ref, |id| {
                         if id != NONE && last_doc[id as usize] != doc {
@@ -518,6 +523,20 @@ fn build_index(
             sampled[t] = samp;
             count[t] = cnt;
         }
+    });
+
+    // Empty byte ranges still need the next document's base. Use a wide
+    // representation if any partition exceeds the entire u16 offset range.
+    for t in 0..nthreads {
+        first_docs[t] = if cut[t] < size {
+            unsafe { parse_id(base.add(cut[t])) }
+        } else {
+            docs
+        };
+    }
+    let compact = (0..nthreads).all(|t| {
+        let end = first_docs.get(t + 1).copied().unwrap_or(docs);
+        end - first_docs[t] <= u16::MAX as u32 + 1
     });
 
     // Sample barrier aggregation
@@ -597,8 +616,10 @@ fn build_index(
                         tx = tx.add(1);
                     }
                     let d_idx = doc as usize;
-                    *tx_ptr.as_ptr().cast_mut().add(2 * d_idx) = (tx as usize - b_ptr.as_ptr() as usize) as u32;
-                    *tx_ptr.as_ptr().cast_mut().add(2 * d_idx + 1) = (nl as usize - b_ptr.as_ptr() as usize) as u32;
+                    *tx_ptr.as_ptr().cast_mut().add(2 * d_idx) =
+                        (tx as usize - b_ptr.as_ptr() as usize) as u32;
+                    *tx_ptr.as_ptr().cast_mut().add(2 * d_idx + 1) =
+                        (nl as usize - b_ptr.as_ptr() as usize) as u32;
 
                     for_each_token(tx, nl, terms_ref, |id| {
                         if id != NONE && last_doc[id as usize] != doc {
@@ -610,8 +631,15 @@ fn build_index(
                                     .fetch_or(1u64 << (doc % 64), Ordering::Relaxed);
                             } else {
                                 let bucket = (id >> BUCKET_BITS) as usize;
-                                local_seen[bucket].push(id);
-                                local_seen[bucket].push(doc);
+                                if compact {
+                                    // Nine bucket-local term bits + sixteen document bits.
+                                    let offset = doc - f;
+                                    debug_assert!(offset <= u16::MAX as u32);
+                                    local_seen[bucket]
+                                        .push(((id & ((1 << BUCKET_BITS) - 1)) << 16) | offset);
+                                } else {
+                                    local_seen[bucket].extend_from_slice(&[id, doc]);
+                                }
                                 local_cnt[id as usize] += 1;
                             }
                         }
@@ -644,34 +672,42 @@ fn build_index(
     }
     start[nterms as usize] = total_postings;
 
-    let mut post = vec![0u32; total_postings as usize];
+    let mut post = vec![0u16; if compact { total_postings as usize } else { 0 }];
+    let mut wide_post = vec![0u32; if compact { 0 } else { total_postings as usize }];
     let post_send = SendPtr(post.as_mut_ptr());
+    let wide_send = SendPtr(wide_post.as_mut_ptr());
 
-    thread::scope(|s| {
-        let count_ref = &count;
-        let seen_ref = &seen;
-
-        for t in 0..nthreads {
-            let p_ptr = post_send;
-            s.spawn(move || unsafe {
-                let mut local_cur = count_ref[t].clone();
-                for b in 0..nbuckets {
-                    let items = &seen_ref[t][b];
-                    let mut i = 0;
-                    while i < items.len() {
-                        let id = items[i];
-                        let doc = items[i + 1];
-                        let dst = local_cur[id as usize] as usize;
-                        *p_ptr.as_ptr().cast_mut().add(dst) = doc;
-                        local_cur[id as usize] += 1;
-                        i += 2;
+    let seg_end = thread::scope(|scope| {
+        let handles: Vec<_> = seen
+            .into_iter()
+            .enumerate()
+            .map(|(t, buckets)| {
+                let mut cursor = count[t].clone();
+                scope.spawn(move || unsafe {
+                    // Each worker owns disjoint term ranges in the destination.
+                    // Consuming buckets releases temporary storage during scatter.
+                    for (bucket, items) in buckets.into_iter().enumerate() {
+                        if compact {
+                            for item in items {
+                                let id = (bucket << BUCKET_BITS) | (item >> 16) as usize;
+                                *post_send.as_ptr().cast_mut().add(cursor[id] as usize) =
+                                    item as u16;
+                                cursor[id] += 1;
+                            }
+                        } else {
+                            for pair in items.chunks_exact(2) {
+                                let id = pair[0] as usize;
+                                *wide_send.as_ptr().cast_mut().add(cursor[id] as usize) = pair[1];
+                                cursor[id] += 1;
+                            }
+                        }
                     }
-                }
-            });
-        }
+                    cursor
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-
-    let seg_end = count;
 
     let mut df = vec![0u32; nterms as usize];
     for id in 0..nterms as usize {
@@ -680,7 +716,9 @@ fn build_index(
         if d != NONE {
             let mut bits_cnt = 0u32;
             for w in 0..words {
-                bits_cnt += bits[d as usize * words + w].load(Ordering::Relaxed).count_ones();
+                bits_cnt += bits[d as usize * words + w]
+                    .load(Ordering::Relaxed)
+                    .count_ones();
             }
             df[id] += bits_cnt;
         }
@@ -697,6 +735,7 @@ fn build_index(
         start,
         seg_end,
         post,
+        wide_post,
         text,
     }
 }
@@ -882,6 +921,7 @@ struct Solver<'a> {
     tmp: Vec<u32>,
     bm: Vec<u64>,
     dense: bool,
+    decoded: Vec<u32>,
 }
 
 impl<'a> Solver<'a> {
@@ -894,11 +934,15 @@ impl<'a> Solver<'a> {
             tmp: Vec::new(),
             bm: Vec::new(),
             dense: false,
+            decoded: Vec::new(),
         }
     }
 
     #[inline(always)]
-    fn postings(&self, id: u32) -> Postings<'a> {
+    fn postings<'b>(&self, id: u32, decoded: &'b mut Vec<u32>) -> Postings<'b>
+    where
+        'a: 'b,
+    {
         let d = self.ix.dense[id as usize];
         if d != NONE {
             let start = d as usize * self.ix.words;
@@ -910,32 +954,52 @@ impl<'a> Solver<'a> {
                 df: self.ix.df[id as usize] as usize,
             };
         }
-        let s = self.ix.start[id as usize] as usize;
-        let e = self.ix.start[id as usize + 1] as usize;
+        let start = self.ix.start[id as usize] as usize;
+        let end = self.ix.start[id as usize + 1] as usize;
+        let p = if !self.ix.wide_post.is_empty() {
+            &self.ix.wide_post[start..end]
+        } else {
+            decoded.clear();
+            decoded.reserve(end - start);
+            let mut offset = start;
+            for t in 0..self.ix.threads {
+                let segment_end = self.ix.seg_end[t][id as usize] as usize;
+                let base = self.ix.first[t];
+                decoded.extend(
+                    self.ix.post[offset..segment_end]
+                        .iter()
+                        .map(|&x| base + x as u32),
+                );
+                offset = segment_end;
+            }
+            &decoded[..]
+        };
         Postings {
-            p: &self.ix.post[s..e],
+            p,
             bits: None,
             words: self.ix.words,
-            df: (e - s),
+            df: end - start,
         }
     }
 
     fn answer(&mut self, q: &Query, out: &mut [u8]) -> usize {
+        let mut decoded = std::mem::take(&mut self.decoded);
         if q.phrase {
-            self.phrase(q);
+            self.phrase(q, &mut decoded);
         } else {
-            self.boolean(q);
+            self.boolean(q, &mut decoded);
         }
+        self.decoded = decoded;
         self.format(out)
     }
 
-    fn boolean(&mut self, q: &Query) {
+    fn boolean(&mut self, q: &Query, decoded: &mut Vec<u32>) {
         if q.terms.is_empty() {
             self.dense = false;
             self.cur.clear();
             return;
         }
-        let first = self.postings(q.terms[0]);
+        let first = self.postings(q.terms[0], decoded);
         self.dense = first.bits.is_some();
         if self.dense {
             let b_slice = first.bits.unwrap();
@@ -949,7 +1013,7 @@ impl<'a> Solver<'a> {
         }
 
         for i in 0..q.ops.len() {
-            let b = self.postings(q.terms[i + 1]);
+            let b = self.postings(q.terms[i + 1], decoded);
             let op = q.ops[i];
             if self.dense {
                 self.apply_dense(op, b);
@@ -1012,7 +1076,7 @@ impl<'a> Solver<'a> {
         }
     }
 
-    fn phrase(&mut self, q: &Query) {
+    fn phrase(&mut self, q: &Query, decoded: &mut Vec<u32>) {
         self.dense = false;
         if q.terms.is_empty() {
             self.cur.clear();
@@ -1025,7 +1089,7 @@ impl<'a> Solver<'a> {
         order.sort_by_key(|&id| ix.df[id as usize]);
 
         let rarest = order[0];
-        let p_rarest = self.postings(rarest);
+        let p_rarest = self.postings(rarest, decoded);
         self.cur.clear();
         if let Some(bits) = p_rarest.bits {
             for_each_bit(bits, p_rarest.words, |x| self.cur.push(x));
@@ -1037,7 +1101,7 @@ impl<'a> Solver<'a> {
             if self.cur.is_empty() {
                 break;
             }
-            op_and(&self.cur, self.postings(id), &mut self.tmp);
+            op_and(&self.cur, self.postings(id, decoded), &mut self.tmp);
             std::mem::swap(&mut self.cur, &mut self.tmp);
         }
 
@@ -1315,11 +1379,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             s.spawn(move || {
                 let mut solver = Solver::new(ix_ref, terms_ref, d_send.as_ptr());
                 loop {
-                    let start = next_ref.fetch_add(16, Ordering::Relaxed);
+                    let start = next_ref.fetch_add(64, Ordering::Relaxed);
                     if start >= nq {
                         break;
                     }
-                    let end = (start + 16).min(nq);
+                    let end = (start + 64).min(nq);
                     for j in start..end {
                         unsafe {
                             let slot_slice = std::slice::from_raw_parts_mut(
@@ -1347,5 +1411,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     unsafe {
         _exit(0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offset_case(documents: u32, threads: usize, expect_compact: bool) {
+        let mut corpus = String::new();
+        for doc in 0..documents {
+            let text = if doc == 0 || doc == documents - 1 {
+                "needle"
+            } else {
+                "other"
+            };
+            corpus.push_str(&format!("{doc}\t{text}\n"));
+        }
+        let size = corpus.len();
+        let mut bytes = corpus.into_bytes();
+        bytes.extend_from_slice(&[0; 128]);
+        let mut query = b"BOOL needle\n".to_vec();
+        let qsize = query.len();
+        query.extend_from_slice(&[0; 128]);
+        let mut terms = TermTable::new();
+        let mut queries = parse_queries(query.as_ptr(), qsize, &mut terms);
+        let ix = build_index(bytes.as_ptr(), size, &mut terms, &mut queries, threads);
+        assert_eq!(ix.wide_post.is_empty(), expect_compact);
+        let mut solver = Solver::new(&ix, &terms, bytes.as_ptr());
+        let mut out = [0; 128];
+        let len = solver.answer(&queries[0], &mut out);
+        let expected = format!("2 {} 0 {}\n", documents - 1, documents - 1);
+        assert_eq!(&out[..len], expected.as_bytes());
+    }
+
+    #[test]
+    fn compact_offsets_cover_u16_max_and_wide_fallback() {
+        offset_case(65536, 1, true);
+        offset_case(65537, 1, false);
+        offset_case(65537, 12, true);
+    }
+
+    #[test]
+    fn empty_worker_segments_preserve_posting_order() {
+        offset_case(2, 12, true);
     }
 }
