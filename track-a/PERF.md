@@ -94,3 +94,10 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | c451b56 | run-95a7235e8965 | 0.0295 | 34.2 | 38.61 | 79.34 | Same Track A code |
 | 5a6463e | run-18cf1fb4a517 | 0.0304 | 32.8 | 38.36 | 79.19 | Same Track A code |
 | 836c19e | run-ab09a84f93b8 | 0.0310 | 20 | 40.99 | 80.64 | Step 3: pwrite per hour, batched chunk release, THP off |
+| b962d6b | run-b962d6b976eb | 0.0301 | 20.0 | 40.67 | 80.47 | Step 4: text size precomputed, mapped output |
+| 20c5a50 | run-20c5a50e4cb0 | 0.0301 | 21.0 | 41.10 | 80.69 | Step 5: trimmed line count |
+| 3b736d2 | run-3b736d2f0408 | 0.0279 | 21.2 | 41.84 | 81.08 | Step 8: lock-free arena table, branchless select |
+| 0fb87a6 | run-0fb87a6d8f1a | 0.0280 | 18.6 | 42.78 | 81.56 | Step 9: 64 KB batched release, pre-barrier free |
+| 0ee3487 | run-0ee3487c8434 | 0.0269 | 19.6 | 43.01 | 81.68 | Step 10: single scratch sizing, 64-byte AVX2 |
+| ebcf5b8 | run-ebcf5b81097e | 0.0260 | 18.8 | 43.96 | 82.16 | Step 11: non-zeroed scratch, bit-length width |
+| d8cd3fe | run-99025cc8bb53 | 0.0258 | 19.2 | 44.26 | 82.30 | Team Lex: Step 11 lock-free arena + _exit(0) |
