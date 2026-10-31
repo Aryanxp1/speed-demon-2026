@@ -18,6 +18,7 @@ const MAP_FAILED: *mut u8 = !0 as *mut u8;
 const PR_SET_THP_DISABLE: i32 = 41;
 
 const RING: usize = 4096;
+const RING_WORDS: usize = RING / 64;
 const ESC_MARKER: u32 = 0xFFFF;
 
 unsafe fn map_file(file: &File) -> (*const u8, usize) {
@@ -142,23 +143,59 @@ fn dial(
 ) -> i64 {
     let d32_ptr = d32.as_mut_ptr();
     let ring_ptr = ring.as_mut_ptr();
+    let mut bitmask = [0u64; RING_WORDS];
     let mut d = 0u32;
-    let mut live = 1usize;
     let mut res = -1i64;
+    let mut upper_bound = u64::MAX;
 
     unsafe {
         *d32_ptr.add(s as usize) = 0;
         touched.push(s);
         (*ring_ptr).push(s);
+        bitmask[0] |= 1u64;
 
-        while live > 0 && res == -1 {
-            let bucket_idx = (d as usize) & (RING - 1);
-            let bucket = &mut *ring_ptr.add(bucket_idx);
+        loop {
+            if d as u64 >= upper_bound {
+                res = upper_bound as i64;
+                break;
+            }
+
+            let cur_b = (d as usize) & (RING - 1);
+            let word = cur_b / 64;
+            let bit = cur_b % 64;
+            let cur_bits = bitmask[word] & (!0u64 << bit);
+
+            let next_b = if cur_bits != 0 {
+                word * 64 + cur_bits.trailing_zeros() as usize
+            } else {
+                let mut found = None;
+                for i in 1..RING_WORDS {
+                    let w = (word + i) & (RING_WORDS - 1);
+                    let val = bitmask[w];
+                    if val != 0 {
+                        found = Some(w * 64 + val.trailing_zeros() as usize);
+                        break;
+                    }
+                }
+                match found {
+                    Some(b) => b,
+                    None => break,
+                }
+            };
+
+            let delta = (next_b + RING - cur_b) & (RING - 1);
+            d += delta as u32;
+
+            if d as u64 >= upper_bound {
+                res = upper_bound as i64;
+                break;
+            }
+
+            let bucket = &mut *ring_ptr.add(next_b);
             let mut k = 0;
             while k < bucket.len() && res == -1 {
                 let u = *bucket.get_unchecked(k);
                 k += 1;
-                live -= 1;
                 if *d32_ptr.add(u as usize) != d {
                     continue;
                 }
@@ -171,9 +208,15 @@ fn dial(
                 for e in start..end {
                     let (v, w) = edge_at(pk, esc, u, e);
                     let nd = (d as u64) + (w as u64);
+                    if nd >= upper_bound {
+                        continue;
+                    }
                     if w >= RING as u32 || nd >= (u32::MAX - 1) as u64 {
                         res = -2;
                         break;
+                    }
+                    if v == tg {
+                        upper_bound = nd;
                     }
                     let nd32 = nd as u32;
                     let v_idx = v as usize;
@@ -183,13 +226,18 @@ fn dial(
                             touched.push(v);
                         }
                         *d32_ptr.add(v_idx) = nd32;
-                        (*ring_ptr.add((nd32 as usize) & (RING - 1))).push(v);
-                        live += 1;
+                        let target_b = (nd32 as usize) & (RING - 1);
+                        (*ring_ptr.add(target_b)).push(v);
+                        bitmask[target_b / 64] |= 1u64 << (target_b % 64);
                     }
                 }
             }
             bucket.clear();
-            d += 1;
+            bitmask[next_b / 64] &= !(1u64 << (next_b % 64));
+
+            if res != -1 {
+                break;
+            }
         }
 
         for b in ring.iter_mut() {
@@ -203,6 +251,8 @@ fn dial(
 
     if res == -2 {
         dijkstra_fallback(pk, esc, off, s, tg)
+    } else if res == -1 && upper_bound != u64::MAX {
+        upper_bound as i64
     } else {
         res
     }
@@ -254,11 +304,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let graph_file = File::open(&graph_path)?;
     let queries_file = File::open(&queries_path)?;
 
-    let nthreads = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(12)
-        .min(12)
-        .max(1);
+    let nthreads = std::env::var("SPEED_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(8)
+                .min(8)
+                .max(1)
+        });
 
 
     // 1. Map graph.txt and queries.txt
