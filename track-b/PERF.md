@@ -33,7 +33,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 26 | Rust again: queries stored flat, the sample's counts freed at once, rustfmt-friendly helpers; 557 lines, 55 MB | run-5231ce22564c | 0.241 | 58.0 | 68.86 |
 | 27 | Per-token handler inlined into the token loop (it was one function call per token) and branch-free; terms numbered by class so a token's role is its id range; each term's postings in one stretch, terms dealt round-robin over 32 scan buckets; bitmaps borrowed, not copied, at query time; branch-free list merge | run-b6f929f84526 | 0.237 | 69.1 | 68.03 |
 | 28 | Transparent huge pages off for the process (`PR_SET_THP_DISABLE`), as the C++ had from step 13 | run-174007cb966d | 0.235 | 48.8 | 69.62 |
-| 29 | Non-term fast exit, 32 KB chunk allocation, stack-based zero-alloc integer formatting | pending | 0.198 | 41.2 | 74.2 |
+| 29 | Non-term fast exit, 32 KB chunk allocation, stack-based zero-alloc integer formatting | run-52a2d5611b2b | 0.212 | 51.7 | 70.37 |
+| 30 | Zero-allocation phrase query formatting, dropping scan counts before post allocation, and early _exit(0) | pending | | | |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 

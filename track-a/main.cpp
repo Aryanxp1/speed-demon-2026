@@ -55,8 +55,38 @@ inline u32 eq32(const char* p, char c) {
     return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
 }
 
-// The number of decimal digits in x.
-inline u32 width(u32 x) { return x < 10 ? 1 : 1 + width(x / 10); }
+// The number of decimal digits in x (branchless, division-free).
+inline u32 width(u32 x) {
+    return 1 + (x >= 10) + (x >= 100) + (x >= 1000) + (x >= 10000) + (x >= 100000) +
+           (x >= 1000000) + (x >= 10000000) + (x >= 100000000) + (x >= 1000000000);
+}
+
+static const char DIGITS[201] =
+    "0001020304050607080910111213141516171819"
+    "2021222324252627282930313233343536373839"
+    "4041424344454647484950515253545556575859"
+    "6061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
+
+inline char* write_u32(char* p, u32 v) {
+    if (v < 10) { *p++ = '0' + v; return p; }
+    char buf[12];
+    int len = 0;
+    while (v >= 100) {
+        u32 q = v / 100, r = v % 100;
+        buf[len++] = DIGITS[r * 2 + 1];
+        buf[len++] = DIGITS[r * 2];
+        v = q;
+    }
+    if (v >= 10) {
+        buf[len++] = DIGITS[v * 2 + 1];
+        buf[len++] = DIGITS[v * 2];
+    } else {
+        buf[len++] = '0' + v;
+    }
+    while (len > 0) *p++ = buf[--len];
+    return p;
+}
 
 // The value of the len (1 to 10) digits ending just before end, with no loop:
 // the 16 bytes before end, minus '0' and with the bytes ahead of the number
@@ -82,7 +112,7 @@ inline const char* next_byte(const char* s, char c) {
 // the name's first and last eight bytes (masked when the name is shorter; the
 // rest of the line keeps both loads in bounds). Names point into the log.
 struct Interner {
-    static constexpr u32 SLOTS = 1 << 12;  // ids fit 11 bits; a seed has 1,842
+    static constexpr u32 SLOTS = 1 << 13;  // ids fit 11 bits; a seed has 1,842
     std::vector<std::string_view> names;
     // id + 1 per slot, 0 if free.
     std::vector<uint16_t> slot = std::vector<uint16_t>(SLOTS);
@@ -93,7 +123,7 @@ struct Interner {
         if (s.size() >= 8) memcpy(&b, s.data() + s.size() - 8, 8);
         else a &= (u64(1) << 8 * s.size()) - 1;
         for (u32 i = _mm_crc32_u64(_mm_crc32_u64(s.size(), a), b);; ++i) {
-            uint16_t& id = slot[i % SLOTS];
+            uint16_t& id = slot[i & (SLOTS - 1)];
             if (id == 0) {
                 if (names.size() == SLOTS / 2) _exit(2);  // ids are 11 bits
                 names.push_back(s);
@@ -132,12 +162,14 @@ struct Parser {
     std::vector<std::pair<u32, u32>> wide[HOURS];
     std::vector<u32> rank;  // local id -> global rank
     // next: where the next chunk is carved; kept: first one not yet released.
-    Chunk *next = nullptr, *kept = nullptr;
+    Chunk *next = nullptr, *kept = nullptr, *base = nullptr;
+    size_t mapped_bytes = 0;
 
     void run(const char* p, const char* end) {
         // A line is at least 40 bytes; each hour may leave one chunk part full.
         size_t bytes = ((end - p) / 40 / Chunk::CAP + 1 + HOURS) * sizeof(Chunk);
-        next = kept = (Chunk*)mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        base = next = kept = (Chunk*)mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        mapped_bytes = bytes;
         while (p < end) {
             // YYYY-MM-DDTHH: month's last digit at 6, day at 8-9, hour at 11-12.
             int day = (p[8] - '0') * 10 + (p[9] - '0'), hour = (p[11] - '0') * 10 + (p[12] - '0');
@@ -242,6 +274,18 @@ int main(int argc, char** argv) {
     std::vector<u64> at(HOURS + 1);  // an hour's text size, then its offset
     char* text = nullptr;
     std::barrier sized(nt, [&]() noexcept {
+        for (auto& ps : parsers) {
+            if (ps.base && ps.mapped_bytes) {
+                munmap(ps.base, ps.mapped_bytes);
+                ps.base = nullptr;
+            }
+            for (int h = 0; h < HOURS; ++h) {
+                std::vector<std::pair<u32, u32>>().swap(ps.wide[h]);
+            }
+            std::vector<uint16_t>().swap(ps.local.slot);
+            std::vector<std::string_view>().swap(ps.local.names);
+            std::vector<u32>().swap(ps.rank);
+        }
         u64 total = 0;
         for (int h = 0; h < HOURS; ++h) total += std::exchange(at[h], total);
         at[HOURS] = total;
@@ -283,7 +327,9 @@ int main(int argc, char** argv) {
                 // each later selection only needs the front part.
                 u32* a = latency.data() + start[e];
                 u32 r99 = (99 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r50 = (50 * n + 99) / 100 - 1;
-                if (n <= 64) std::sort(a, a + n);  // most groups; cheaper than three selections
+                if (n == 1) {}
+                else if (n == 2) { if (a[0] > a[1]) std::swap(a[0], a[1]); }
+                else if (n <= 64) std::sort(a, a + n);  // most groups; cheaper than three selections
                 else for (auto [r, lim] : {std::pair{r99, n}, {r95, r99}, {r50, r95}}) std::nth_element(a, a + r, a + lim);
                 const Line& l = lines[h].emplace_back(e, n, a[r50], a[r95], a[r99], errors[e]);
                 // Label, name, six numbers each after a space, newline.
@@ -292,20 +338,33 @@ int main(int argc, char** argv) {
             }
             at[h] = size;
         }
+        std::vector<u32>().swap(latency);
+        std::vector<u32>().swap(start);
+        std::vector<u32>().swap(errors);
         sized.arrive_and_wait();
 
         for (int h; (h = claim_text++) < HOURS;) {
-            char label[32];
-            int day = (h + 18) / 24;
-            snprintf(label, sizeof label, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11, day < 2 ? 30 + day : day - 1, (h + 18) % 24);
+            char label[32] = "2026-10-30T18:00:00Z ";
+            int day = (h + 18) / 24, mon = day < 2 ? 10 : 11, d = day < 2 ? 30 + day : day - 1, hr = (h + 18) % 24;
+            label[5] = '0' + mon / 10; label[6] = '0' + mon % 10;
+            label[8] = '0' + d / 10; label[9] = '0' + d % 10;
+            label[11] = '0' + hr / 10; label[12] = '0' + hr % 10;
             char* o = text + at[h];
             for (const Line& l : lines[h]) {
                 o = std::copy_n(label, 21, o);
                 o = std::copy(names[l.e].begin(), names[l.e].end(), o);
-                for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)}) {
-                    *o++ = ' ';
-                    o = std::to_chars(o, o + 10, x).ptr;
-                }
+                *o++ = ' ';
+                o = write_u32(o, l.n);
+                *o++ = ' ';
+                o = write_u32(o, l.p50);
+                *o++ = ' ';
+                o = write_u32(o, l.p95);
+                *o++ = ' ';
+                o = write_u32(o, l.p99);
+                *o++ = ' ';
+                o = write_u32(o, l.errors);
+                *o++ = ' ';
+                o = write_u32(o, ppm(l));
                 *o++ = '\n';
             }
             std::vector<Line>().swap(lines[h]);
@@ -313,5 +372,5 @@ int main(int argc, char** argv) {
     });
     for (auto& th : pool) th.join();
     close(out);
-    return 0;
+    _exit(0);
 }

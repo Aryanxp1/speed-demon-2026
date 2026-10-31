@@ -11,7 +11,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 4 | Hours computed into compact per-group numbers with their exact text size, then formatted straight into the mapped output file at known offsets; endpoint names compared with one 32-byte SIMD compare | run-b962d6b976eb | 0.0301 | 20 | 80.47 |
 | 5 | Step 4 trimmed from 301 to 271 counted lines: digit width by recursion, shorter error paths, unused includes and fields dropped, the three selections as one loop | run-20c5a50e4cb0 | 0.0301 | 21 | 80.69 |
 | 6 | Rust port of step 5, same design; rustfmt-counted code trimmed from 444 to 341 lines | run-2048094dbc8d | 0.0323 | 20.9 | 79.14 |
-| 7 | Back to the C++ of step 5: on the box the Rust port was no faster and counts 349 lines against 271 | pending | | | |
+| 7 | Back to the C++ of step 5: on the box the Rust port was no faster and counts 349 lines against 271 | run-1a8505de02c6 | 0.0334 | 21.75 | 79.45 |
+| 8 | Branchless digit width, 8192-slot interner, n<=2 selection shortcut, direct ASCII date copy, unmapping parser chunks before output mapping, 2-digit LUT integer formatting, _exit(0) | pending | | | |
 
 ## Local measurements
 
