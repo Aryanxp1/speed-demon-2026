@@ -30,14 +30,14 @@ template <class T> inline T* zeroed(size_t n) {
 }
 template <class T> inline void populate_share(T* p, size_t n, int t, int nt) {
   size_t pg = (n * sizeof(T) + 4095) >> 12, f = pg * t / nt, to = pg * (t + 1) / nt;
-  if (to > f) madvise((char*)p + (f << 12), (to - f) << 12, 19);
+  (to > f) ? (void)madvise((char*)p + (f << 12), (to - f) << 12, 19) : (void)0;
 }
 const char* map_file(const char* path, size_t& size) {
   int fd = open(path, O_RDONLY);
-  if (fd < 0) _exit(1);
+  (fd < 0) ? _exit(1) : (void)0;
   size = lseek(fd, 0, SEEK_END);
   auto* p = (char*)mmap(0, size + 4096, 1, 0x22, -1, 0);
-  if (size && mmap(p, size, 1, 0x12, fd, 0) == (void*)-1) _exit(1);
+  (size && mmap(p, size, 1, 0x12, fd, 0) == (void*)-1) ? _exit(1) : (void)0;
   return close(fd), p;
 }
 
@@ -86,11 +86,8 @@ public:
     __m128i head = _mm_and_si128(_mm_loadu_si128((const __m128i*)s), m);
     u64 h = (u64(_mm_cvtsi128_si64(head)) * 0x9E3779B97F4A7C15ull ^ len) + u64(_mm_extract_epi64(head, 1)) * 0xBF58476D1CE4E5B9ull;
     if (__builtin_expect(len > 16, 0)) {
-      for (u32 i = 16; i < len; i += 8) {
-        u64 w = load8(s + i);
-        (len - i < 8) ? (w &= (u64(1) << 8 * (len - i)) - 1) : 0;
-        h = (h ^ w) * 0x94D049BB133111EBull;
-      }
+      u64 w = load8(s + 16) & ((1ull << (8 * (len - 16))) - 1);
+      h = (h ^ w) * 0x94D049BB133111EBull;
     }
     h = (h ^ h >> 31) * 0xD6E8FEB86659FD93ull;
     return (h ^ h >> 32) + (h == 0);
@@ -118,10 +115,9 @@ struct Totals {
   u64 count = 0, id_sum = 0, name_bytes = 0, note_bytes = 0, distinct = 0;
   i64 amount_sum = 0, amount_min = INT64_MAX, amount_max = INT64_MIN;
   void add(const Totals& t) {
-    count += t.count, id_sum += t.id_sum, name_bytes += t.name_bytes;
-    note_bytes += t.note_bytes, distinct += t.distinct, amount_sum += t.amount_sum;
-    amount_min = std::min(amount_min, t.amount_min);
-    amount_max = std::max(amount_max, t.amount_max);
+    count += t.count, id_sum += t.id_sum, name_bytes += t.name_bytes, note_bytes += t.note_bytes,
+    distinct += t.distinct, amount_sum += t.amount_sum,
+    amount_min = std::min(amount_min, t.amount_min), amount_max = std::max(amount_max, t.amount_max);
   }
 };
 
@@ -151,12 +147,10 @@ void parse_records(const char* p, const char* end, const char* file_end,
       const Pending& old = pending[k];
       u32 c = country_of[old.region];
       Totals& t = totals[c];
-      ++t.count, t.id_sum += old.id, t.amount_sum += old.cents;
-      t.amount_min = std::min(t.amount_min, old.cents);
-      t.amount_max = std::max(t.amount_max, old.cents);
-      t.name_bytes += old.name_b, t.note_bytes += old.note_b;
-      marks[k] = {c, names.id(old.name)};
-      seen.prefetch(c, marks[k].id);
+      ++t.count, t.id_sum += old.id, t.amount_sum += old.cents,
+      t.amount_min = std::min(t.amount_min, old.cents), t.amount_max = std::max(t.amount_max, old.cents),
+      t.name_bytes += old.name_b, t.note_bytes += old.note_b,
+      marks[k] = {c, names.id(old.name)}, seen.prefetch(c, marks[k].id);
     }
   };
 
@@ -226,7 +220,7 @@ int main(int argc, char** argv) {
 
   size_t rsize, size;
   const char* regions = map_file(reg_file, rsize);
-  const char* records = map_file(rec_file, size);
+  const char* records = map_file(rec_file, size); madvise((void*)records, size, MADV_WILLNEED);
 
   const char* last = (const char*)memrchr(regions, '\n', rsize - 1) + 1;
   size_t nreg = atoll(last) + 1;
@@ -240,7 +234,7 @@ int main(int argc, char** argv) {
   auto number_countries = [&] {
     for (u32 k = 0; k < present.size(); ++k)
       if (present[k]) codes.push_back(k), index_of[k] = codes.size();
-    if (codes.size() > 255) _exit(1);
+    (codes.size() > 255) ? _exit(1) : (void)0;
   };
 
   size_t start = size ? (char*)memchr(records, '\n', size) - records + 1 : 0;
@@ -281,8 +275,7 @@ int main(int argc, char** argv) {
   char buf[65536], *o = buf;
   auto put_num = [&](u64 v) { *o++ = ' ', o = std::to_chars(o, o + 32, v).ptr; };
   auto put_cents = [&](i64 c) {
-    *o++ = ' ';
-    c < 0 ? (*o++ = '-', c = -c) : 0;
+    *o++ = ' ', (c < 0) ? (*o++ = '-', c = -c) : 0;
     o = std::to_chars(o, o + 32, u64(c) / 100).ptr;
     *o++ = '.', *o++ = '0' + (u64(c) % 100 / 10), *o++ = '0' + (u64(c) % 10);
   };
@@ -298,12 +291,11 @@ int main(int argc, char** argv) {
       u32 k = codes[c - 1];
       *o++ = 'A' + (k >> 10), *o++ = 'A' + ((k >> 5) & 31), *o++ = 'A' + (k & 31);
     }
-    put_num(sum.count), put_num(sum.id_sum);
-    put_cents(sum.amount_sum), put_cents(sum.amount_min), put_cents(sum.amount_max);
-    put_num(sum.distinct), put_num(sum.name_bytes), put_num(sum.note_bytes);
-    *o++ = '\n';
+    put_num(sum.count), put_num(sum.id_sum), put_cents(sum.amount_sum),
+    put_cents(sum.amount_min), put_cents(sum.amount_max), put_num(sum.distinct),
+    put_num(sum.name_bytes), put_num(sum.note_bytes), *o++ = '\n';
   }
   int fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  fd >= 0 ? ((void)!write(fd, buf, o - buf), close(fd)) : 0;
+  fd >= 0 ? ((void)!write(fd, buf, o - buf), (void)close(fd)) : (void)0;
   _exit(0);
 }
