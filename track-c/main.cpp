@@ -69,10 +69,11 @@ inline const char* comma_after(const char* p) {
 struct Text { const char* at; u32 raw, length; };
 inline Text text(const char*& p) {
   const char* s = p;
-  if (*s != '"') return p = find(s, ',') + 1, Text{s, u32(p - 1 - s), u32(p - 1 - s)};
-  u32 pairs = 0;
-  const char* q = s + 1;
-  for (; (q = find(q, '"'))[1] == '"'; q += 2) ++pairs;
+  if (__builtin_expect(*s != '"', 0)) return p = find(s, ',') + 1, Text{s, u32(p - 1 - s), u32(p - 1 - s)};
+  const char* q = find(s + 1, '"');
+  if (__builtin_expect(q[1] != '"', 1)) return p = q + 2, Text{s + 1, u32(q - s - 1), u32(q - s - 1)};
+  u32 pairs = 1;
+  for (q += 2; (q = find(q, '"'))[1] == '"'; q += 2) ++pairs;
   return p = q + 2, Text{s + 1, u32(q - s - 1), u32(q - s - 1 - pairs)};
 }
 
@@ -177,7 +178,7 @@ void parse_records(const char* p, const char* end, const char* file_end,
     i64 cents = money(amount + negative, amount_end);
     negative ? (cents = -cents) : 0;
 
-    u32 r = region < regions ? u32(region) : u32(regions);
+    u32 r = std::min<size_t>(region, regions);
     _mm_prefetch((const char*)(country_of + r), _MM_HINT_T0);
     advance();
     auto nk = NameTable::key(name.at, name.raw);
@@ -243,7 +244,7 @@ int main(int argc, char** argv) {
   };
 
   size_t start = size ? (char*)memchr(records, '\n', size) - records + 1 : 0;
-  const int pieces = 6 * nt;
+  const int pieces = 8 * nt;
   auto cut = split(records, start, size, pieces, "\r\n", 2);
   std::vector<std::array<Totals, 256>> totals(nt);
   NameTable names;
