@@ -1,12 +1,11 @@
-// Speed Demon 2026, Track C (Join).
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <barrier>
 #include <charconv>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <mutex>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <thread>
@@ -28,6 +27,10 @@ inline u64 load8(const char* p) { return *(const u64_u*)p; }
 template <class T> inline T* zeroed(size_t n) {
   return (T*)mmap(0, n * sizeof(T), 3, 0x22, -1, 0);
 }
+template <class T> inline void populate_share(T* p, size_t n, int t, int nt) {
+  size_t pg = (n * sizeof(T) + 4095) >> 12, f = pg * t / nt, to = pg * (t + 1) / nt;
+  if (to > f) madvise((char*)p + (f << 12), (to - f) << 12, 19);
+}
 const char* map_file(const char* path, size_t& size) {
   int fd = open(path, O_RDONLY);
   if (fd < 0) _exit(1);
@@ -37,10 +40,6 @@ const char* map_file(const char* path, size_t& size) {
   return close(fd), p;
 }
 
-inline u32 match32(const char* p, char c) {
-  __m256i v = _mm256_loadu_si256((const __m256i*)p);
-  return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
-}
 inline u64 fold(u64 v, size_t n) {
   v &= 0x0F0F0F0F0F0F0F0F & ~u64(0) << 8 * (8 - n);
   v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
@@ -53,9 +52,12 @@ inline u64 money(const char* s, const char* e) {
   return fold((w & 0xFFFFFFFFFF) << 8 | (w & 0xFFFF000000000000), e - s - 1);
 }
 inline const char* find(const char* p, char c) {
-  for (;; p += 64)
-    if (u64 m = match32(p, c) | u64(match32(p + 32, c)) << 32)
-      return p + __builtin_ctzll(m);
+  __m256i tgt = _mm256_set1_epi8(c);
+  for (;; p += 32) {
+    __m256i v = _mm256_loadu_si256((const __m256i*)p);
+    u32 m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, tgt));
+    if (m) return p + __builtin_ctz(m);
+  }
 }
 inline const char* comma_after(const char* p) {
   u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2Cull;
@@ -79,17 +81,19 @@ inline Text text(const char*& p) {
 class NameTable {
 public:
   static constexpr u32 BITS = 17, SLOTS = 1 << BITS;
-  static u64 key(const char* s, u32 len) {
+  static __attribute__((always_inline)) inline u64 key(const char* s, u32 len) {
     alignas(16) static constexpr char K[32] = {-1, -1, -1, -1, -1, -1, -1, -1,
                                                -1, -1, -1, -1, -1, -1, -1, -1};
     __m128i m = _mm_loadu_si128((const __m128i*)(K + 16 - std::min(len, 16u)));
     __m128i head = _mm_and_si128(_mm_loadu_si128((const __m128i*)s), m);
     u64 h = (u64(_mm_cvtsi128_si64(head)) * 0x9E3779B97F4A7C15ull ^ len)
           + u64(_mm_extract_epi64(head, 1)) * 0xBF58476D1CE4E5B9ull;
-    for (u32 i = 16; i < len; i += 8) {
-      u64 w = load8(s + i);
-      if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
-      h = (h ^ w) * 0x94D049BB133111EBull;
+    if (__builtin_expect(len > 16, 0)) {
+      for (u32 i = 16; i < len; i += 8) {
+        u64 w = load8(s + i);
+        if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
+        h = (h ^ w) * 0x94D049BB133111EBull;
+      }
     }
     h = (h ^ h >> 31) * 0xD6E8FEB86659FD93ull;
     h ^= h >> 32;
@@ -98,7 +102,7 @@ public:
   void prefetch(u64 k) const {
     _mm_prefetch((const char*)(&slots_[k >> (64 - BITS)]), _MM_HINT_T0);
   }
-  u32 id(u64 k) {
+  __attribute__((always_inline)) inline u32 id(u64 k) {
     __m256i tgt = _mm256_set1_epi64x(k), z = _mm256_setzero_si256();
     for (u32 i = k >> (64 - BITS) & ~3u;; i = (i + 4) & (SLOTS - 1)) {
       __m256i v = _mm256_load_si256((const __m256i*)&slots_[i]);
@@ -111,7 +115,7 @@ public:
       }
     }
   }
-  void populate() const { madvise(slots_, SLOTS * sizeof(std::atomic<u64>), 19); }
+  void populate(int t, int n) const { populate_share(slots_, SLOTS, t, n); }
 private:
   std::atomic<u64>* slots_ = zeroed<std::atomic<u64>>(SLOTS);
 };
@@ -137,7 +141,6 @@ struct NamesSeen {
     for (u32 w = 0; w < WORDS; ++w) n += __builtin_popcountll(bits[c * WORDS + w]);
     return n;
   }
-  void populate(size_t nc) const { madvise(bits, (nc + 1) * WORDS * sizeof(std::atomic<u64>), 19); }
 };
 
 void parse_records(const char* p, const char* end, const char* file_end,
@@ -164,7 +167,7 @@ void parse_records(const char* p, const char* end, const char* file_end,
   };
 
   while (p < end) {
-    if (u8(*p) == 0xEF) p += 3;
+    if (__builtin_expect(u8(*p) == 0xEF, 0)) p += 3;
     const char* f1 = comma_after(p);
     u64 id = digits(p, f1);
     p = f1 + 1;
@@ -172,7 +175,8 @@ void parse_records(const char* p, const char* end, const char* file_end,
     const char* f4 = comma_after(p);
     u64 region = digits(p, f4);
     const char* amount = f4 + 1;
-    u32 lf = match32(amount, '\n');
+    __m256i v = _mm256_loadu_si256((const __m256i*)amount);
+    u32 lf = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('\n')));
     const char* eol = lf ? amount + __builtin_ctz(lf) : file_end;
     const char* amount_end = eol - (eol[-1] == '\r');
     bool negative = *amount == '-';
@@ -189,6 +193,23 @@ void parse_records(const char* p, const char* end, const char* file_end,
   }
   for (last = n; n < last + 2 * LAG; ++n) advance();
 }
+
+inline std::pair<u64, u32> region_line(const char*& p) {
+  u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2C;
+  const char* c = p + __builtin_ctzll((x - M1) & ~x & M8) / 8;
+  auto id = digits(p, c); p = c + 4; while (*p++ != '\n');
+  return {id, code3(c + 1)};
+}
+
+struct Phase {
+  const int pieces;
+  std::atomic<int> claimed{0}, done{0};
+  template <class F> void run(F&& f) {
+    for (int k; (k = claimed++) < pieces;)
+      if (f(k), ++done == pieces) done.notify_all();
+    for (int d; (d = done) < pieces;) done.wait(d);
+  }
+};
 
 auto split(const char* d, size_t from, size_t sz, int n, const char* dl, size_t dl_sz) {
   std::vector<size_t> cut(n + 1, sz);
@@ -215,56 +236,48 @@ int main(int argc, char** argv) {
   const char* last = (const char*)memrchr(regions, '\n', rsize - 1) + 1;
   size_t nreg = atoll(last) + 1;
   u8* country_of = zeroed<u8>(nreg + 1);
-  madvise(country_of, nreg + 1, 19);
-
-  u8 seen_code[1 << 15] = {0};
-  const char* rend = regions + rsize, *p = strchr(regions, '\n') + 1;
-  while (p < rend) {
-    u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2Cull;
-    const char* c = p + __builtin_ctzll((x - M1) & ~x & M8) / 8;
-    seen_code[code3(c + 1)] = 1;
-    p = c + 4;
-    while (*p != '\n') ++p;
-    ++p;
-  }
-
-  std::vector<u32> codes;
+  size_t roff = strchr(regions, '\n') - regions + 1;
+  auto rcut = split(regions, roff, rsize, nt, "\n", 1);
+  std::vector<std::atomic<u8>> present(1 << 15);
   std::array<u8, 1 << 15> index_of{};
-  for (u32 k = 0; k < (1 << 15); ++k)
-    if (seen_code[k]) codes.push_back(k), index_of[k] = codes.size();
-  if (codes.size() > 255) _exit(1);
-
-  p = strchr(regions, '\n') + 1;
-  while (p < rend) {
-    u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2Cull;
-    const char* c = p + __builtin_ctzll((x - M1) & ~x & M8) / 8;
-    auto id = digits(p, c);
-    country_of[id] = index_of[code3(c + 1)];
-    p = c + 4;
-    while (*p != '\n') ++p;
-    ++p;
-  }
+  std::vector<u32> codes;
+  std::once_flag numbered;
+  auto number_countries = [&] {
+    for (u32 k = 0; k < present.size(); ++k)
+      if (present[k]) codes.push_back(k), index_of[k] = codes.size();
+    if (codes.size() > 255) _exit(1);
+  };
 
   size_t start = size ? (char*)memchr(records, '\n', size) - records + 1 : 0;
   const int pieces = 4 * nt;
   auto cut = split(records, start, size, pieces, "\r\n", 2);
   std::vector<std::array<Totals, 256>> totals(nt);
   NameTable names;
-  names.populate();
   NamesSeen seen;
-  seen.populate(codes.size());
 
-  std::atomic<int> claim{0};
-  std::barrier bar(nt);
+  Phase flag{nt}, fill{nt}, parse{pieces};
   auto worker = [&](int t) {
-    for (int k; (k = claim++) < pieces;) {
+    flag.run([&](int k) {
+      populate_share(country_of, nreg, k, nt);
+      names.populate(k, nt);
+      for (const char* p = regions + rcut[k]; p < regions + rcut[k + 1];)
+        present[region_line(p).second].store(1, std::memory_order_relaxed);
+    });
+    std::call_once(numbered, number_countries);
+    fill.run([&](int k) {
+      populate_share(seen.bits, (codes.size() + 1) * NamesSeen::WORDS, k, nt);
+      for (const char* p = regions + rcut[k]; p < regions + rcut[k + 1];) {
+        auto [id, c] = region_line(p);
+        country_of[id] = index_of[c];
+      }
+    });
+    parse.run([&](int k) {
       parse_records(records + cut[k], records + cut[k + 1], records + size,
                     country_of, nreg, names, seen, totals[t].data());
-    }
-    bar.arrive_and_wait();
-    for (u32 c = t; c <= codes.size(); c += nt) totals[t][c].distinct = seen.count(c);
+    });
+    for (u32 c = t; c <= codes.size(); c += nt)
+      totals[t][c].distinct = seen.count(c);
   };
-
   std::vector<std::thread> pool;
   for (int t = 1; t < nt; ++t) pool.emplace_back(worker, t);
   worker(0);
