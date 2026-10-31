@@ -185,7 +185,7 @@ public:
     void prefetch(__m128i k) const { _mm_prefetch(reinterpret_cast<const char*>(&slots_[home(k)]), _MM_HINT_T0); }
 
     u32 id(__m128i k) {
-        for (u32 i = home(k);; i = (i + 1) % SLOTS) {
+        for (u32 i = home(k);; i = (i + 1) & (SLOTS - 1)) {
             __m128i s = _mm_load_si128(&slots_[i]);
             if (_mm_testz_si128(s, s)) {
                 unsigned __int128 want;
