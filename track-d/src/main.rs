@@ -18,8 +18,31 @@ const MAP_FAILED: *mut u8 = !0 as *mut u8;
 const PR_SET_THP_DISABLE: i32 = 41;
 
 const RING: usize = 4096;
-const RING_WORDS: usize = RING / 64;
 const ESC_MARKER: u32 = 0xFFFF;
+
+struct Bucket {
+    ptr: *mut u32,
+    len: u32,
+    cap: u32,
+}
+
+#[inline(always)]
+unsafe fn bpush(b: *mut Bucket, v: u32) {
+    if (*b).len == (*b).cap {
+        let new_cap = if (*b).cap == 0 { 32 } else { (*b).cap * 2 };
+        let new_ptr = if (*b).cap == 0 {
+            let layout = std::alloc::Layout::array::<u32>(new_cap as usize).unwrap();
+            std::alloc::alloc(layout) as *mut u32
+        } else {
+            let old_layout = std::alloc::Layout::array::<u32>((*b).cap as usize).unwrap();
+            std::alloc::realloc((*b).ptr as *mut u8, old_layout, new_cap as usize * 4) as *mut u32
+        };
+        (*b).ptr = new_ptr;
+        (*b).cap = new_cap;
+    }
+    *(*b).ptr.add((*b).len as usize) = v;
+    (*b).len += 1;
+}
 
 unsafe fn map_file(file: &File) -> (*const u8, usize) {
     let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
@@ -139,63 +162,27 @@ fn dial(
     tg: u32,
     d32: &mut [u32],
     touched: &mut Vec<u32>,
-    ring: &mut [Vec<u32>],
+    ring: &mut [Bucket],
 ) -> i64 {
     let d32_ptr = d32.as_mut_ptr();
     let ring_ptr = ring.as_mut_ptr();
-    let mut bitmask = [0u64; RING_WORDS];
-    let mut d = 0u32;
+    let mut live = 1usize;
     let mut res = -1i64;
-    let mut upper_bound = u64::MAX;
 
     unsafe {
         *d32_ptr.add(s as usize) = 0;
         touched.push(s);
-        (*ring_ptr).push(s);
-        bitmask[0] |= 1u64;
+        bpush(ring_ptr, s);
 
-        loop {
-            if d as u64 >= upper_bound {
-                res = upper_bound as i64;
-                break;
-            }
-
-            let cur_b = (d as usize) & (RING - 1);
-            let word = cur_b / 64;
-            let bit = cur_b % 64;
-            let cur_bits = bitmask[word] & (!0u64 << bit);
-
-            let next_b = if cur_bits != 0 {
-                word * 64 + cur_bits.trailing_zeros() as usize
-            } else {
-                let mut found = None;
-                for i in 1..RING_WORDS {
-                    let w = (word + i) & (RING_WORDS - 1);
-                    let val = bitmask[w];
-                    if val != 0 {
-                        found = Some(w * 64 + val.trailing_zeros() as usize);
-                        break;
-                    }
-                }
-                match found {
-                    Some(b) => b,
-                    None => break,
-                }
-            };
-
-            let delta = (next_b + RING - cur_b) & (RING - 1);
-            d += delta as u32;
-
-            if d as u64 >= upper_bound {
-                res = upper_bound as i64;
-                break;
-            }
-
-            let bucket = &mut *ring_ptr.add(next_b);
-            let mut k = 0;
-            while k < bucket.len() && res == -1 {
-                let u = *bucket.get_unchecked(k);
+        let mut d = 0u32;
+        while live > 0 && res == -1 {
+            let b_idx = (d as usize) & (RING - 1);
+            let b = &mut *ring_ptr.add(b_idx);
+            let mut k = 0usize;
+            while k < (*b).len as usize && res == -1 {
+                let u = *(*b).ptr.add(k);
                 k += 1;
+                live -= 1;
                 if *d32_ptr.add(u as usize) != d {
                     continue;
                 }
@@ -207,16 +194,24 @@ fn dial(
                 let end = *off.get_unchecked(u as usize + 1) as usize;
                 for e in start..end {
                     let (v, w) = edge_at(pk, esc, u, e);
-                    let nd = (d as u64) + (w as u64);
-                    if nd >= upper_bound {
-                        continue;
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if e + 1 < end {
+                            let next_x = *pk.get_unchecked(e + 1);
+                            if (next_x & 0xFFFF) != ESC_MARKER {
+                                let next_dv = (next_x >> 16) as i16 as i32;
+                                let next_v = (u as i32 + next_dv) as usize;
+                                core::arch::x86_64::_mm_prefetch(
+                                    d32_ptr.add(next_v) as *const i8,
+                                    core::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                        }
                     }
+                    let nd = (d as u64) + (w as u64);
                     if w >= RING as u32 || nd >= (u32::MAX - 1) as u64 {
                         res = -2;
                         break;
-                    }
-                    if v == tg {
-                        upper_bound = nd;
                     }
                     let nd32 = nd as u32;
                     let v_idx = v as usize;
@@ -226,22 +221,17 @@ fn dial(
                             touched.push(v);
                         }
                         *d32_ptr.add(v_idx) = nd32;
-                        let target_b = (nd32 as usize) & (RING - 1);
-                        (*ring_ptr.add(target_b)).push(v);
-                        bitmask[target_b / 64] |= 1u64 << (target_b % 64);
+                        bpush(ring_ptr.add((nd32 as usize) & (RING - 1)), v);
+                        live += 1;
                     }
                 }
             }
-            bucket.clear();
-            bitmask[next_b / 64] &= !(1u64 << (next_b % 64));
-
-            if res != -1 {
-                break;
-            }
+            (*b).len = 0;
+            d += 1;
         }
 
         for b in ring.iter_mut() {
-            b.clear();
+            b.len = 0;
         }
         for &u in touched.iter() {
             *d32_ptr.add(u as usize) = u32::MAX;
@@ -251,8 +241,6 @@ fn dial(
 
     if res == -2 {
         dijkstra_fallback(pk, esc, off, s, tg)
-    } else if res == -1 && upper_bound != u64::MAX {
-        upper_bound as i64
     } else {
         res
     }
@@ -310,8 +298,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| {
             thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(8)
-                .min(8)
+                .unwrap_or(12)
+                .min(12)
                 .max(1)
         });
 
@@ -387,8 +375,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let edge_start_usize = edge_start as usize;
 
-    let off_atomic = (0..=n + 1).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
-    let has_in_atomic = (0..=n).map(|_| AtomicBool::new(false)).collect::<Vec<_>>();
+    let off_atomic: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; n + 2]) };
+    let has_in_atomic: Vec<AtomicBool> = unsafe { std::mem::transmute(vec![0u8; n + 1]) };
 
     // Pass 1: Count out-degrees and mark has_in
     thread::scope(|s| {
@@ -407,17 +395,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if q >= q_end {
                         break;
                     }
-                    let u = parse_u32(&mut q);
-                    q = q.add(1);
-                    let v = parse_u32(&mut q);
-                    q = q.add(1);
-                    let _w = parse_u32(&mut q);
-                    while q < q_end && *q != b'\n' {
+                    let mut u = 0u32;
+                    while *q != b' ' {
+                        u = u * 10 + (*q - b'0') as u32;
                         q = q.add(1);
                     }
-                    if q < q_end {
+                    q = q.add(1);
+                    let mut v = 0u32;
+                    while *q != b' ' {
+                        v = v * 10 + (*q - b'0') as u32;
                         q = q.add(1);
                     }
+                    q = q.add(1);
+                    while *q != b'\n' {
+                        q = q.add(1);
+                    }
+                    q = q.add(1);
                     if u != v && (u as usize) < n && (v as usize) < n {
                         off_ref[u as usize + 1].fetch_add(1, Ordering::Relaxed);
                         has_in_ref[v as usize].store(true, Ordering::Relaxed);
@@ -436,9 +429,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut edges = vec![Edge { v: 0, w: 0 }; m_valid];
     let edges_addr = edges.as_mut_ptr() as usize;
 
-    let cur = (0..=n)
-        .map(|i| AtomicU32::new(off[i]))
-        .collect::<Vec<_>>();
+    let cur: Vec<AtomicU32> = unsafe { std::mem::transmute(off.clone()) };
 
     // Pass 2: Scatter edges into array
     thread::scope(|s| {
@@ -457,17 +448,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if q >= q_end {
                         break;
                     }
-                    let u = parse_u32(&mut q);
-                    q = q.add(1);
-                    let v = parse_u32(&mut q);
-                    q = q.add(1);
-                    let w = parse_u32(&mut q);
-                    while q < q_end && *q != b'\n' {
+                    let mut u = 0u32;
+                    while *q != b' ' {
+                        u = u * 10 + (*q - b'0') as u32;
                         q = q.add(1);
                     }
-                    if q < q_end {
+                    q = q.add(1);
+                    let mut v = 0u32;
+                    while *q != b' ' {
+                        v = v * 10 + (*q - b'0') as u32;
                         q = q.add(1);
                     }
+                    q = q.add(1);
+                    let mut w = 0u32;
+                    while *q != b'\n' {
+                        w = w * 10 + (*q - b'0') as u32;
+                        q = q.add(1);
+                    }
+                    q = q.add(1);
                     if u != v && (u as usize) < n && (v as usize) < n {
                         let idx = cur_ref[u as usize].fetch_add(1, Ordering::Relaxed);
                         *e_ptr.add(idx as usize) = Edge { v, w };
@@ -500,12 +498,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 if h + 16 < tail {
-                    let next_u = order[h + 16] as usize;
+                    let next_u = *order.get_unchecked(h + 16) as usize;
                     core::arch::x86_64::_mm_prefetch(off.as_ptr().add(next_u) as *const i8, core::arch::x86_64::_MM_HINT_T0);
                 }
                 if h + 8 < tail {
-                    let next_e = off[order[h + 8] as usize] as usize;
+                    let next_e = *off.get_unchecked(*order.get_unchecked(h + 8) as usize) as usize;
                     core::arch::x86_64::_mm_prefetch(edges.as_ptr().add(next_e) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+                }
+                if h + 4 < tail {
+                    let next_u4 = *order.get_unchecked(h + 4) as usize;
+                    let e_start = *off.get_unchecked(next_u4) as usize;
+                    let e_end = *off.get_unchecked(next_u4 + 1) as usize;
+                    for e in e_start..e_end {
+                        let v = edges.get_unchecked(e).v as usize;
+                        core::arch::x86_64::_mm_prefetch(perm.as_ptr().add(v) as *const i8, core::arch::x86_64::_MM_HINT_T0);
+                    }
                 }
             }
             let u = order[h] as usize;
@@ -608,7 +615,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ans = answers_addr as *mut i64;
                 let mut d32 = vec![u32::MAX; n];
                 let mut touched = Vec::with_capacity(65536);
-                let mut ring: Vec<Vec<u32>> = (0..RING).map(|_| Vec::with_capacity(32)).collect();
+                let mut ring: Vec<Bucket> = (0..RING).map(|_| {
+                    let cap = 32;
+                    let layout = std::alloc::Layout::array::<u32>(cap).unwrap();
+                    let ptr = unsafe { std::alloc::alloc(layout) as *mut u32 };
+                    Bucket { ptr, len: 0, cap: cap as u32 }
+                }).collect();
 
                 loop {
                     let q = next_q_ref.fetch_add(1, Ordering::Relaxed);
@@ -641,6 +653,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     unsafe {
                         *ans.add(q) = res;
+                    }
+                }
+
+                for b in &ring {
+                    let layout = std::alloc::Layout::array::<u32>(b.cap as usize).unwrap();
+                    unsafe {
+                        std::alloc::dealloc(b.ptr as *mut u8, layout);
                     }
                 }
             });

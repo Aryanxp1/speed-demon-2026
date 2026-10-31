@@ -153,8 +153,8 @@ impl Structure {
     }
 }
 
-const SLOTS: usize = 1 << 19;
-const IDS: usize = 1 << 19;
+const SLOTS: usize = 1 << 17;
+const IDS: usize = 1 << 17;
 const HEAD: usize = 24;
 const BUSY: u16 = 0xFFFF;
 
