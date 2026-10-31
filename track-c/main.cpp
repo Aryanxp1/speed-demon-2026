@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <mutex>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <thread>
@@ -54,11 +55,9 @@ inline u64 money(const char* s, const char* e) {
 }
 inline const char* find(const char* p, char c) {
   __m256i tgt = _mm256_set1_epi8(c);
-  for (;; p += 64) {
-    u32 m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)p), tgt));
-    if (m0) return p + __builtin_ctz(m0);
-    u32 m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(p + 32)), tgt));
-    if (m1) return p + 32 + __builtin_ctz(m1);
+  for (;; p += 32) {
+    u32 m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)p), tgt));
+    if (m) return p + __builtin_ctz(m);
   }
 }
 inline const char* comma_after(const char* p) {
@@ -213,14 +212,16 @@ auto split(const char* d, size_t from, size_t sz, int n, const char* dl, size_t 
 
 int main(int argc, char** argv) {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-  int nt = std::clamp((int)std::thread::hardware_concurrency(), 1, 12);
+  cpu_set_t cpus;
+  sched_getaffinity(0, sizeof(cpus), &cpus);
+  int nt = std::clamp(CPU_COUNT(&cpus), 1, 12);
   const char* reg_file = argc > 1 ? argv[1] : "/data/regions.csv";
   const char* rec_file = argc > 2 ? argv[2] : "/data/records.csv";
   const char* out_file = argc > 3 ? argv[3] : "/out/aggregates.txt";
 
   size_t rsize, size;
   const char* regions = map_file(reg_file, rsize);
-  const char* records = map_file(rec_file, size); madvise((void*)records, size, MADV_WILLNEED);
+  const char* records = map_file(rec_file, size);
 
   const char* last = (const char*)memrchr(regions, '\n', rsize - 1) + 1;
   size_t nreg = atoll(last) + 1;
