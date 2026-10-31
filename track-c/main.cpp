@@ -25,7 +25,8 @@ typedef u64 __attribute__((aligned(1))) u64_u;
 inline u64 load8(const char* p) { return *(const u64_u*)p; }
 
 template <class T> inline T* zeroed(size_t n) {
-  return (T*)mmap(0, n * sizeof(T), 3, 0x22, -1, 0);
+  void* p = mmap(0, n * sizeof(T), 3, 0x22, -1, 0);
+  return p == (void*)-1 ? (_exit(1), (T*)0) : (T*)p;
 }
 template <class T> inline void populate_share(T* p, size_t n, int t, int nt) {
   size_t pg = (n * sizeof(T) + 4095) >> 12, f = pg * t / nt, to = pg * (t + 1) / nt;
@@ -53,10 +54,10 @@ inline u64 money(const char* s, const char* e) {
 }
 inline const char* find(const char* p, char c) {
   __m256i tgt = _mm256_set1_epi8(c);
-  for (;; p += 32) {
-    __m256i v = _mm256_loadu_si256((const __m256i*)p);
-    u32 m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, tgt));
-    if (m) return p + __builtin_ctz(m);
+  for (;; p += 64) {
+    u64 m0 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)p), tgt));
+    u64 m1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(p + 32)), tgt));
+    if (u64 m = m0 | (m1 << 32)) return p + __builtin_ctzll(m);
   }
 }
 inline const char* comma_after(const char* p) {
@@ -67,48 +68,37 @@ inline const char* comma_after(const char* p) {
 struct Text { const char* at; u32 raw, length; };
 inline Text text(const char*& p) {
   const char* s = p;
-  if (*s != '"') {
-    p = find(s, ',') + 1;
-    return {s, u32(p - 1 - s), u32(p - 1 - s)};
-  }
+  if (*s != '"') return p = find(s, ',') + 1, Text{s, u32(p - 1 - s), u32(p - 1 - s)};
   u32 pairs = 0;
   const char* q = s + 1;
   for (; (q = find(q, '"'))[1] == '"'; q += 2) ++pairs;
-  p = q + 2;
-  return {s + 1, u32(q - s - 1), u32(q - s - 1 - pairs)};
+  return p = q + 2, Text{s + 1, u32(q - s - 1), u32(q - s - 1 - pairs)};
 }
 
 class NameTable {
 public:
   static constexpr u32 BITS = 17, SLOTS = 1 << BITS;
   static __attribute__((always_inline)) inline u64 key(const char* s, u32 len) {
-    alignas(16) static constexpr char K[32] = {-1, -1, -1, -1, -1, -1, -1, -1,
-                                               -1, -1, -1, -1, -1, -1, -1, -1};
+    alignas(16) static constexpr char K[32] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
     __m128i m = _mm_loadu_si128((const __m128i*)(K + 16 - std::min(len, 16u)));
     __m128i head = _mm_and_si128(_mm_loadu_si128((const __m128i*)s), m);
-    u64 h = (u64(_mm_cvtsi128_si64(head)) * 0x9E3779B97F4A7C15ull ^ len)
-          + u64(_mm_extract_epi64(head, 1)) * 0xBF58476D1CE4E5B9ull;
-    if (__builtin_expect(len > 16, 0)) {
-      for (u32 i = 16; i < len; i += 8) {
-        u64 w = load8(s + i);
-        if (len - i < 8) w &= (u64(1) << 8 * (len - i)) - 1;
-        h = (h ^ w) * 0x94D049BB133111EBull;
-      }
+    u64 h = (u64(_mm_cvtsi128_si64(head)) * 0x9E3779B97F4A7C15ull ^ len) + u64(_mm_extract_epi64(head, 1)) * 0xBF58476D1CE4E5B9ull;
+    for (u32 i = 16; i < len; i += 8) {
+      u64 w = load8(s + i);
+      (len - i < 8) ? (w &= (u64(1) << 8 * (len - i)) - 1) : 0;
+      h = (h ^ w) * 0x94D049BB133111EBull;
     }
     h = (h ^ h >> 31) * 0xD6E8FEB86659FD93ull;
-    h ^= h >> 32;
-    return h + (h == 0);
+    return (h ^ h >> 32) + (h == 0);
   }
-  void prefetch(u64 k) const {
-    _mm_prefetch((const char*)(&slots_[k >> (64 - BITS)]), _MM_HINT_T0);
-  }
+  void prefetch(u64 k) const { _mm_prefetch((const char*)(&slots_[k >> (64 - BITS)]), _MM_HINT_T0); }
   __attribute__((always_inline)) inline u32 id(u64 k) {
-    __m256i tgt = _mm256_set1_epi64x(k), z = _mm256_setzero_si256();
+    __m256i tgt = _mm256_set1_epi64x(k);
     for (u32 i = k >> (64 - BITS) & ~3u;; i = (i + 4) & (SLOTS - 1)) {
       __m256i v = _mm256_load_si256((const __m256i*)&slots_[i]);
       u32 hit = mask64(_mm256_cmpeq_epi64(v, tgt));
       if (hit) return i + __builtin_ctz(hit);
-      for (u32 free = mask64(_mm256_cmpeq_epi64(v, z)); free; free &= free - 1) {
+      for (u32 free = mask64(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())); free; free &= free - 1) {
         u32 j = i + __builtin_ctz(free);
         u64 s = 0;
         if (slots_[j].compare_exchange_strong(s, k) || s == k) return j;
@@ -152,7 +142,7 @@ void parse_records(const char* p, const char* end, const char* file_end,
   u64 n = 0, last = UINT64_MAX;
   auto advance = [&]() __attribute__((always_inline)) {
     u32 k = n % LAG;
-    if (n >= 2 * LAG && n - 2 * LAG < last) seen.mark(marks[k].country, marks[k].id);
+    (n >= 2 * LAG && n - 2 * LAG < last) ? seen.mark(marks[k].country, marks[k].id) : (void)0;
     if (n >= LAG && n - LAG < last) {
       const Pending& old = pending[k];
       u32 c = country_of[old.region];
@@ -167,7 +157,7 @@ void parse_records(const char* p, const char* end, const char* file_end,
   };
 
   while (p < end) {
-    if (__builtin_expect(u8(*p) == 0xEF, 0)) p += 3;
+    (u8(*p) == 0xEF) ? (p += 3) : 0;
     const char* f1 = comma_after(p);
     u64 id = digits(p, f1);
     p = f1 + 1;
@@ -181,7 +171,7 @@ void parse_records(const char* p, const char* end, const char* file_end,
     const char* amount_end = eol - (eol[-1] == '\r');
     bool negative = *amount == '-';
     i64 cents = money(amount + negative, amount_end);
-    if (negative) cents = -cents;
+    negative ? (cents = -cents) : 0;
 
     u32 r = region < regions ? u32(region) : u32(regions);
     _mm_prefetch((const char*)(country_of + r), _MM_HINT_T0);
@@ -206,7 +196,7 @@ struct Phase {
   std::atomic<int> claimed{0}, done{0};
   template <class F> void run(F&& f) {
     for (int k; (k = claimed++) < pieces;)
-      if (f(k), ++done == pieces) done.notify_all();
+      (f(k), ++done == pieces) ? done.notify_all() : (void)0;
     for (int d; (d = done) < pieces;) done.wait(d);
   }
 };
@@ -287,7 +277,7 @@ int main(int argc, char** argv) {
   auto put_num = [&](u64 v) { *o++ = ' ', o = std::to_chars(o, o + 32, v).ptr; };
   auto put_cents = [&](i64 c) {
     *o++ = ' ';
-    if (c < 0) *o++ = '-', c = -c;
+    c < 0 ? (*o++ = '-', c = -c) : 0;
     o = std::to_chars(o, o + 32, u64(c) / 100).ptr;
     *o++ = '.', *o++ = '0' + (u64(c) % 100 / 10), *o++ = '0' + (u64(c) % 10);
   };
@@ -304,12 +294,11 @@ int main(int argc, char** argv) {
       *o++ = 'A' + (k >> 10), *o++ = 'A' + ((k >> 5) & 31), *o++ = 'A' + (k & 31);
     }
     put_num(sum.count), put_num(sum.id_sum);
-    put_cents(sum.amount_sum), put_cents(sum.amount_min);
-    put_cents(sum.amount_max), put_num(sum.distinct);
-    put_num(sum.name_bytes), put_num(sum.note_bytes);
+    put_cents(sum.amount_sum), put_cents(sum.amount_min), put_cents(sum.amount_max);
+    put_num(sum.distinct), put_num(sum.name_bytes), put_num(sum.note_bytes);
     *o++ = '\n';
   }
   int fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  if (fd >= 0) (void)!write(fd, buf, o - buf), close(fd);
+  fd >= 0 ? ((void)!write(fd, buf, o - buf), close(fd)) : 0;
   _exit(0);
 }
