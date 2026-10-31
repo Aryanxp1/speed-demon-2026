@@ -621,6 +621,16 @@ fn main() {
                     return;
                 }
                 let i = id as usize;
+                // Repeated bitmap tokens only OR the same local bit. Flush on
+                // the next bitmap block, even across blocks with no such terms.
+                if i < nbits {
+                    if doc as usize / 64 != block {
+                        let w = std::mem::replace(&mut block, doc as usize / 64);
+                        flush(&mut pending, w);
+                    }
+                    pending[i] |= 1u64 << (doc % 64);
+                    return;
+                }
                 if i.wrapping_sub(a0) < nkeep - a0 {
                     let k = i - a0;
                     for &(_, q, j) in &anchored[astart[k]..astart[k + 1]] {
@@ -631,20 +641,12 @@ fn main() {
                         }
                     }
                 }
-                if doc as usize / 64 != block {
-                    let w = std::mem::replace(&mut block, doc as usize / 64);
-                    flush(&mut pending, w);
-                }
                 if i < lists {
                     let mark = (doc - first + 1) as u16;
                     if last[i] != mark {
                         last[i] = mark;
-                        if i < nbits {
-                            pending[i] |= 1u64 << (doc % 64);
-                        } else {
-                            buckets[i % BUCKETS].add((i / BUCKETS) as u32, doc - first);
-                            count[i] += 1;
-                        }
+                        buckets[i % BUCKETS].add((i / BUCKETS) as u32, doc - first);
+                        count[i] += 1;
                     }
                 }
             },

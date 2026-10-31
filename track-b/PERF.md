@@ -198,3 +198,10 @@ Rejected this session: shrinking the scan dictionary to active terms, integer-ke
 ### Official evaluation of the November 1 change
 
 Board run `run-064a36060485`, evaluated commit `4d2cf91` (includes Track B implementation commit `e0ee3d2`): all gates passed; T = 0.213750 s, M = 48,369,664 bytes (46.13 MiB), S = 670, D = 1, K = 25.823580, machine points = **70.600822**. Previous best `run-52a2d5611b2b`: T = 0.212250 s, M = 51,752,960 bytes (49.36 MiB), S = 672, K = 25.555187, points = 70.373953. New best improves by 0.226869 points; memory falls 6.54%, time is 0.71% slower. Against the immediately preceding same-code baseline run `run-9b488a45a169` (690 lines, 52,015,104 bytes, 0.216000 s), this version is smaller, lighter, and slightly faster. Kept. The board cloned the subsequent Track C commit while it contained this unchanged Track B implementation.
+
+
+## Track B 75-point sprint: bitmap fast path
+
+Common bitmap terms now take a dedicated path before phrase/list bookkeeping. Repeated occurrences simply OR the same local pending bit, so no per-term last-document lookup is needed for them. Pending bitmap words are flushed when the next bitmap term enters a different 64-document block; blocks with no bitmap terms need no flush. List deduplication and exact phrase verification are unchanged.
+
+Local full-input comparisons consistently favored this change, with representative 13-run alternating medians 165.260 ms baseline versus 157.490 ms candidate; another round 169.778 versus 156.831 ms. All timed output bytes matched. Stored tiny/sample/full and seeds 42/999 plus six fresh randomized Python-reference comparisons passed. This is an intermediate candidate toward the user's 75+ target, not a claim that the target has been met.
