@@ -354,6 +354,15 @@ fn push_u64(out: &mut String, mut v: u64) {
     out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i..]) });
 }
 
+fn summary(out: &mut String, count: u64, sum: u64, first: impl Iterator<Item = u32>) {
+    for x in [count, sum].into_iter().chain(first.map(u64::from)) {
+        push_u64(out, x);
+        out.push(' ');
+    }
+    out.pop();
+    out.push('\n');
+}
+
 /// "count sum id1 ... id10" for a set of documents.
 fn line(out: &mut String, docs: &Docs) {
     let (mut count, mut sum) = (0u64, 0u64);
@@ -392,14 +401,7 @@ fn line(out: &mut String, docs: &Docs) {
             }
         }
     }
-    push_u64(out, count);
-    out.push(' ');
-    push_u64(out, sum);
-    for &d in &first[..nfirst] {
-        out.push(' ');
-        push_u64(out, d as u64);
-    }
-    out.push('\n');
+    summary(out, count, sum, first[..nfirst].iter().copied());
 }
 
 /// Calls f(doc, id, start, len) for the term tokens of the lines in text,
@@ -475,31 +477,21 @@ fn main() {
                                      // PR_SET_THP_DISABLE: the box backs part-written regions with whole 2 MB pages.
     unsafe { prctl(41, 1u64, 0u64, 0u64, 0u64) };
 
-    let mut data_dir = String::from("/data");
-    let mut out_dir = String::from("/out");
     let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "--data" && i + 1 < args.len() {
-            data_dir = args[i + 1].clone();
-            i += 2;
-        } else if args[i] == "--out" && i + 1 < args.len() {
-            out_dir = args[i + 1].clone();
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    if let Ok(env_data) = std::env::var("DATA_DIR") {
-        if !env_data.is_empty() {
-            data_dir = env_data;
-        }
-    }
-    if let Ok(env_out) = std::env::var("OUT_DIR") {
-        if !env_out.is_empty() {
-            out_dir = env_out;
-        }
-    }
+    let path = |flag, env, default: &str| {
+        std::env::var(env)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                args.windows(2)
+                    .rev()
+                    .find(|a| a[0] == flag)
+                    .map(|a| a[1].clone())
+            })
+            .unwrap_or_else(|| default.to_owned())
+    };
+    let data_dir = path("--data", "DATA_DIR", "/data");
+    let out_dir = path("--out", "OUT_DIR", "/out");
 
     let qtext = map(&format!("{data_dir}/queries.txt"));
     let slots = vec![0; (qtext.len() / 8).next_power_of_two()];
@@ -603,6 +595,8 @@ fn main() {
     // Zero pages from the kernel, written only where a bit is set.
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
 
+    drop((df, new, order, anchor, in_bool));
+
     // The scan: phrase matches, bitmap bits, and list postings by bucket.
     let found = Mutex::new(vec![]); // (query, document) phrase matches
     let scans: Vec<(Vec<u16>, Mutex<Vec<Units>>)> = on_threads(|t| {
@@ -661,6 +655,9 @@ fn main() {
         found.lock().unwrap().extend(mine);
         (count, Mutex::new(buckets))
     });
+    // The scan is complete: its dictionary and planning tables must not overlap
+    // the final posting array's resident pages.
+    drop((terms, anchored, astart));
     // Each term's postings lie in one stretch, thread by thread: the segment
     // from thread t holds seg[i * THREADS + t] offsets from firsts[t]. The
     // stretches go bucket by bucket, so a bucket's scatter writes one region,
@@ -673,10 +670,7 @@ fn main() {
             .for_each(|(n, scan)| *n = scan.0[i]);
         (start[i], end) = (end, end + s.iter().map(|&n| n as u32).sum::<u32>());
     }
-    let all_buckets: Vec<Mutex<Vec<Units>>> = scans
-        .into_iter()
-        .map(|s| s.1)
-        .collect();
+    let all_buckets: Vec<Mutex<Vec<Units>>> = scans.into_iter().map(|s| s.1).collect();
     // Written by every thread at its own positions; relaxed stores are plain stores.
     let post: Vec<AtomicU16> = unsafe { std::mem::transmute(vec![0u16; end as usize]) };
     on_threads(|t| {
@@ -744,27 +738,14 @@ fn main() {
             );
             if phrase {
                 let at = found.partition_point(|m| m.0 < q as u32);
-                let matches = &found[at..];
-                let mut count = 0u64;
-                let mut sum = 0u64;
-                let mut first = [0u32; 10];
-                let mut nfirst = 0;
-                for m in matches.iter().take_while(|m| m.0 == q as u32) {
-                    count += 1;
-                    sum += m.1 as u64;
-                    if nfirst < 10 {
-                        first[nfirst] = m.1;
-                        nfirst += 1;
-                    }
-                }
-                push_u64(&mut out, count);
-                out.push(' ');
-                push_u64(&mut out, sum);
-                for &d in &first[..nfirst] {
-                    out.push(' ');
-                    push_u64(&mut out, d as u64);
-                }
-                out.push('\n');
+                let end = at + found[at..].partition_point(|m| m.0 == q as u32);
+                let matches = &found[at..end];
+                summary(
+                    &mut out,
+                    matches.len() as u64,
+                    matches.iter().map(|m| m.1 as u64).sum(),
+                    matches.iter().take(10).map(|m| m.1),
+                );
             } else {
                 let cur = docs(tids[0]);
                 let set = ops
