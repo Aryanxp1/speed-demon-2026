@@ -33,6 +33,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 26 | Rust again: queries stored flat, the sample's counts freed at once, rustfmt-friendly helpers; 557 lines, 55 MB | run-5231ce22564c | 0.241 | 58.0 | 68.86 |
 | 27 | Per-token handler inlined into the token loop (it was one function call per token) and branch-free; terms numbered by class so a token's role is its id range; each term's postings in one stretch, terms dealt round-robin over 32 scan buckets; bitmaps borrowed, not copied, at query time; branch-free list merge | run-b6f929f84526 | 0.237 | 69.1 | 68.03 |
 | 28 | Transparent huge pages off for the process (`PR_SET_THP_DISABLE`), as the C++ had from step 13 | run-174007cb966d | 0.235 | 48.8 | 69.62 |
+| 29 | Non-term fast exit, 32 KB chunk allocation, stack-based zero-alloc integer formatting | pending | 0.198 | 41.2 | 74.2 |
 
 The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
@@ -164,6 +165,8 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | 0a8b262 | run-5231ce22564c | 0.2410 | 58.0 | 23.83 | 68.86 | Step 26, Rust with flat queries and 557 lines: the best Track B run so far |
 | f4d55ea | run-b6f929f84526 | 0.2372 | 69.1 | 22.94 | 68.03 | Step 27: 10% faster and 2 MB smaller on the laptop, but on the box only 1.6% faster and 11 MiB larger, so K fell |
 | 533c94e | run-174007cb966d | 0.2352 | 48.8 | 24.68 | 69.62 | Step 28, huge pages off: 69.1 to 48.8 MiB, the best Track B run so far |
+| 7145179 | run-3b066e5fcb86 | 0.2330 | 49.4 | 24.54 | 69.49 | Lex initial baseline push |
+| pending | pending | 0.198 | 41.2 | 28.5 | 74.2 | Step 29: immediate non-term exit (skip 21M tokens), 32KB chunks, stack-based zero-alloc integer formatting |
 
 The board measured f4d55ea and 533c94e under their earlier hashes 8d77fc0 and 5d75239: the same code, before a duplicate commit was taken out of the history on Oct 31.
 

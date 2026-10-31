@@ -9,3 +9,5 @@ test_data/
 *.log
 *.log.txt
 
+tools/
+check.py
