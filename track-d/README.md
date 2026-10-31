@@ -1,48 +1,21 @@
 # Track D: Traverse
 
-High-performance shortest path engine for directed weighted graphs on road network topology.
+The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/d-traverse.md).
 
 ## Approach
 
-1. **Compact Cache-Interleaved CSR Graph**:
-   - `offsets`: `Vec<u32>` of size $N + 1$ (starts for each node's forward edge list).
-   - `edges`: `Vec<EdgeTarget>` of size $M$ where `struct EdgeTarget { to: u32, weight: u32 }` (8 bytes per edge). Interleaving destination vertex and weight into a single contiguous array eliminates dual cache misses during edge relaxation.
-   - Total graph memory for 1.74M nodes and 5M edges: ~47 MB.
-   - Self-loops ($u == v$) filtered out during load.
+One Rust file, `src/main.rs`, with no crates (the C++ version it replaced is in the git history up to commit ee086ce). Plain Dijkstra with early exit is the right algorithm for these queries (Dijkstra rank at most 131,071, median 512), run from both ends, so the work went into a cheap build and cheap settled nodes.
 
-2. **$O(1)$ Reachability & Bounds Filtering**:
-   - Out-of-bounds node query IDs (`sq >= N || tq >= N`) safely return `-1`.
-   - `s == t` answered immediately with `0`.
-   - `out_degree[s] == 0` or `in_degree[t] == 0` answered immediately with `-1`.
-
-3. **Epoch-Based Distance Reset**:
-   - Each worker thread maintains a flat `visited_epoch: Vec<u32>` and `dist: Vec<u64>` of length $N$.
-   - Advancing `cur_epoch += 1` resets distance queries in $O(1)$ time without allocating or looping over 1.74M entries.
-   - Epoch rollover protection: when `cur_epoch == u32::MAX`, arrays are cleanly cleared and reset.
-
-4. **Dynamic Multi-Threaded Work Scheduling**:
-   - Rather than static query chunking, queries are dynamically distributed across 6 worker threads using an `AtomicUsize` work counter.
-   - Threads dynamically claim the next query index with `fetch_add(1, Relaxed)`, eliminating thread idle time caused by uneven Dijkstra search depths.
-   - Zero external crates ($D = 1.000$).
-
-5. **Direct ASCII Output Serialization**:
-   - Custom integer serialization to a buffered `BufWriter` with no heap string allocations.
-
-## Performance Metrics (Official Board Seed 1 Full)
-
-- **Reference Wall Time ($T_{\text{ref}}$):** 72.69 s
-- **Official Measured Wall Time ($T$):** 1.512 s (48.1x speedup)
-- **Reference Peak Memory ($M_{\text{ref}}$):** 915.0 MB
-- **Official Measured Peak Memory ($M$):** 177.0 MB (5.17x leaner)
-- **Official Machine Score ($K$):** 7.430230 (43.550 points)
-- **Correctness:** 100% byte-identical SHA-256 match (`a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`).
+1. **Parse once.** `graph.txt` is memory-mapped and cut into one line-aligned range per thread. Each thread files every edge under the part of the node range its tail falls in (about 27 parts of 65,536 nodes), as sequential appends. An edge is one 32-bit word, the head in the low bits and the weight above it; a weight too large for its field is stored as all ones with its value on a side list.
+2. **Build each part on its own.** A thread takes a part, counts its nodes' out-degrees and places its edges, all inside a 256 KB counter array. This replaced two passes of random atomic adds over the whole graph.
+3. **Renumber for locality.** Node ids are a random relabelling, so each thread cuts the road network into compact blobs of 512 nodes grown by BFS (nodes claimed by compare-exchange), and the graph is copied into that numbering, then reversed in place.
+4. **Bidirectional Dijkstra.** Each query grows the side with the smaller queue, records the best length where the sides meet and stops once the two smallest queued keys reach it. 4-ary heaps; distances in 4 KB pages handed out on first touch. A target with no in-edge is -1 at once, read off the reverse graph.
 
 ## Dependencies
 
-- Pure Rust standard library (`std::thread`, `std::sync::atomic`, `std::collections::BinaryHeap`, `std::fs`, `std::io`).
-- External runtime dependencies: **0** ($D = 1.000$).
+None. Standard library and POSIX `mmap` only.
 
 ## With another 24 hours
 
-1. **SIMD Graph Parser:** Accelerate space and newline parsing using AVX2 vector instructions during initial CSR ingestion.
-2. **ALT (A*, Landmarks, Triangle Inequality) or CH (Contraction Hierarchies):** Precompute landmarks to accelerate long-distance goal-directed Dijkstra queries.
+- The second pass (random atomic writes into the CSR arrays) is now the largest part of the build; partitioning edges by tail before placing them would make those writes local.
+- Bidirectional search would roughly halve the settled nodes but needs the reverse graph (about 47 MB more); on this scoring formula that is close to break-even.

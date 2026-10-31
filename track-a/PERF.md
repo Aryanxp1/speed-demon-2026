@@ -1,57 +1,74 @@
-# Track A: Performance Log
+# Track A: performance log
 
-Every step from the reference to our optimized version, with measured metrics, architectural rationale, and verified SHA-256 correctness.
+Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
-| Step | Change | Run ID / Context | T (s) | M (MB) | S (lines) | K | Points |
-|---|---|---|---|---|---|---|---|
-| **0** | Official scoring box Python reference | `calibration-seed1.json` | 32.05 | 228.0 | 56 | 1.000 | 0.00 |
-| **1** | Single-threaded zero-dependency Rust baseline (`BufReader`, dynamic endpoint interner, bucket array) | Unofficial local | 0.81 | 28.0 | 140 | 8.370 | 46.10 |
-| **2** | Full-file buffer ingest (`fs::read`). *Reverted/Adjusted*: Peak RSS increased to 260 MB, penalized memory score. Replaced with streaming chunk buffer. | Unofficial local | 0.75 | 260.0 | 165 | 5.820 | 38.20 |
-| **3** | 6-thread parallel chunking with `std::thread::scope`, global mutex registry with thread-local read cache, nearest-rank `select_nth_unstable`, and custom integer formatting. | Unofficial local | 0.65 | 54.6 | 394 | 6.960 | 42.10 |
-| **4** | Architectural pruning & line consolidation: eliminated redundant integer formatters, unified numerical serializers, reduced code size from 394 to 263 lines (+11% gain on $S$ factor). | Unofficial local | 0.65 | 54.6 | 263 | 7.390 | 43.40 |
-| **5** | **Official Board Submission (Baseline v1.0)**: Executed on official scoring machine (Intel Core i5-13500, pinned 12 threads, 8 GB RAM). 100% byte-identical SHA-256 match. | **Official Board Run** | **0.292** | **61.0** | **263** | **10.284873** | **50.610** |
-| **6** | **Official Board Submission (v1.1)**: Improved line grouping & memory efficiency. | **Official Board Run** | **0.150** | **62.0** | **379** | **14.400088** | **57.918** |
-| **7** | **Zero-Copy Mmap Ingest, SIMD Vector Scanning, & Radix Bucketing**: Zero-copy `mmap` with AVX2 `match32`, SIMD digit parsing (`_mm_maddubs_epi16`), thread-local `EndpointTable` with hardware CRC32 (`_mm_crc32_u64`), fixed 16 KB `Block` arena, radix prefix-sum latency scattering with `madvise(MADV_DONTNEED)`, and dedicated streaming background writer thread. | Official Board Run (`22347ff`) | 0.032 | 41.0 | 523 | 32.125243 | 75.342 |
-| **8** | **THP Disable (`PR_SET_THP_DISABLE = 41`) & Immediate Hour Buffer Reclaim**: Corrected `prctl(41, 1, 0, 0, 0)` syscall to disable Linux Transparent Huge Pages (eliminating 2MB page faults and dirty page bloat). Free each hour output buffer immediately upon disk write (`*buf = Vec::new()`), preventing co-residence of 72 text buffers. Verified 100% SHA-256 match. | Target Board Run | <0.030 | ~25.0 | 523 | >36.0 | >77.5 |
+| Step | Change | Run ID | T (s) | M (MB) | Points |
+|---|---|---|---|---|---|
+| 0 | The reference, unchanged | | 32.05 | 228 | 0 |
+| 1 | C++: mmap, 12 threads, records per hour in blocks, per-hour counting sort and nth_element, writer thread | pending | | | |
+| 2 | Same design in 222 formatted lines instead of 373 | run-3c1dcbde6115 | 0.0293 | 31.8 | 79.7 |
+| 3 | One thread pool with a barrier; each hour written with pwrite at an offset handed on by the hour before, instead of per-hour strings and a writer thread; chunks released from the front of each region in 256 KB batches instead of one madvise per chunk; THP off | run-ab09a84f93b8 | 0.0310 | 20 | 80.64 |
+| 4 | Hours computed into compact per-group numbers with their exact text size, then formatted straight into the mapped output file at known offsets; endpoint names compared with one 32-byte SIMD compare | run-b962d6b976eb | 0.0301 | 20 | 80.47 |
+| 5 | Step 4 trimmed from 301 to 271 counted lines: digit width by recursion, shorter error paths, unused includes and fields dropped, the three selections as one loop | run-20c5a50e4cb0 | 0.0301 | 21 | 80.69 |
+| 6 | Rust port of step 5, same design; rustfmt-counted code trimmed from 444 to 341 lines | run-2048094dbc8d | 0.0323 | 20.9 | 79.14 |
+| 7 | Back to the C++ of step 5: on the box the Rust port was no faster and counts 349 lines against 271 | pending | | | |
 
----
+## Local measurements
 
-### Step 1: Single-Threaded Rust Baseline
-- **Motivation:** Replace Python's interpreted line splitting, `strptime`, and heap allocation churn with zero-dependency Rust.
-- **Approach:**
-  - Fast arithmetic day/hour parsing mapping the fixed 72-hour window (`2026-10-30T18:00:00Z` to `2026-11-02T17:59:59Z`) directly to `0..71`.
-  - Dynamic string interning for the 1,842 endpoints.
-  - Flat group table `[72 * 2048]` with `Vec<u32>` latencies.
-- **Result:** $T = 0.81\text{ s}$, $M = 28.0\text{ MB}$. Output SHA-256 byte-identical.
+Laptop (Ryzen 7840HS), full seed-1 data in a Docker volume, `--cpus=12`, cgroup `memory.peak`, wall time around the process inside the container. Every version produced the published hash `495ca096...`.
 
-### Step 2: Full-File Memory Ingest vs Streaming (The Memory Trade-Off)
-- **Motivation:** Reading the entire 238.8 MB file with `fs::read` avoids repeated `read` syscalls.
-- **Observation:** While wall time was fast, peak resident memory jumped to 260 MB. In the Speed Demon formula, $M$ carries a $0.20$ exponent. A memory ratio of $0.87$ penalized total $K$ by 36%.
-- **Decision:** Replaced full-file buffering with a 2 MB streaming chunk buffer that preserves low memory ($28\text{--}54\text{ MB}$) while maintaining sub-second execution.
+| Version | Wall (ms, median) | Peak (MB) | Where the time went |
+|---|---|---|---|
+| v1: one global (hour x endpoint) grid, count, prefix and scatter over it | 74 to 87 | 48 | parse 30, serial prefix over 132k groups x 12 threads 13, scatter 13, format 9, write 6 |
+| v2: records filed per hour; each hour sorted and formatted on its own in L2 | 41 to 46 | 33 | parse 21 to 38, hours 9 |
+| v3: one 64-byte SIMD scan per line, loop-free latency decode | 39 to 42 | 33 | within noise of v2 |
+| step 2: v3 rewritten shorter (to_chars, fwrite, fixed endpoint table) | 38 to 46 | 33 | same speed, S 373 to 222 |
 
-### Step 3: Multi-Core Concurrency & Lock-Free Thread Caches
-- **Motivation:** Leverage the 6 Performance cores / 12 hardware threads available on the Falkenstein box.
-- **Approach:**
-  - Partition file into disjoint contiguous byte ranges split at newline (`\n`) boundaries.
-  - Spawn 6 scoped threads using `std::thread::scope` (zero external dependencies, $D=1.0$).
-  - Global endpoint registry protected by a `Mutex`, combined with an $O(1)$ thread-local cache. After the first 5,000 lines, 100% of endpoint lookups hit the local cache without taking locks.
-  - Replace full $O(n \log n)$ latency vector sort with $O(n)$ `select_nth_unstable` for percentiles $k_{99}, k_{95}, k_{50}$.
-  - Custom fast integer formatting directly into a reusable line buffer.
-- **Result:** $T = 0.65\text{ s}$ across middle-3 runs, $M = 54.6\text{ MB}$.
+## What the profile said
 
-### Step 4: Source Size ($S$) Optimization & Multi-Seed Generalization
-- **Motivation:** In the $K$ formula, code size carries a $0.15$ exponent. Reducing unnecessary boilerplate improves the $S$ ratio directly.
-- **Approach:**
-  - Consolidated duplicate integer serialization routines.
-  - Verified edge cases and holdout generalization against seeds 1, 42, and 999 across tiny, sample, and full scales.
-- **Result:** Code lines reduced from 394 to 263 lines without performance loss. Local $K = 7.39$.
+**v1 to v2.** More than half the time went to a global grid of 132,624 (hour, endpoint) groups: a serial prefix sum across 12 per-thread count arrays and a scatter with random writes. Filing records per hour while parsing makes each hour's work (about 43k latencies) small enough for L2: a counting sort by endpoint rank, three `nth_element` calls per group, formatting, and the writer thread emits hours in order as they finish.
 
-### Step 5: Official Board Verification & Metrics
-- **Environment:** Dedicated official benchmark host (Intel i5-13500, 6 P-cores @ 2.5 GHz turbo off, 8 GB memory limit, Linux offline container).
-- **Official Result:**
-  - $T = \mathbf{0.292\text{ s}}$ ($109.8\times$ faster than 32.05s reference).
-  - $M = \mathbf{61.0\text{ MB}}$ ($3.74\times$ leaner than 228.0 MB reference).
-  - $K = \mathbf{10.284873}$.
-  - **Points Earned:** $\mathbf{50.610}$ machine points.
-- **Correctness:** 100% SHA-256 match on full public dataset (`495ca09682542a981a8ba214a1a659fb221ee54fe66d8ba609fca940aa415ef4`).
+**v2 to v3.** Page faults on the input were 3 to 7 ms (a variant that only touched each page); `MAP_POPULATE` was slower (serial, +15 ms). The rest was per-line parsing, so the method, endpoint and line ends now come from one 64-byte compare. The gain was inside laptop noise.
 
+**Step 2.** S is counted after `clang-format --style=LLVM`, which wraps at 80 columns. Folding the per-hour summary into `main`, using `std::to_chars` and `fwrite`, and a fixed-size endpoint table (a seed has 1,842 endpoints) took it from 373 to 222 lines with no change in speed.
+
+**Step 3.** Phase timers showed the hour phase at about 17 ms for work that is only a counting sort and small selections. Dropping the per-chunk `madvise` (about 1,600 calls, each a TLB shootdown across every thread) cut it to about 12 ms, but peak memory went from 23 to 32 MB: the finished hours' strings piled up in malloc arenas, and the output file's own pages count toward the cgroup as it is written. So the strings went: each thread formats an hour into one reusable buffer, takes its file offset from the hour before, passes the next offset on and writes with `pwrite`. Chunks still have to go back while the output grows, but the log is in arrival order, so the front of each thread's region empties hour by hour; one `madvise` per 256 KB of finished chunks does it. Transparent huge pages are off, as on B and C, so a part-written region is not backed by 2 MB pages on the box. Locally (11 alternating runs): median 40 ms and 21 MB, against 44 ms and 23 MB for step 2, same hash on full, sample, tiny and the worked example. Formatted code lines 245 to 254.
+
+**Step 3 to 4.** `perf` (in a privileged throwaway container) put `memcmp` at 12% of all cycles, one call per line to confirm the endpoint lookup, and a kernel lock (`osq_lock`, `rwsem_spin_on_owner`) at 6 to 14%, which its call graph traced to `pwrite`: the filesystem takes the file's lock for every write, so twelve threads writing one file queue on it. Both names live in the log, where 32 bytes can always be read, so names of up to 32 bytes are now compared in one AVX2 step. Per-step timers inside the hour phase (CPU summed over threads, ms): counting 13 to 22, scattering 6 to 8, release 2, selection and formatting 50 to 54, waiting for the previous hour's offset 24 to 60, `pwrite` 21 to 31. About 40% of the phase was waiting and writing. The hours now run in two steps around a barrier. First each thread computes its hours' groups (24 bytes each, about 3 MB in all) and the exact size each hour's text will take; a number's width comes from its bit length (checked against `len(str(x))` on half a million values and every power-of-ten boundary). Then the last thread in turns sizes into offsets, sets the file's length and maps it (`MAP_SHARED`, so the file is opened read-write), and every thread formats its hours straight into it. No hour waits for another, nothing queues on the file's lock, and the output's pages fill only after the records are released. Locally (15 alternating runs): median 32 ms against 38 ms, peak 20 against 21 MB. Same hash on full, sample, tiny, the worked example, a seed-9 sample and an empty log (zero-byte output), all through `check.py`'s bind-mounted `/out`. Formatted code lines 264 to 294.
+
+**Step 4 on the board.** run-b962d6b976eb: 0.0301 s against 0.0310 s, same 20 MiB, but the source grew from 261 to 301 counted lines, so K went from 41.02 to 40.67. The time gain (3%) is worth less on this formula than the 15% more code costs; the next step is to win those lines back. An averaged profile after this step still shows `memcmp` at 7% (endpoint names longer than 32 bytes, and the name sort in the merge).
+
+**Step 4 to 5.** Formatted with `clang-format --style=LLVM` and counted locally, step 4 was 294 lines; the board counted 301. Trimmed to 264 (the size step 3 had) without changing what the program does: the digit-width table became a one-line recursion (it runs once per printed number, about 760k times), error paths became one line each, the unused `region` field and two includes went, the per-hour reserve went, and the three selections became one loop. Two trims were tried and reverted after `perf stat -r 8` (8 runs per build, interleaved): a plain digit loop instead of the SIMD latency decoder cost 5% more instructions in all, and dropping the sort for groups of 64 or fewer cost another 1%. With both kept, instructions match step 4 within 3% and wall time is inside the laptop's noise of steps 3 and 4. Same hash on full, sample, tiny, the worked example, the seed-9 sample and an empty log.
+
+**Step 5 to 6: the same program in Rust.** A line-for-line port (one file, no crates; `mmap`, `madvise`, `ftruncate` and `prctl` declared by hand, raw pointers for the record chunks, one scoped thread pool with `std::sync::Barrier`, the serial steps run by the barrier's leader). It matched the hash on full, sample, tiny, the worked example, the seed-9 sample and an empty log on its first build. Three interleaved `perf stat -r 15` rounds against step 5: 0.647 to 0.657G cycles against 0.689 to 0.728G, CPU time 292 to 298 ms against 321 to 332 ms, though 16% more instructions; `cmp.ps1` median 43 ms against 46 ms, same 21 MB. The difference is in the hour phase: Rust's `sort_unstable` and `select_nth_unstable` mispredict much less than libstdc++'s `std::sort` and `nth_element` on the many small groups (the C++ build's branch mispredictions sat almost all inside them). rustfmt's defaults (which the board applies) spread struct literals, call chains and long argument lists over many lines, so the first port counted 444 lines; splitting long expressions, merging the line-end search into one helper, keeping each group's numbers as a 7-number array and asserting instead of branching on errors brought it to 341 (349 with the Dockerfile, against 271 for step 5). On the laptop the time gain and the code cost come out about even on K, so the board run decided: run-2048094dbc8d measured 0.0323 s and 20.9 MiB, inside the 0.029 to 0.034 s the C++ has scored on the box, with K 38.27 against the C++'s best of 41.10. The laptop's 7% did not show on the Intel box (as with Track B's Rust port), so the code went back to the C++ of step 5 (step 7).
+
+**After step 7: a shorter Rust port, measured and not shipped.** The step 6 port was trimmed further: three selections for every group instead of a sort below 65 records (the second and third over `a[..=r99]` and `a[..=r95]`, so a group of one or two records never selects in an empty slice; as fast as the split, 4 lines fewer), digits written backwards over their known width, and a shorter constructor: 333 rustfmt lines. A plain digit fold instead of the SIMD latency decoder saved 11 more lines but cost 6% of cycles, so the decoder stayed. Against step 5's C++ in three `perf stat -r 15` rounds: about 4% fewer cycles, wall within noise, the same 21 MB, but 341 counted lines against 271. That is about +1.5% of K from time and -3.4% from size, a net loss, and step 6's board run had already shown the box not rewarding the laptop's gain. With a 56-line reference, Rust's rustfmt layout costs this track more than its sort and selection save, so Track A stays C++.
+
+## Tried and kept out
+
+- **Third session (Oct 31): where the time goes now, and why none of it shipped.** `perf stat` on step 5 (three interleaved rounds of 15 runs, output on tmpfs as on the box): 0.72G cycles, 0.79G instructions, 10.1M branch mispredictions (about 3.3 a line), only 6 of 12 CPUs busy on average. Switching parts off: with endpoint interning replaced by a stand-in id the run takes 0.41G cycles, so interning is the largest single cost; trusting the slot without comparing names takes 0.59G, and hashing without the table 0.50G. Then, each measured the same way:
+  - Names compared in a loop of 32-byte steps instead of `memcmp` past 32 bytes (half the lines have longer names): same cycles, 5% more instructions.
+  - A 64-bit hash of the whole name (two CRC32 chains) as the only key, so no stored name is read: 4% fewer cycles, 13% more instructions, and no longer exact.
+  - The first 64 bytes compared in two masked steps with no branch on the length (exact): 2 to 5% fewer cycles over six rounds, for 9 more lines.
+  - The log in 96 pieces claimed in turn instead of 12 fixed ranges: the slowest parse thread finished at 12 to 17 ms instead of 18 to 21 ms on the laptop (where threads share cores unevenly), but whole-run timing was inside noise; the box pins its threads evenly.
+  - A 128-byte window for the line's spaces and newline (128-bit masks), since a 64-byte one misses the end of about a third of the lines: 13% more instructions, slightly more cycles.
+  - Most mispredictions turned out to be inside `std::sort` and `nth_element` in the hour phase. Large groups by a histogram over log-scale buckets (bit length, then six bits) that finds each percentile's bucket, one branch-free gather of those buckets and a small selection; small groups by counting each element's rank with 8-lane compares: mispredictions 10.1M to 5.9M and 7% fewer cycles, but 65 more lines.
+  - `-O2`, and `-O3 -funroll-loops`: no change.
+
+  On this track the reference is 56 lines, so 20% more code costs about 2.7% of K, as much as a 5% faster run gains. The combined version (329 lines against 264, 7% fewer cycles) came out level on K, and the smaller pieces are below what the box can resolve (it varies 0.029 to 0.034 s on identical code), so the code stays at step 5.
+- `MAP_POPULATE`: slower, the populate is serial.
+- A plain digit loop instead of the SIMD latency decoder: the laptop could not tell them apart; kept SIMD.
+- **A streaming design, aimed at memory.** The log is the shards' chunks in arrival order and, by the generator's own model, no line arrives more than about ten minutes after its hour ends. So all threads swept the log together in 128 KB blocks claimed in order, and an hour was closed (gathered from every thread, counting-sorted, formatted and written out) as soon as the parsed front of the log held a line two hours later; its 4 KB chunks went back to a pool. Correct for any input: a line that turned up for a closed hour sent the whole run round again with every hour held open. It matched the hash on full, sample, tiny, the worked example, the seed-9 sample and an empty log, and only about two hours of records were alive at once. It still did not pay. The harness bind-mounts `/out` from a tmpfs on the box, so the 10 MB summary itself stays in memory and counts toward M, on top of a container floor of about 5 MB: no layout gets M under about 15 MiB, which is where the leaders sit (17 MiB). Writing with `O_DIRECT`, or dropping written pages with `posix_fadvise`, only helps on a disk-backed `/out`, and on the laptop's disk volume both were slower (38 to 96 ms in writes). With the output on tmpfs as on the box, 13 alternating runs gave 36 to 37 ms against 34 ms for the current code, at 19 MB against 21 MB. `perf stat` put the streaming build at 6% more instructions and 15% more CPU time, about a third of it kernel lock contention from page faults while the threads share one sweep. Two MB of memory is worth about 2% of K and the lost time about 3.5%, so it stays out.
+
+## Board runs
+
+Runs measured on the scoring box after the team was registered. M is the box's cgroup peak in MiB; K and points as the board reports them.
+
+| Commit | Run ID | T (s) | M (MiB) | K | Points | What it measured |
+|---|---|---|---|---|---|---|
+| ac44ba2 | run-3c1dcbde6115 | 0.0293 | 31.8 | 39.34 | 79.74 | Trimmed version (step 2) first measured on the board |
+| 8041c6b | run-e7a6c67e6934 | 0.0329 | 34.4 | 36.55 | 78.15 | Same Track A code; box variance between runs |
+| b4606d2 | run-cae4bc93c3f8 | 0.0294 | 33.5 | 38.87 | 79.48 | Same Track A code |
+| c451b56 | run-95a7235e8965 | 0.0295 | 34.2 | 38.61 | 79.34 | Same Track A code |
+| 5a6463e | run-18cf1fb4a517 | 0.0304 | 32.8 | 38.36 | 79.19 | Same Track A code |
+| 836c19e | run-ab09a84f93b8 | 0.0310 | 20 | 40.99 | 80.64 | Step 3: pwrite per hour, batched chunk release, THP off |

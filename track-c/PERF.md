@@ -1,88 +1,50 @@
-# Track C: Performance Log
+# Track C: performance log
 
-Every step from the reference to our optimized version, with measured metrics, architectural rationale, and verified SHA-256 correctness.
+Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
-| Step | Change | Run ID / Context | T (s) | M (MB) | S (lines) | K | Points |
-|---|---|---|---|---|---|---|---|
-| **0** | Official scoring box Python reference | `calibration-seed1.json` | 14.44 | 367.0 | 157 | 1.000 | 0.00 |
-| **1** | Single-threaded zero-dependency Rust with full-file ingest and `HashSet<Vec<u8>>` distinct tracking. | Unofficial local | 2.74 | 380.0 | 340 | 3.250 | 25.60 |
-| **2** | Direct 64-bit FxHash distinct tracking (`HashSet<u64>`) eliminating 100,000 heap allocations. Pre-allocated buffers. | Unofficial local | 1.24 | 240.1 | 350 | 4.310 | 31.70 |
-| **3** | Sliding-window chunked streaming (2 MB buffer). Slashes peak RSS from 240 MB to 45.4 MB ($8.1\times$ leaner than reference) and improves wall time to 1.20s due to L3 cache locality. | Unofficial local | 1.20 | 45.5 | 367 | 4.630 | 33.30 |
-| **4** | **Official Board Submission (Baseline v1.0)**: Evaluated on official scoring machine (Intel Core i5-13500, pinned 12 threads, 8 GB RAM). 100% byte-identical SHA-256 match. | **Official Board Run** | **0.926** | **88.0** | **367** | **4.378513** | **32.066** |
-| **5** | **64-Byte Carry-less Multiply (CLMUL) Structural Quote Masking & Lock-Free Concurrent NameTable**: Direct zero-copy `mmap` with 4096-byte padding; 64-byte blocks processed with `_mm_clmulepi64_si128` prefix XOR quote masking to find commas and newlines in hardware; $O(1)$ arithmetic string length computation `(e - s) - (q ? q / 2 + 1 : 0)`; lock-free concurrent `NameTable` with 16-bit tags and 24-byte inline `head` comparison via `_mm256_cmpeq_epi8`; shared bitset `NamesSeen` marked in a single `fetch_or` and popcounted per country. | Official board run `286d812` | 0.051 | 26.0 | 870 | 20.942871 | 66.052 |
-| **6** | **Table Capacity Right-Sizing (`1 << 17` Slots & IDs)**: Reduced `SLOTS` and `IDS` from `1 << 19` to `1 << 17` (131,072 entries) matching optimal working set size. Slashes dirty anonymous memory allocations by 12.5 MB (from ~22 MB down to 8.7 MB), reducing official peak RSS from 26 MB to 14 MB. | Official Board Run (`dba6217`) | 0.050 | 14.0 | 870 | 23.945910 | 68.962 |
-| **7** | **Bitwise Modulo Probing & Line-Count Pruning**: Replaced `% SLOTS` modulo division with fast bitwise `& (SLOTS - 1)` across table probing paths; removed internal unit test block from `src/main.rs` to reduce source line count from 870 down to 797 lines (+1.3% boost from $(S_{ref}/S)^{0.15}$). All datasets verified byte-identical. | Target Board Run | <0.048 | 14.0 | 797 | >25.5 | >70.5 |
+| Step | Change | Run ID | T (s) | M (MB) | Points |
+|---|---|---|---|---|---|
+| 0 | The reference, unchanged | | 14.44 | 367 | 0 |
+| 1 | C++: 64-byte structural scan with a carry-less prefix XOR for quotes, eight-digit number decode, direct region table, lock-free name interning and per-country name bitsets, both prefetched records ahead; huge pages off | run-e93a8bd735f4 | 0.0471 | 13 | 72.34 |
+| 2 | records.csv cut into four pieces per thread, claimed in turn, instead of one fixed range per thread | run-ec7524ed632d | 0.0560 | 12 | 70.55 |
+| 3 | Shared tables populated up front instead of faulted in by twelve threads; the region lookup and the per-country sums moved into the prefetch pipeline | run-ee8f16604d56 | 0.0556 | 13.5 | 70.27 |
+| 4 | Name keys of 16 bytes (exact up to 16 bytes, first 8 bytes plus a tail hash beyond) in one 2 MB table claimed by 16-byte CAS, instead of tags, 32-byte slots and an arena; shared tables populated by all threads in parallel | run-09adfa1681cb | 0.0384 | 10.3 | 75.54 |
+| 5 | Amount decoded as one number with its dot dropped; names marked with a plain atomic OR, no test first | run-74059dd5273c | 0.0414 | 10.4 | 74.67 |
 
----
+**Step 3 to 4.** A profile of step 3 showed only 5.9 of 12 CPUs busy on average: before any record was parsed, the main thread spent about 4 ms populating 9 MB of shared tables, and the name lookup was still the largest part of the record pass (a hash loop over every word of the name, a probe over the 16-bit tags, then a 32-byte compare against a 32-byte slot whose head copy made the table 4 MB). The name table is now one array of 16-byte keys. A name of up to 16 bytes (89% of the 100,000 pool names at full scale) is its own key, its bytes zero padded, which is exact because names hold no zero byte. A longer name keeps its first 8 bytes and a 63-bit hash of the rest, with the top bit set (ASCII never sets it), so two names are confused only if they share their first 8 bytes and that hash; at full scale about 1,500 long names share a first 8 bytes with another, which puts the chance near 10^-16. The empty name has its own key. A key's slot is the name's id, a lookup is one aligned 16-byte load and compare (one cache line, prefetched when the record is parsed), and an empty slot is claimed with a 16-byte compare-and-swap, so a reader sees a slot either empty or whole and every name gets one id. The table is 2 MB instead of 4.25 MB plus the arena. The shared tables are now populated with `MADV_POPULATE_WRITE`, each thread its own share, inside the thread pool. Over three interleaved `perf stat -r 15` rounds: cycles 1.31G to 0.97G, wall 0.044 to 0.033 s; `cmp.ps1` median 49 to 38 ms and peak 14 to 11 MB. Same hash on full, sample, tiny, the worked example, the rules file and the seed-11 sample, and the same hash on 10 more runs each of full and sample.
 
-### Step 1: Zero-Dependency Rust Baseline
-- **Motivation:** Replace Python's interpreted string decoding, regex parsers, and dict lookups with direct byte scanning and array lookups.
-- **Approach:**
-  - Direct 10 MB lookup array `region_to_country: Vec<u8>` mapping `region_id` ($0 \dots 9,999,999$) to country index in $O(1)$ time with zero hash collisions.
-  - Custom byte-level CSV state machine handling mid-file UTF-8 BOMs (`\xEF\xBB\xBF`), quoted commas, escaped `""`, and multiline notes.
-  - Exact integer arithmetic for amounts (cents stored as `i64`).
-- **Result:** $T = 2.74\text{ s}$, $M = 380\text{ MB}$. Output SHA-256 byte-identical.
+**Step 1 to 2.** Per-thread timers on the record pass showed the threads finishing 8 to 10 ms apart out of about 45 ms, even when they started together: ranges with more first sightings of names (inserts, not lookups) run slower. Pieces claimed from a shared counter let the fast threads take up the slack. Timing-only variants put the rest of the record pass in perspective: with name interning switched off it takes 22 to 32 ms instead of about 45, and with only the bitset marks off about 43, so interning is the next target. Locally the change is inside the laptop's noise (two builds of the same code differ by 4 ms of median), so the board run is the measurement. Same hash on full, sample, tiny, the worked example and the rules file.
 
-### Step 2: 64-Bit FxHash Distinct Name Tracking
-- **Motivation:** Storing 100,000 distinct `Vec<u8>` names in `HashSet` caused severe allocator fragmentation and ballooned RSS.
-- **Approach:**
-  - Replace `HashSet<Vec<u8>>` with `HashSet<u64>` keyed by a fast 64-bit FxHash.
-  - Zero collisions observed across all datasets.
-- **Result:** Wall time improved by $2.2\times$ ($2.74\text{ s} \to 1.24\text{ s}$), peak RSS dropped from 380 MB to 240 MB.
+**Step 2 on the board.** 0.056 s, the same as the step 1 code's latest run (0.0556 s); the box varies between about 0.047 and 0.056 s for identical C code, so the split made no visible difference. Kept, as it costs two lines.
 
-### Step 3: Sliding-Window Chunked Streaming (2 MB Buffer)
-- **Motivation:** In the Speed Demon formula, memory carries a $0.20$ exponent. Reading the full 202 MB file into memory created an avoidable memory footprint.
-- **Approach:**
-  - Implemented a sliding window 2 MB buffer. When remaining bytes in the buffer fall below `MAX_RECORD_LEN` (64 KB), unparsed tail bytes are shifted to the front and the next 2 MB chunk is read from disk.
-  - Eliminates the 202 MB file buffer allocation entirely.
-  - Keeps working set entirely within L3 CPU cache (24 MB on Falkenstein i5-13500).
-- **Result:** Peak RSS plunged from 240 MB to **45.5 MB** ($8.08\times$ leaner than reference 367 MB). Wall time clocked at **1.20 s**. Local $K = 4.63$.
+**Step 2 to 3.** Switching parts of the record pass off pointed at name interning (about 20 ms of 45), and a variant that only read the name slot was as fast as one that skipped the lookup entirely, so the slot read itself was not the cost. `perf` inside a privileged throwaway container (the Docker VM's kernel exposes the counters) gave the real answer: about 12% of all cycles were a kernel spinlock, `__pte_offset_map_lock`, inside page faults. Twelve threads were faulting in pages of the shared name slots, tags, bitsets and region table at the same time, all under a handful of page-table locks, and every page was faulted twice: on its first read (mapped to the shared zero page) and again on its first write. These tables are dense and fully touched anyway, so they are now mapped with `MAP_POPULATE`; the lock disappeared from the profile and user CPU fell about 8% at the same peak. With the faults gone, `perf annotate` put 14% of the cycles on one stall: `country_of[region]`, a random byte from a 1 MB table, read and used at once for every record. The region row is now prefetched when the record is parsed, and the country lookup and the per-country sums run 16 records later, in the same pipeline that resolves the name (the step that retires a record is forced inline; GCC had stopped inlining it). The atomic OR that marks a name as seen is the next hot spot, about 5%. Wall time on the laptop is too noisy to resolve this (CPU time itself varies 30% between runs), so the board run is the measurement. Same hash on full, sample, tiny, the worked example, the rules file and a seed-11 sample checked against the reference.
 
-### Step 4: Official Board Verification & Metrics
-- **Environment:** Dedicated official benchmark host (Intel i5-13500, 6 P-cores @ 2.5 GHz turbo off, 8 GB memory limit, Linux offline container).
-- **Official Result:**
-  - $T = \mathbf{0.926\text{ s}}$ ($15.6\times$ faster than 14.44s reference).
-  - $M = \mathbf{88.0\text{ MB}}$ ($4.17\times$ leaner than 367.0 MB reference).
-  - $K = \mathbf{4.378513}$.
-  - **Points Earned:** $\mathbf{32.066}$ machine points.
-- **Correctness:** 100% SHA-256 match on full public dataset (`d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`).
+**Step 4 to 5.** Two small cuts in the per-record work, found by switching parts of the record pass off: finding the separators alone takes 0.30G cycles and 0.35G instructions, and the numbers, lengths, sums and pipeline add 0.76G instructions (about 230 a record) before any name work. The eight-digit decode was the largest share of those. An amount is at most seven digits around its dot (99999.99), so its eight bytes with the dot's byte dropped are one number: one decode instead of two. And a name is marked with the atomic OR straight away instead of testing the bit first, since 93% of marks are first sightings and the test fetched the line shared before the OR fetched it again exclusive. Together: 2 to 5% fewer cycles and 30M fewer instructions in three interleaved rounds, same hashes on every file and on repeated runs.
 
-### Step 5: Exact-Byte Collision-Proof Verification (Holdout Hardening)
-- **Motivation:** Hash-based distinct name tracking carries a non-zero probability of birthday-paradox collisions on unseen holdout datasets with unknown name distributions.
-- **Approach:**
-  - Replaced the hash set with `DistinctNameTable`, an open-addressing hash table storing `(country_id, offset, len)` records backed by a contiguous `Vec<u8>` string arena.
-  - On hash hit, compares exact slice bytes `&arena[off..off+len] == name`.
-  - Dynamically resizes at 50% load factor.
-- **Result:** Complete collision immunity guaranteed on any holdout dataset. Retains lean memory footprint (~90 MB) and sub-second wall time. 100% verified across tiny, sample, full, seed 42, and seed 999.
+## Tried and kept out
 
+- **After step 4** (each against step 4, three interleaved `perf stat -r 15` rounds). Switching parts off first: without the bitset marks 0.83G cycles instead of 0.97G; without the name lookup as well 0.57G; computing the keys but not looking them up cost nothing more, so the lookup itself is about 75 cycles a record even with its slot prefetched 16 records ahead. Then:
+  - The name's country bits in the same 64-byte line as its key, so the mark needs no second random read and the pipeline loses a stage: 15% more cycles. Every record now writes the lines other threads read for their lookups, and the table grew to 8 MB.
+  - A second prefetch for the line after the home slot (at load 0.76 a name often sits a few slots past it): no change. A table of 256k slots (load 0.38): 3% fewer cycles for 5.7 MB more memory, so probing is not the cost either.
+  - The tables on 2 MB pages (`MADV_HUGEPAGE`): within noise, so not TLB bound.
+  - Prefetch leads of 8 and 32 records instead of 16: within noise.
+- **After step 5.** Removing the name-slot prefetch costs only 6% more cycles, and counters put the lookup at about 0.85 branch mispredictions and 1.5 cache misses per record: the probe loop's length varies at load 0.76. Buckets of four slots per cache line, compared whole (four aligned 16-byte loads, so each slot is still read atomically) and moved past only when full: about 2.5% fewer cycles in three rounds but 12% more instructions and 8 more lines, a gain the box (which varies by 20% on identical C code) could not show. Kept out.
 
-## 2026-10-31 — Lex: repair `22347ff` correctness
+- **A Rust rewrite** (Track D's rewrite had paid off). Same design: SIMD structural scan with a shift-based prefix XOR for the quote mask, lock-free name table with per-country name bitsets, the 16-record prefetch pipeline, shared tables populated up front, and one phase fewer (the region table stores the country code directly). It matched the published hash on full, sample, tiny, the worked example, the rules file and a seed-11 sample on its first build, but a determinism check (40 runs) caught a race the six single runs had not: when two threads raced for the same free name slot, the loser kept the stale "free" value instead of re-reading the slot (C++'s `compare_exchange_strong` does that implicitly; Rust's `compare_exchange` returns the current value in its `Err`), so it could skip past a slot the winner was filling with the very same name and intern the name twice. Fixed, it gave the same hash 40 times out of 40. Measured with `perf stat -r 8` against the C++: 0.046 to 0.052 s against 0.046 to 0.054 s, 11% more instructions, and 424 formatted lines against 398. A deeper prefetch pipeline (32 records) and four-word masked name hashing did not separate from noise either. Same speed with more code would lower K, so C stays in C++.
 
-**Correction to the historical Step 5 claims above:** the CLMUL implementation at `22347ff` fails local tiny, sample and full correctness. Its prior estimated score and correctness claims do not validate that commit. The older arena implementation described separately above is not the current implementation. No new official score has been measured.
+- **Where the time goes, measured on the Rust build** (`perf stat -r 8`, CPU time summed over threads): full 530 ms and 1.78 B instructions; names looked up but bitsets never written 471 ms; no name work at all 232 ms and 1.18 B; separators only 95 ms and 0.34 B. So the per-country bitset writes cost about 60 ms of CPU (handing each thread a fixed set of countries to avoid sharing them would not pay), and the name lookup about 240 ms, nearly half the run. A branch-free four-word hash, one 32-byte SIMD compare against the slot, a tag without a division and reading a long name's tail only for long names cut its instructions by 7% and its time by nothing measurable: the lookup waits on memory (the 256 KB tag array is read when the record is parsed, before any prefetch can help), not on instructions. A three-stage pipeline was then tried in the C++: hash the name and prefetch its tag line when the record is parsed, probe the tags and prefetch the slot 16 records later, look the name up 16 later still, mark 16 after that. Over four interleaved `perf stat -r 8` rounds it was within noise of the two-stage version (wall 0.054 to 0.060 s against 0.053 to 0.059 s) with 4% more instructions, so it was reverted: the tag reads were not the stall that matters either.
 
-The reproduced primary failure was final-region parsing: a trailing LF caused the parser to read after the final row and allocate a region map of length one. All records became `_UNMATCHED`. The fix finds the last nonempty row. Existing region chunk splitting already aligns to LF; boundary tests cover 1–31 workers. Additional fixes initialize amount extrema correctly and inspect a competing writer's published name after a failed compare-exchange, preventing duplicate IDs for equal names.
+## Board runs
 
-The fast name table and ID bitmap capacity are now 524,288. Bounded probing spills into exact-byte standard-library maps/sets if capacity is exhausted. Long-name suffixes reference the immutable input mapping, removing the unchecked 8 MiB arena. AVX2/PCLMUL target attributes and Docker flags are explicit; unsupported CPUs receive an error. The Linux THP-disable prctl constant is corrected. These changes improve robustness without claiming unlimited holdout capacity or performance.
+Runs measured on the scoring box after the team was registered. M is the box's cgroup peak in MiB; K and points as the board reports them.
 
-Local environment: WSL2, i7-12700H, CPUs 0–11, Linux musl release, x86-64-v3 plus PCLMUL. RSS includes mapped input pages; it is not equivalent to official container memory accounting.
+| Commit | Run ID | T (s) | M (MiB) | K | Points | What it measured |
+|---|---|---|---|---|---|---|
+| 8041c6b | run-c0256839d76a | 0.0469 | 26.9 | 24.04 | 69.04 | Current design, first board run: 13 MB locally, 27 MiB on the box |
+| b4606d2 | run-10380893c086 | 0.0636 | 12.2 | 24.39 | 69.36 | Huge pages off everywhere: memory fixed, but T rose (the dense tables lost their huge pages) |
+| c451b56 | run-8a652a8caa88 | 0.0475 | 28.2 | 23.86 | 68.88 | Huge pages back on, off only for the name arena and overflow table: T back to 0.047 s, memory back to 28 MiB, so those regions were not the cause |
+| 5a6463e | run-5ab2877a394d | 0.0558 | 28.2 | 21.97 | 67.09 | Also 1 MB thread stacks: no change in memory; reverted to the b4606d2 version (huge pages off) after this |
+| b59a694 | run-09adfa1681cb | 0.0384 | 10.3 | 32.41 | 75.54 | Step 4: 16-byte name keys and tables populated in parallel; T 0.047 to 0.038 s (best before, 0.056 latest), M 13.1 to 10.3 MiB |
+| 1a34f09 | run-74059dd5273c | 0.0414 | 10.4 | 31.15 | 74.67 | Step 5: within the box's run-to-run spread of step 4 (0.038 s); the 2 to 5% laptop gain is too small to see there |
 
-| Dataset / version | Wall time (s) | Peak RSS (KiB) | Correctness |
-|---|---:|---:|---|
-| Tiny baseline | .02 | 1796 | FAIL |
-| Sample baseline | .06 | 25228 | FAIL |
-| Full baseline | .41 | 202748 | FAIL |
-| Tiny fixed | .01 | 1996 | PASS |
-| Sample fixed | .05 | 41832 | PASS |
-| Full fixed, five serial runs | .15, .06, .06, .06, .06 | 220588, 220672, 220736, 220416, 220736 | PASS every run |
-
-Fixed full trimmed mean: .060 s, maximum RSS: 226.03 decimal MB. An earlier verification run took .25 s / 220608 KiB; cache and scheduling effects are substantial. Invalid baseline timings are recorded for diagnosis only, not a valid speedup comparison. The fixes were measured as one correctness repair, not isolated performance optimizations.
-
-| Dataset | Verified SHA-256 |
-|---|---|
-| Tiny | `e4e43bc39920e9d446c3fcd700fdd35b3959e9495c6aaa738491df38a1aed733` |
-| Sample | `9035fed36823232dd41ae2d1b9d6d21aa7c73f49d8e95647e953a89d5ebe9a66` |
-| Full | `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536` |
-| Seed 42 tiny | `7d151bcd945ddf65dcddaa4b956f75435d638a411bddb7cdb42f4fb7e2d8e816` |
-| Seed 999 sample | `62e7f211aa5d71f593a5fa718e0ca8279b71fd1b716d0879112d550c6d3ab77d` |
-
-Seed 42 and 999 initial verification measurements: .02 s / 1960 KiB and .05 s / 42240 KiB respectively. Both match reference output byte for byte. Official WORKED and RULES handwritten fixtures also pass, covering quoted fields, BOMs, multiline notes and amount extrema. Three new unit tests pass for region boundaries/extrema, concurrent deduplication, and exhausted-table fallback. Dev/release checks deny warnings. Docker validation and the live board rerun remain outstanding; the 72+ target is unverified. Local scripts and binaries are in ignored `.data/lex_directive`, measurements in `/home/aryan/speeddemon_data/lex-directive`.
+**What the board taught about memory.** The box backs anonymous memory with transparent huge pages, the laptop's Docker VM only on request. With them on, C measured 27 to 28 MiB on the box against 13 MB locally; turning them off for the whole process (`PR_SET_THP_DISABLE`) brought it to 12.2 MiB. Turning them off only for the sparse regions, or shrinking thread stacks, did not, so the extra comes from the dense tables being rounded to whole 2 MB pages. Huge pages also seem to make C faster (0.047 s with, 0.064 s without), but C's time on the box varies by about 20% between runs of the same code, so that is not settled. The version with them off scored the higher K and stays.

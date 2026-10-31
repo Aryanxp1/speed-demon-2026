@@ -1,267 +1,229 @@
-use std::fs::File;
-use std::io::Write;
-use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::thread;
+//! Speed Demon 2026, Track D (Traverse), in Rust with no dependencies.
+//!
+//! 1. Parse once. graph.txt is memory-mapped and cut into one line-aligned
+//!    range per thread. Each thread files every edge, as sequential appends,
+//!    under the part of the node range its tail falls in (about 27 parts of
+//!    65,536 nodes). An edge is one 32-bit word: the head in the low bits, the
+//!    weight above it; a weight too large for its field is stored as all ones
+//!    with its value on a side list.
+//! 2. Build each part on its own. A thread takes a part, counts its nodes'
+//!    out-degrees and places its edges, all inside a 256 KB counter array, so
+//!    the adjacency list is built with no atomics and no cache misses beyond
+//!    the writes themselves.
+//! 3. Renumber for locality. Node ids are a random relabelling, so each thread
+//!    cuts the road network into compact blobs of 512 nodes grown by BFS, and
+//!    the graph is copied into that numbering, then reversed.
+//! 4. Bidirectional Dijkstra per query, with 4-ary heaps and distances kept in
+//!    pages handed out on first touch. A target with no in-edge is -1 at once.
+use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+use std::ffi::c_void;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering::Relaxed};
+use std::sync::Mutex;
 
-// POSIX mmap / munmap / prctl bindings
 extern "C" {
-    fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    fn munmap(addr: *mut u8, len: usize) -> i32;
-    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
 }
 
-const PROT_READ: i32 = 1;
-const MAP_PRIVATE: i32 = 0x02;
-const MAP_FAILED: *mut u8 = !0 as *mut u8;
-const PR_SET_THP_DISABLE: i32 = 41;
-
-const RING: usize = 4096;
-const ESC_MARKER: u32 = 0xFFFF;
-
-struct Bucket {
-    ptr: *mut u32,
-    len: u32,
-    cap: u32,
+#[cfg(target_env = "gnu")]
+extern "C" {
+    fn mallopt(param: i32, value: i32) -> i32;
 }
 
-#[inline(always)]
-unsafe fn bpush(b: *mut Bucket, v: u32) {
-    if (*b).len == (*b).cap {
-        let new_cap = if (*b).cap == 0 { 32 } else { (*b).cap * 2 };
-        let new_ptr = if (*b).cap == 0 {
-            let layout = std::alloc::Layout::array::<u32>(new_cap as usize).unwrap();
-            std::alloc::alloc(layout) as *mut u32
-        } else {
-            let old_layout = std::alloc::Layout::array::<u32>((*b).cap as usize).unwrap();
-            std::alloc::realloc((*b).ptr as *mut u8, old_layout, new_cap as usize * 4) as *mut u32
-        };
-        (*b).ptr = new_ptr;
-        (*b).cap = new_cap;
+#[cfg(not(target_env = "gnu"))]
+unsafe fn mallopt(_param: i32, _value: i32) -> i32 {
+    0
+}
+
+const INF: u64 = u64::MAX;
+const BLOB: usize = 512; // nodes per locality blob
+const PART_BITS: u32 = 16; // nodes per part: 2^16, so a part's counters fit in L2
+const PAGE: usize = 512; // distances per page
+
+/// A pointer the threads share; every use writes indices no other thread writes.
+#[derive(Clone, Copy)]
+struct Raw<T>(*mut T);
+unsafe impl<T> Send for Raw<T> {}
+unsafe impl<T> Sync for Raw<T> {}
+impl<T> Raw<T> {
+    fn of(v: &mut [T]) -> Self {
+        Raw(v.as_mut_ptr())
     }
-    *(*b).ptr.add((*b).len as usize) = v;
-    (*b).len += 1;
-}
-
-unsafe fn map_file(file: &File) -> (*const u8, usize) {
-    let size = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
-    if size == 0 {
-        return (std::ptr::null(), 0);
-    }
-    let fd = file.as_raw_fd();
-    let p = mmap(std::ptr::null_mut(), size + 4096, PROT_READ, MAP_PRIVATE, fd, 0);
-    if p == MAP_FAILED {
-        return (std::ptr::null(), 0);
-    }
-    (p as *const u8, size)
-}
-
-#[inline(always)]
-unsafe fn parse_u32(p: &mut *const u8) -> u32 {
-    let mut v = (**p - b'0') as u32;
-    *p = p.add(1);
-    while **p >= b'0' {
-        v = v * 10 + (**p - b'0') as u32;
-        *p = p.add(1);
-    }
-    v
-}
-
-#[derive(Copy, Clone)]
-struct Edge {
-    v: u32,
-    w: u32,
-}
-
-#[derive(Copy, Clone)]
-struct Esc {
-    e: u32,
-    v: u32,
-    w: u32,
-}
-
-
-#[inline(always)]
-fn edge_at(pk: &[u32], esc: &[Esc], u: u32, e: usize) -> (u32, u32) {
-    let x = unsafe { *pk.get_unchecked(e) };
-    if (x & 0xFFFF) != ESC_MARKER {
-        let dv = (x >> 16) as i16 as i32;
-        let v = (u as i32 + dv) as u32;
-        let w = x & 0xFFFF;
-        (v, w)
-    } else {
-        let idx = esc.binary_search_by_key(&(e as u32), |x| x.e).unwrap_or(0);
-        let item = unsafe { esc.get_unchecked(idx) };
-        (item.v, item.w)
+    unsafe fn at(self, i: usize) -> *mut T {
+        self.0.add(i)
     }
 }
 
-fn dijkstra_fallback(
-    pk: &[u32],
-    esc: &[Esc],
-    off: &[u32],
-    s: u32,
-    tg: u32,
-) -> i64 {
-    use std::cmp::Ordering;
-    use std::collections::{BinaryHeap, HashMap};
-
-    #[derive(Copy, Clone, Eq, PartialEq)]
-    struct State {
-        cost: u64,
-        node: u32,
-    }
-
-    impl Ord for State {
-        fn cmp(&self, other: &Self) -> Ordering {
-            other.cost.cmp(&self.cost)
-        }
-    }
-    impl PartialOrd for State {
-        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    let mut dist: HashMap<u32, u64> = HashMap::new();
-    let mut heap = BinaryHeap::new();
-
-    dist.insert(s, 0);
-    heap.push(State { cost: 0, node: s });
-
-    while let Some(State { cost, node }) = heap.pop() {
-        if cost > *dist.get(&node).unwrap_or(&u64::MAX) {
-            continue;
-        }
-        if node == tg {
-            return cost as i64;
-        }
-
-        let start = off[node as usize] as usize;
-        let end = off[node as usize + 1] as usize;
-        for e in start..end {
-            let (v, w) = edge_at(pk, esc, node, e);
-            let next_cost = cost.saturating_add(w as u64);
-            let cur = *dist.get(&v).unwrap_or(&u64::MAX);
-            if next_cost < cur {
-                dist.insert(v, next_cost);
-                heap.push(State { cost: next_cost, node: v });
-            }
-        }
-    }
-
-    -1
+fn prefetch<T>(p: *const T) {
+    unsafe { _mm_prefetch::<_MM_HINT_T0>(p as *const i8) }
 }
 
-fn dial(
-    pk: &[u32],
-    esc: &[Esc],
-    off: &[u32],
-    s: u32,
-    tg: u32,
-    d32: &mut [u32],
-    touched: &mut Vec<u32>,
-    ring: &mut [Bucket],
-) -> i64 {
-    let d32_ptr = d32.as_mut_ptr();
-    let ring_ptr = ring.as_mut_ptr();
-    let mut live = 1usize;
-    let mut res = -1i64;
-
+fn map(path: &str) -> &'static [u8] {
+    let file = std::fs::File::open(path).expect(path);
+    let len = file.metadata().unwrap().len() as usize;
+    // An anonymous page of zeros, then the file over its start (PROT_READ;
+    // MAP_PRIVATE | MAP_ANONYMOUS, then MAP_PRIVATE | MAP_FIXED), so an
+    // 8-byte read at any byte of the file stays inside the mapping.
     unsafe {
-        *d32_ptr.add(s as usize) = 0;
-        touched.push(s);
-        bpush(ring_ptr, s);
+        let p = mmap(std::ptr::null_mut(), len + 4096, 1, 0x22, -1, 0);
+        let ok = len == 0 || mmap(p, len, 1, 0x12, file.as_raw_fd(), 0) == p;
+        assert!(p as isize != -1 && ok, "mmap {path}");
+        std::slice::from_raw_parts(p as *const u8, len)
+    }
+}
 
-        let mut d = 0u32;
-        while live > 0 && res == -1 {
-            let b_idx = (d as usize) & (RING - 1);
-            let b = &mut *ring_ptr.add(b_idx);
-            let mut k = 0usize;
-            while k < (*b).len as usize && res == -1 {
-                let u = *(*b).ptr.add(k);
-                k += 1;
-                live -= 1;
-                if *d32_ptr.add(u as usize) != d {
-                    continue;
-                }
-                if u == tg {
-                    res = d as i64;
+/// The number at text[*i..], leaving *i past the one byte that ends it.
+/// Digits have bit 0x10 set and the space and newline that end a number do
+/// not, so one 8-byte load finds the end of any number up to 7 digits, and
+/// its digits are combined in pairs, quads and halves; longer numbers (only
+/// heavy weights) take the byte loop.
+#[inline(always)]
+fn number(text: &[u8], i: &mut usize) -> u32 {
+    let w = u64::from_le_bytes(unsafe { *(text.as_ptr().add(*i) as *const [u8; 8]) });
+    let stop = !w & 0x1010_1010_1010_1010;
+    if stop == 0 {
+        let mut v = 0u32;
+        while let d @ b'0'..=b'9' = unsafe { *text.get_unchecked(*i) } {
+            v = v * 10 + (d - b'0') as u32;
+            *i += 1;
+        }
+        *i += 1;
+        return v;
+    }
+    let len = stop.trailing_zeros() / 8; // digits before the separator
+    *i += len as usize + 1;
+    let mut v = (w << (64 - 8 * len)) & 0x0F0F_0F0F_0F0F_0F0F;
+    v = (v * 10 + (v >> 8)) & 0x00FF_00FF_00FF_00FF;
+    v = (v * 100 + (v >> 16)) & 0x0000_FFFF_0000_FFFF;
+    ((v * 10000 + (v >> 32)) & 0xFFFF_FFFF) as u32
+}
+
+/// k line-aligned cuts of text[from..].
+fn cuts(text: &[u8], from: usize, k: usize) -> Vec<usize> {
+    let mut c = vec![text.len(); k + 1];
+    c[0] = from;
+    for t in 1..k {
+        let mut x = (from + (text.len() - from) * t / k).max(c[t - 1]);
+        while x < text.len() && text[x - 1] != b'\n' {
+            x += 1;
+        }
+        c[t] = x;
+    }
+    c
+}
+
+/// Runs f(t) on nt threads and collects what each returns.
+fn on_threads<R: Send>(nt: usize, f: impl Fn(usize) -> R + Sync) -> Vec<R> {
+    let f = &f;
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..nt).map(|t| s.spawn(move || f(t))).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+/// Thread t's share of 0..n.
+fn share(n: usize, t: usize, nt: usize) -> std::ops::Range<usize> {
+    n * t / nt..n * (t + 1) / nt
+}
+
+/// A 4-ary min-heap of (key, node): it only ever holds the live frontier, so
+/// it stays small, and four children share one cache line.
+#[derive(Default)]
+struct Heap(Vec<(u64, u32)>);
+
+impl Heap {
+    fn push(&mut self, k: u64, u: u32) {
+        let h = &mut self.0;
+        let mut i = h.len();
+        h.push((k, u));
+        while i > 0 && h[(i - 1) / 4].0 > k {
+            h[i] = h[(i - 1) / 4];
+            i = (i - 1) / 4;
+        }
+        h[i] = (k, u);
+    }
+    /// The smallest entry (the heap must not be empty). The last entry sifts
+    /// down from the root, unchecked: every index read is below n.
+    fn pop(&mut self) -> (u64, u32) {
+        let x = self.0.pop().unwrap();
+        let Some(&top) = self.0.first() else { return x };
+        let (h, n, mut i) = (self.0.as_mut_ptr(), self.0.len(), 0);
+        unsafe {
+            while 4 * i + 1 < n {
+                let c = 4 * i + 1;
+                let m = (c + 1..n.min(c + 4)).fold(c, |m, j| if (*h.add(j)).0 < (*h.add(m)).0 { j } else { m });
+                if (*h.add(m)).0 >= x.0 {
                     break;
                 }
-                let start = *off.get_unchecked(u as usize) as usize;
-                let end = *off.get_unchecked(u as usize + 1) as usize;
-                for e in start..end {
-                    let (v, w) = edge_at(pk, esc, u, e);
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        if e + 1 < end {
-                            let next_x = *pk.get_unchecked(e + 1);
-                            if (next_x & 0xFFFF) != ESC_MARKER {
-                                let next_dv = (next_x >> 16) as i16 as i32;
-                                let next_v = (u as i32 + next_dv) as usize;
-                                core::arch::x86_64::_mm_prefetch(
-                                    d32_ptr.add(next_v) as *const i8,
-                                    core::arch::x86_64::_MM_HINT_T0,
-                                );
-                            }
-                        }
-                    }
-                    let nd = (d as u64) + (w as u64);
-                    if w >= RING as u32 || nd >= (u32::MAX - 1) as u64 {
-                        res = -2;
-                        break;
-                    }
-                    let nd32 = nd as u32;
-                    let v_idx = v as usize;
-                    let cur_dist = *d32_ptr.add(v_idx);
-                    if nd32 < cur_dist {
-                        if cur_dist == u32::MAX {
-                            touched.push(v);
-                        }
-                        *d32_ptr.add(v_idx) = nd32;
-                        bpush(ring_ptr.add((nd32 as usize) & (RING - 1)), v);
-                        live += 1;
-                    }
-                }
+                (*h.add(i), i) = (*h.add(m), m);
             }
-            (*b).len = 0;
-            d += 1;
+            *h.add(i) = x;
         }
-
-        for b in ring.iter_mut() {
-            b.len = 0;
-        }
-        for &u in touched.iter() {
-            *d32_ptr.add(u as usize) = u32::MAX;
-        }
-        touched.clear();
-    }
-
-    if res == -2 {
-        dijkstra_fallback(pk, esc, off, s, tg)
-    } else {
-        res
+        top
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Tentative distances in pages of 512, handed out on first touch and taken
+/// back after each query, so a thread's memory follows its largest search.
+struct Dist {
+    tab: Vec<u16>,
+    used: Vec<u32>,
+    pool: Vec<u64>,
+}
+
+impl Dist {
+    fn new(n: usize) -> Self {
+        Dist { tab: vec![0; n / PAGE + 1], used: Vec::new(), pool: Vec::new() }
+    }
+    /// INF for a node this search never reached; hands out no page.
+    fn get(&self, v: u32) -> u64 {
+        match unsafe { *self.tab.get_unchecked(v as usize / PAGE) } as usize {
+            0 => INF,
+            pg => unsafe { *self.pool.get_unchecked((pg - 1) * PAGE + v as usize % PAGE) },
+        }
+    }
+    fn at(&mut self, v: u32) -> &mut u64 {
+        let i = v as usize / PAGE;
+        if unsafe { *self.tab.get_unchecked(i) } == 0 {
+            self.used.push(i as u32);
+            self.tab[i] = self.used.len() as u16;
+            let s = (self.used.len() - 1) * PAGE;
+            self.pool.resize(self.pool.len().max(s + PAGE), INF);
+            self.pool[s..s + PAGE].fill(INF);
+        }
+        let k = (self.tab[i] as usize - 1) * PAGE + v as usize % PAGE;
+        unsafe { self.pool.get_unchecked_mut(k) }
+    }
+    fn reset(&mut self) {
+        self.used.iter().for_each(|&i| self.tab[i as usize] = 0);
+        self.used.clear();
+    }
+}
+
+/// The weight of edge e stored as all ones: its entry in the sorted list.
+fn heavy_weight(heavy: &[(u32, u32)], e: u32) -> u32 {
+    heavy[heavy.partition_point(|h| h.0 < e)].1
+}
+
+fn main() {
+    // Plain pages (a part-touched array with huge pages would count whole
+    // 2 MB pages), and freed arrays really go back to the kernel.
     unsafe {
-        prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+        prctl(41, 1, 0, 0, 0); // PR_SET_THP_DISABLE
+        mallopt(-3, 1 << 16); // M_MMAP_THRESHOLD
     }
 
-    let mut data_dir = PathBuf::from("/data");
-    let mut out_dir = PathBuf::from("/out");
-
+    let mut data_dir = String::from("/data");
+    let mut out_dir = String::from("/out");
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         if args[i] == "--data" && i + 1 < args.len() {
-            data_dir = PathBuf::from(&args[i + 1]);
+            data_dir = args[i + 1].clone();
             i += 2;
         } else if args[i] == "--out" && i + 1 < args.len() {
-            out_dir = PathBuf::from(&args[i + 1]);
+            out_dir = args[i + 1].clone();
             i += 2;
         } else {
             i += 1;
@@ -269,430 +231,322 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Ok(env_data) = std::env::var("DATA_DIR") {
         if !env_data.is_empty() {
-            data_dir = PathBuf::from(env_data);
+            data_dir = env_data;
         }
     }
     if let Ok(env_out) = std::env::var("OUT_DIR") {
         if !env_out.is_empty() {
-            out_dir = PathBuf::from(env_out);
+            out_dir = env_out;
         }
     }
 
-    let graph_path = data_dir.join("graph.txt");
-    let queries_path = data_dir.join("queries.txt");
-    let out_path = out_dir.join("distances.txt");
-
-    std::fs::create_dir_all(&out_dir).ok();
-
-    if !graph_path.exists() || !queries_path.exists() {
-        File::create(&out_path)?;
-        return Ok(());
-    }
-
-    let graph_file = File::open(&graph_path)?;
-    let queries_file = File::open(&queries_path)?;
-
-    let nthreads = std::env::var("SPEED_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(12)
-                .min(12)
-                .max(1)
-        });
-
-
-    // 1. Map graph.txt and queries.txt
-    let (graph_ptr, gsize) = unsafe { map_file(&graph_file) };
-    let (q_ptr, qsize) = unsafe { map_file(&queries_file) };
-
-    if graph_ptr.is_null() || q_ptr.is_null() {
-        File::create(&out_path)?;
-        return Ok(());
-    }
-
-    // Parse queries
+    let nt = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 12);
+    let qtext = map(&format!("{data_dir}/queries.txt"));
     let mut queries = Vec::new();
-    unsafe {
-        let mut p = q_ptr;
-        let end = q_ptr.add(qsize);
-        while p < end {
-            while p < end && *p <= b' ' {
-                p = p.add(1);
+    let mut i = 0;
+    while i < qtext.len() {
+        let s = number(qtext, &mut i);
+        queries.push((s, number(qtext, &mut i)));
+    }
+    let text = map(&format!("{data_dir}/graph.txt"));
+    let mut i = 0;
+    let n = number(text, &mut i) as usize;
+    number(text, &mut i);
+    let hb = 32 - (n as u32 | 1).leading_zeros(); // bits for a node id
+    let (hmask, big) = ((1u32 << hb) - 1, u32::MAX >> hb);
+    let sh = PART_BITS.min(hb);
+    let parts = (n >> sh) + 1;
+
+    // 1. Parse once, filing each edge under its tail's part.
+    type Bucket = (Vec<u64>, Vec<u32>); // (offset in part << 32 | word), heavy weights in order
+    let cut = cuts(text, i, nt);
+    let filed: Vec<Vec<Bucket>> = on_threads(nt, |t| {
+        let mut out: Vec<Bucket> = (0..parts).map(|_| Default::default()).collect();
+        let guess = (cut[t + 1] - cut[t]) / 17 / parts + 64;
+        out.iter_mut().for_each(|b| b.0.reserve(guess));
+        let mut i = cut[t];
+        while i < cut[t + 1] {
+            let u = number(text, &mut i);
+            let v = number(text, &mut i);
+            let mut w = number(text, &mut i);
+            if u == v {
+                continue; // a self-loop never shortens a path
             }
-            if p >= end {
-                break;
+            let b = &mut out[(u >> sh) as usize];
+            if w >= big {
+                b.1.push(w);
+                w = big;
             }
-            let s = parse_u32(&mut p);
-            p = p.add(1);
-            let t = parse_u32(&mut p);
-            while p < end && *p != b'\n' {
-                p = p.add(1);
-            }
-            if p < end {
-                p = p.add(1);
-            }
-            queries.push((s, t));
+            b.0.push(((u & ((1 << sh) - 1)) as u64) << 32 | (v | w << hb) as u64);
         }
-        munmap(q_ptr as *mut u8, qsize + 4096);
+        out
+    });
+    // Part p's edges start where part p - 1's end.
+    let mut base = vec![0u32; parts + 1];
+    for p in 0..parts {
+        base[p + 1] = base[p] + filed.iter().map(|f| f[p].0.len() as u32).sum::<u32>();
+    }
+    let buckets: Vec<Mutex<Bucket>> = (0..parts * nt).map(|_| Mutex::default()).collect();
+    for (t, f) in filed.into_iter().enumerate() {
+        for (p, b) in f.into_iter().enumerate() {
+            *buckets[p * nt + t].lock().unwrap() = b;
+        }
     }
 
-    // Parse graph header
-    let (n, edge_start, edge_len) = unsafe {
-        let mut p = graph_ptr;
-        let end = graph_ptr.add(gsize);
-        while p < end && *p <= b' ' {
-            p = p.add(1);
+    // 2. Build each part's adjacency on its own.
+    let m = base[parts] as usize;
+    let (mut first, mut link) = (vec![0u32; n + 1], vec![0u32; m]);
+    first[n] = m as u32;
+    let (fr, lr) = (Raw::of(&mut first), Raw::of(&mut link));
+    let claim_part = AtomicUsize::new(0);
+    let mut heavy: Vec<(u32, u32)> = on_threads(nt, |_| {
+        let mut heavy = Vec::new();
+        loop {
+            let p = claim_part.fetch_add(1, Relaxed);
+            if p >= parts {
+                return heavy;
+            }
+            let lo = p << sh;
+            let len = (n - lo).min(1 << sh);
+            let mine: Vec<Bucket> = (0..nt).map(|t| std::mem::take(&mut *buckets[p * nt + t].lock().unwrap())).collect();
+            let mut cursor = vec![0u32; len];
+            mine.iter().for_each(|b| b.0.iter().for_each(|&r| cursor[(r >> 32) as usize] += 1));
+            let mut at = base[p];
+            for (k, c) in cursor.iter_mut().enumerate() {
+                unsafe { *fr.at(lo + k) = at };
+                (at, *c) = (at + *c, at);
+            }
+            for (records, weights) in &mine {
+                let mut h = weights.iter();
+                for &r in records {
+                    let c = &mut cursor[(r >> 32) as usize];
+                    let x = r as u32;
+                    if x >> hb == big {
+                        heavy.push((*c, *h.next().unwrap()));
+                    }
+                    unsafe { *lr.at(*c as usize) = x };
+                    *c += 1;
+                }
+            }
         }
-        let n = parse_u32(&mut p);
-        p = p.add(1);
-        let _m = parse_u32(&mut p);
-        while p < end && *p != b'\n' {
-            p = p.add(1);
-        }
-        if p < end {
-            p = p.add(1);
-        }
-        let start = p;
-        let len = gsize - (start as usize - graph_ptr as usize);
-        (n as usize, start, len)
+    })
+    .concat();
+    heavy.sort_unstable();
+    drop(buckets);
+
+    // 3. Locality order: compact BFS blobs. A thread grows a blob over
+    // unclaimed nodes (claimed by compare-exchange), then starts the next one
+    // from the last one's unclaimed frontier, so consecutive ids are close on
+    // the map.
+    let claimed: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+    let claim = |v: u32| {
+        let c = &claimed[v as usize];
+        c.load(Relaxed) == 0 && c.compare_exchange(0, 1, Relaxed, Relaxed).is_ok()
     };
-
-    // Partition edge slice across threads
-    let mut cut = vec![edge_len; nthreads + 1];
-    cut[0] = 0;
-    for t in 1..nthreads {
-        let mut c = edge_len * t / nthreads;
-        unsafe {
-            while c < edge_len && *edge_start.add(c - 1) != b'\n' {
-                c += 1;
+    let (first_v, link_v) = (first, link);
+    let (first, link) = (&first_v[..], &link_v[..]);
+    let chains: Vec<Vec<u32>> = on_threads(nt, |t| {
+        let (mut ord, mut seeds) = (Vec::with_capacity(n / nt + BLOB), Vec::new());
+        let mut scan = share(n, t, nt).start;
+        // Fetch the offsets 8 queue entries ahead and the edges 4 ahead.
+        let ahead = |ord: &Vec<u32>, i: usize| {
+            ord.get(i + 8).map(|&u| prefetch(&first[u as usize]));
+            ord.get(i + 4).map(|&u| prefetch(&link[first[u as usize] as usize]));
+        };
+        loop {
+            let mut seed = None;
+            while let Some(v) = seeds.pop() {
+                if claim(v) {
+                    seed = Some(v);
+                    break;
+                }
             }
-        }
-        cut[t] = c;
-    }
-
-    let edge_start_usize = edge_start as usize;
-
-    let off_atomic: Vec<AtomicU32> = unsafe { std::mem::transmute(vec![0u32; n + 2]) };
-    let has_in_atomic: Vec<AtomicBool> = unsafe { std::mem::transmute(vec![0u8; n + 1]) };
-
-    // Pass 1: Count out-degrees and mark has_in
-    thread::scope(|s| {
-        for t in 0..nthreads {
-            let c_start = cut[t];
-            let c_end = cut[t + 1];
-            let off_ref = &off_atomic;
-            let has_in_ref = &has_in_atomic;
-            s.spawn(move || unsafe {
-                let mut q = (edge_start_usize + c_start) as *const u8;
-                let q_end = (edge_start_usize + c_end) as *const u8;
-                while q < q_end {
-                    while q < q_end && *q <= b' ' {
-                        q = q.add(1);
-                    }
-                    if q >= q_end {
-                        break;
-                    }
-                    let mut u = 0u32;
-                    while *q != b' ' {
-                        u = u * 10 + (*q - b'0') as u32;
-                        q = q.add(1);
-                    }
-                    q = q.add(1);
-                    let mut v = 0u32;
-                    while *q != b' ' {
-                        v = v * 10 + (*q - b'0') as u32;
-                        q = q.add(1);
-                    }
-                    q = q.add(1);
-                    while *q != b'\n' {
-                        q = q.add(1);
-                    }
-                    q = q.add(1);
-                    if u != v && (u as usize) < n && (v as usize) < n {
-                        off_ref[u as usize + 1].fetch_add(1, Ordering::Relaxed);
-                        has_in_ref[v as usize].store(true, Ordering::Relaxed);
+            while seed.is_none() && scan < n {
+                if claim(scan as u32) {
+                    seed = Some(scan as u32);
+                }
+                scan += 1;
+            }
+            let Some(seed) = seed else { return ord };
+            let (blob, mut i) = (ord.len(), ord.len());
+            ord.push(seed);
+            while i < ord.len() && ord.len() - blob < BLOB {
+                ahead(&ord, i);
+                let u = ord[i] as usize;
+                for e in first[u]..first[u + 1] {
+                    let v = link[e as usize] & hmask;
+                    if ord.len() - blob < BLOB && claim(v) {
+                        ord.push(v);
                     }
                 }
-            });
+                i += 1;
+            }
+            for i in i..ord.len() {
+                ahead(&ord, i);
+                let u = ord[i] as usize;
+                for e in first[u]..first[u + 1] {
+                    let v = link[e as usize] & hmask;
+                    if claimed[v as usize].load(Relaxed) == 0 {
+                        seeds.push(v);
+                    }
+                }
+            }
         }
     });
-    let mut off = vec![0u32; n + 2];
-    for i in 0..=n {
-        off[i + 1] = off[i] + off_atomic[i + 1].load(Ordering::Relaxed);
+
+    // New ids: each thread's chain in turn (every node is in one).
+    let mut id_v = vec![0u32; n];
+    let mut start = vec![0u32; nt + 1];
+    for t in 0..nt {
+        start[t + 1] = start[t] + chains[t].len() as u32;
     }
-    drop(off_atomic);
+    let ir = Raw::of(&mut id_v);
+    on_threads(nt, |t| chains[t].iter().zip(start[t]..).for_each(|(&u, k)| unsafe { *ir.at(u as usize) = k }));
+    drop((claimed, chains));
 
-    let m_valid = off[n] as usize;
-    let mut edges = vec![Edge { v: 0, w: 0 }; m_valid];
-    let edges_addr = edges.as_mut_ptr() as usize;
-
-    let cur: Vec<AtomicU32> = unsafe { std::mem::transmute(off.clone()) };
-
-    // Pass 2: Scatter edges into array
-    thread::scope(|s| {
-        for t in 0..nthreads {
-            let c_start = cut[t];
-            let c_end = cut[t + 1];
-            let cur_ref = &cur;
-            s.spawn(move || unsafe {
-                let e_ptr = edges_addr as *mut Edge;
-                let mut q = (edge_start_usize + c_start) as *const u8;
-                let q_end = (edge_start_usize + c_end) as *const u8;
-                while q < q_end {
-                    while q < q_end && *q <= b' ' {
-                        q = q.add(1);
-                    }
-                    if q >= q_end {
-                        break;
-                    }
-                    let mut u = 0u32;
-                    while *q != b' ' {
-                        u = u * 10 + (*q - b'0') as u32;
-                        q = q.add(1);
-                    }
-                    q = q.add(1);
-                    let mut v = 0u32;
-                    while *q != b' ' {
-                        v = v * 10 + (*q - b'0') as u32;
-                        q = q.add(1);
-                    }
-                    q = q.add(1);
-                    let mut w = 0u32;
-                    while *q != b'\n' {
-                        w = w * 10 + (*q - b'0') as u32;
-                        q = q.add(1);
-                    }
-                    q = q.add(1);
-                    if u != v && (u as usize) < n && (v as usize) < n {
-                        let idx = cur_ref[u as usize].fetch_add(1, Ordering::Relaxed);
-                        *e_ptr.add(idx as usize) = Edge { v, w };
-                    }
-                }
-            });
-        }
-    });
-    // Unmap graph.txt immediately!
-    unsafe {
-        munmap(graph_ptr as *mut u8, gsize + 4096);
+    // The graph in the new numbering: degrees scattered, summed, then each
+    // edge's head mapped (weight bits kept), with the random reads of later
+    // nodes started 8 and 4 nodes early.
+    let id = &id_v[..];
+    let mut off = vec![0u32; n + 1];
+    let or = Raw::of(&mut off);
+    on_threads(nt, |t| share(n, t, nt).for_each(|u| unsafe { *or.at(id[u] as usize + 1) = first[u + 1] - first[u] }));
+    for v in 0..n {
+        off[v + 1] += off[v];
     }
-    drop(cur);
-    drop(cut);
-
-    // BFS Reordering
-    let mut order = vec![0u32; n];
-    let mut perm = vec![u32::MAX; n];
-    let mut tail = 0usize;
-
-    for r in 0..n {
-        if perm[r] != u32::MAX {
-            continue;
-        }
-        perm[r] = tail as u32;
-        order[tail] = r as u32;
-        tail += 1;
-        let mut h = tail - 1;
-        while h < tail {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                if h + 16 < tail {
-                    let next_u = *order.get_unchecked(h + 16) as usize;
-                    core::arch::x86_64::_mm_prefetch(off.as_ptr().add(next_u) as *const i8, core::arch::x86_64::_MM_HINT_T0);
-                }
-                if h + 8 < tail {
-                    let next_e = *off.get_unchecked(*order.get_unchecked(h + 8) as usize) as usize;
-                    core::arch::x86_64::_mm_prefetch(edges.as_ptr().add(next_e) as *const i8, core::arch::x86_64::_MM_HINT_T0);
-                }
-                if h + 4 < tail {
-                    let next_u4 = *order.get_unchecked(h + 4) as usize;
-                    let e_start = *off.get_unchecked(next_u4) as usize;
-                    let e_end = *off.get_unchecked(next_u4 + 1) as usize;
-                    for e in e_start..e_end {
-                        let v = edges.get_unchecked(e).v as usize;
-                        core::arch::x86_64::_mm_prefetch(perm.as_ptr().add(v) as *const i8, core::arch::x86_64::_MM_HINT_T0);
-                    }
-                }
+    let mut adj = vec![0u32; m];
+    let ar = Raw::of(&mut adj);
+    let off = &off;
+    let mut heavy2: Vec<(u32, u32)> = on_threads(nt, |t| {
+        let (mut out, r) = (Vec::new(), share(n, t, nt));
+        for u in r.clone() {
+            if u + 8 < r.end {
+                prefetch(&off[id[u + 8] as usize]);
+                (first[u + 8]..first[u + 9]).for_each(|e| prefetch(&id[(link[e as usize] & hmask) as usize]));
             }
-            let u = order[h] as usize;
-            h += 1;
-            let start = off[u] as usize;
-            let end = off[u + 1] as usize;
-            for e in start..end {
-                let v = edges[e].v as usize;
-                if perm[v] == u32::MAX {
-                    perm[v] = tail as u32;
-                    order[tail] = v as u32;
-                    tail += 1;
+            if u + 4 < r.end {
+                prefetch(unsafe { ar.at(off[id[u + 4] as usize] as usize) });
+            }
+            let mut j = off[id[u] as usize];
+            for e in first[u]..first[u + 1] {
+                let x = link[e as usize];
+                if x >> hb == big {
+                    out.push((j, heavy_weight(&heavy, e)));
                 }
+                unsafe { *ar.at(j as usize) = id[(x & hmask) as usize] | (x & !hmask) };
+                j += 1;
             }
         }
+        out
+    })
+    .concat();
+    heavy2.sort_unstable();
+    // Queries in the new numbering (sorted later), then the old graph and the
+    // id map can go, freed on a side thread while the reverse graph is built.
+    let ends: Vec<(u32, u32)> = queries.iter().map(|&(s, t)| (id[s as usize], id[t as usize])).collect();
+    std::thread::spawn(move || drop((heavy, first_v, link_v, id_v)));
+
+    // The reverse graph in the same format: in-degrees counted into
+    // roff[v + 1], summed, then roff[v] used as v's cursor, which leaves it at
+    // v's end, so shifting it up by one restores the offsets.
+    let adj = &adj;
+    let mut roff = vec![0u32; n + 1];
+    let rr = Raw::of(&mut roff);
+    let bump = |i: usize| unsafe { AtomicU32::from_ptr(rr.at(i)).fetch_add(1, Relaxed) };
+    on_threads(nt, |t| share(n, t, nt).for_each(|u| (off[u]..off[u + 1]).for_each(|e| { bump((adj[e as usize] & hmask) as usize + 1); })));
+    for v in 0..n {
+        roff[v + 1] += roff[v];
     }
-    let mut off2 = vec![0u32; n + 2];
-    for i in 0..n {
-        let u = order[i] as usize;
-        off2[i + 1] = off[u + 1] - off[u];
-    }
-    for i in 0..n {
-        off2[i + 1] += off2[i];
-    }
+    let mut radj = vec![0u32; m];
+    let rar = Raw::of(&mut radj);
+    let mut rheavy: Vec<(u32, u32)> = on_threads(nt, |t| {
+        let mut out = Vec::new();
+        for u in share(n, t, nt) {
+            for e in off[u]..off[u + 1] {
+                let x = adj[e as usize];
+                let j = bump((x & hmask) as usize);
+                if x >> hb == big {
+                    out.push((j, heavy_weight(&heavy2, e)));
+                }
+                unsafe { *rar.at(j as usize) = u as u32 | (x & !hmask) };
+            }
+        }
+        out
+    })
+    .concat();
+    rheavy.sort_unstable();
+    roff.copy_within(0..n, 1);
+    roff[0] = 0;
 
-    let mut pk = vec![0u32; m_valid];
-    let pk_addr = pk.as_mut_ptr() as usize;
-
-    let mut has_in2 = vec![false; n];
-    let has_in2_addr = has_in2.as_mut_ptr() as usize;
-
-    let mut thread_escs = vec![Vec::new(); nthreads];
-
-    thread::scope(|s| {
-        for (t, esc_out) in thread_escs.iter_mut().enumerate() {
-            let lo = n * t / nthreads;
-            let hi = n * (t + 1) / nthreads;
-            let order_ref = &order;
-            let perm_ref = &perm;
-            let off_ref = &off;
-            let off2_ref = &off2;
-            let edges_ref = &edges;
-            let has_in_ref = &has_in_atomic;
-            s.spawn(move || unsafe {
-                let p_pk = pk_addr as *mut u32;
-                let p_hi = has_in2_addr as *mut bool;
-                for i in lo..hi {
-                    let u = order_ref[i] as usize;
-                    let mut k = off2_ref[i] as usize;
-                    let start = off_ref[u] as usize;
-                    let end = off_ref[u + 1] as usize;
-                    for e in start..end {
-                        let v = perm_ref[edges_ref[e].v as usize];
-                        let w = edges_ref[e].w;
-                        let dv = v as i64 - i as i64;
-                        if dv >= i16::MIN as i64 && dv <= i16::MAX as i64 && w < ESC_MARKER {
-                            *p_pk.add(k) = ((dv as i16 as u16 as u32) << 16) | (w & 0xFFFF);
-                        } else {
-                            *p_pk.add(k) = ESC_MARKER;
-                            esc_out.push(Esc { e: k as u32, v, w });
+    // 4. Queries sorted so neighbouring searches share cached pages.
+    let mut order: Vec<usize> = (0..ends.len()).collect();
+    order.sort_unstable_by_key(|&q| ends[q]);
+    // Each direction: offsets, packed edge words, heavy weights.
+    let sides = [(&off[..], &adj[..], &heavy2[..]), (&roff[..], &radj[..], &rheavy[..])];
+    let mut ans = vec![INF; ends.len()];
+    let ansr = Raw::of(&mut ans);
+    let next = AtomicUsize::new(0);
+    // Bidirectional Dijkstra: grow the side with the smaller queue, record the
+    // best length where the sides meet, and stop once the two smallest queued
+    // keys add up to at least that. A side that runs dry has reached every node
+    // it can, so the best meeting seen is the answer.
+    on_threads(nt, |_| {
+        let mut dist = [Dist::new(n), Dist::new(n)];
+        let mut queue = [Heap::default(), Heap::default()];
+        loop {
+            let q = next.fetch_add(1, Relaxed);
+            let Some(&i) = order.get(q) else { return };
+            let ((s0, t0), (s, t)) = (queries[i], ends[i]);
+            if s0 == t0 {
+                unsafe { *ansr.at(i) = 0 };
+                continue;
+            }
+            if roff[t as usize + 1] == roff[t as usize] {
+                continue; // no in-edge: unreachable
+            }
+            let mut best = INF;
+            *dist[0].at(s) = 0;
+            queue[0].push(0, s);
+            *dist[1].at(t) = 0;
+            queue[1].push(0, t);
+            while let (Some(a), Some(b)) = (queue[0].0.first(), queue[1].0.first()) {
+                if a.0 + b.0 >= best {
+                    break;
+                }
+                let k = (queue[1].0.len() < queue[0].0.len()) as usize;
+                let (go, ga, gh) = sides[k];
+                let (a, b) = dist.split_at_mut(1);
+                let (mine, other) = if k == 0 { (a, b) } else { (b, a) };
+                let (d, u) = queue[k].pop();
+                if d > mine[0].get(u) {
+                    continue;
+                }
+                let lo = unsafe { *go.get_unchecked(u as usize) };
+                let hi = unsafe { *go.get_unchecked(u as usize + 1) };
+                for e in lo..hi {
+                    let x = unsafe { *ga.get_unchecked(e as usize) };
+                    let (v, w) = (x & hmask, x >> hb);
+                    let w = if w == big { heavy_weight(gh, e) } else { w };
+                    let nd = d + w as u64;
+                    if nd < best {
+                        let slot = mine[0].at(v);
+                        if nd < *slot {
+                            *slot = nd;
+                            queue[k].push(nd, v);
+                            prefetch(go.as_ptr().wrapping_add(v as usize));
+                            best = best.min(nd.saturating_add(other[0].get(v)));
                         }
-                        k += 1;
                     }
-                    *p_hi.add(i) = has_in_ref[u].load(Ordering::Relaxed);
-                }
-            });
-        }
-    });
-    let mut esc = Vec::new();
-    for te in thread_escs {
-        esc.extend(te);
-    }
-
-    drop(edges);
-    drop(off);
-    drop(has_in_atomic);
-    drop(order);
-
-    // Remap queries with perm
-    for q in &mut queries {
-        q.0 = perm[q.0 as usize];
-        q.1 = perm[q.1 as usize];
-    }
-    drop(perm);
-
-    // Parallel query execution with Dial's algorithm
-    let mut answers = vec![-1i64; queries.len()];
-    let next_q = AtomicUsize::new(0);
-    let answers_addr = answers.as_mut_ptr() as usize;
-
-    thread::scope(|s| {
-        for _ in 0..nthreads {
-            let next_q_ref = &next_q;
-            let queries_ref = &queries;
-            let pk_ref = &pk;
-            let esc_ref = &esc;
-            let off2_ref = &off2;
-            let has_in2_ref = &has_in2;
-            s.spawn(move || {
-                let ans = answers_addr as *mut i64;
-                let mut d32 = vec![u32::MAX; n];
-                let mut touched = Vec::with_capacity(65536);
-                let mut ring: Vec<Bucket> = (0..RING).map(|_| {
-                    let cap = 32;
-                    let layout = std::alloc::Layout::array::<u32>(cap).unwrap();
-                    let ptr = unsafe { std::alloc::alloc(layout) as *mut u32 };
-                    Bucket { ptr, len: 0, cap: cap as u32 }
-                }).collect();
-
-                loop {
-                    let q = next_q_ref.fetch_add(1, Ordering::Relaxed);
-                    if q >= queries_ref.len() {
-                        break;
-                    }
-                    let (sq, tq) = queries_ref[q];
-                    if sq == tq {
-                        unsafe {
-                            *ans.add(q) = 0;
-                        }
-                        continue;
-                    }
-                    if !has_in2_ref[tq as usize] || off2_ref[sq as usize] == off2_ref[sq as usize + 1] {
-                        unsafe {
-                            *ans.add(q) = -1;
-                        }
-                        continue;
-                    }
-
-                    let res = dial(
-                        pk_ref,
-                        esc_ref,
-                        off2_ref,
-                        sq,
-                        tq,
-                        &mut d32,
-                        &mut touched,
-                        &mut ring,
-                    );
-                    unsafe {
-                        *ans.add(q) = res;
-                    }
-                }
-
-                for b in &ring {
-                    let layout = std::alloc::Layout::array::<u32>(b.cap as usize).unwrap();
-                    unsafe {
-                        std::alloc::dealloc(b.ptr as *mut u8, layout);
-                    }
-                }
-            });
-        }
-    });
-
-    // Format output
-    let mut out_bytes = Vec::with_capacity(answers.len() * 12);
-    let mut num_buf = [0u8; 32];
-    for &a in &answers {
-        if a < 0 {
-            out_bytes.extend_from_slice(b"-1\n");
-        } else {
-            let mut x = a as u64;
-            let mut p = 31;
-            num_buf[p] = b'\n';
-            if x == 0 {
-                p -= 1;
-                num_buf[p] = b'0';
-            } else {
-                while x > 0 {
-                    p -= 1;
-                    num_buf[p] = b'0' + (x % 10) as u8;
-                    x /= 10;
                 }
             }
-            out_bytes.extend_from_slice(&num_buf[p..]);
+            unsafe { *ansr.at(i) = best };
+            queue.iter_mut().for_each(|q| q.0.clear());
+            dist.iter_mut().for_each(Dist::reset);
         }
-    }
+    });
 
-    let mut out_file = File::create(&out_path)?;
-    out_file.write_all(&out_bytes)?;
-    out_file.flush()?;
-
-    Ok(())
+    // INF prints as -1 (u64::MAX as i64); every real distance is below 2^63.
+    let out: String = ans.iter().map(|&a| format!("{}\n", a as i64)).collect();
+    std::fs::create_dir_all(&out_dir).ok();
+    std::fs::write(format!("{out_dir}/distances.txt"), out).unwrap();
 }

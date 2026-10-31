@@ -1,32 +1,26 @@
 # Track A: Ingest
 
-The task, the input files, and the exact output format are defined in the [Track A Specification](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md).
+The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md).
 
 ## Approach
 
-Our solution is a zero-dependency, parallel log aggregation engine written in Rust:
+One C++20 file, `main.cpp`, built as a static binary with `-O3 -march=native`.
 
-1. **Deterministic Hour Arithmetic:** Rather than parsing RFC 3339 timestamps with a general-purpose date library, the parser exploits the invariant 72-hour competition window (`2026-10-30T18:00:00Z` to `2026-11-02T17:59:59Z`). Day and hour bytes are mapped directly to an integer slot in `0..71` using branchless byte arithmetic, correctly accounting for month rollover.
-2. **Dynamic Endpoint Interning:** To generalize safely to unknown holdout seeds with distinct endpoint catalogues, endpoints are dynamically interned into a global registry. A thread-local cache layer filters lookups so that after the first few thousand records, 100% of endpoint lookups complete in $O(1)$ without locking or atomics.
-3. **Multi-Core Work Partitioning:** The file is partitioned into 6 disjoint contiguous chunks split along newline boundaries. Each thread processes its assigned chunk independently with a 1 MB streaming buffer, keeping peak memory under 61 MB (3.7x leaner than the reference).
-4. **Nearest-Rank Percentiles:** Groups with small counts ($n \le 2$) resolve in 1–2 comparisons. Groups with $n > 2$ use `select_nth_unstable` to partition percentiles $k_{99}, k_{95}, k_{50}$ in $O(n)$ time, avoiding full $O(n \log n)$ quicksorts.
-5. **Direct ASCII Output Serialization:** Formats the final 10.1 MB output directly into reusable memory buffers using fast integer-to-ASCII conversion, eliminating format string interpretation overhead.
-
-## Performance Metrics (Official Board Seed 1 Full)
-
-- **Reference Wall Time ($T_{\text{ref}}$):** 32.05 s
-- **Official Measured Wall Time ($T$):** 0.292 s (109.8x speedup)
-- **Reference Peak Memory ($M_{\text{ref}}$):** 228.0 MB
-- **Official Measured Peak Memory ($M$):** 61.0 MB (3.74x leaner)
-- **Official Machine Score ($K$):** 10.284873 (50.610 points)
-- **Correctness:** 100% byte-identical SHA-256 match (`495ca09682542a981a8ba214a1a659fb221ee54fe66d8ba609fca940aa415ef4`).
+1. **Map and split.** `requests.log` is memory-mapped (input pages are not charged to the container) with a spare page after it, so 32-byte loads near the end are safe. The file is cut into 12 line-aligned ranges, one per thread.
+2. **Parse with fixed offsets and one scan per line.** The timestamp is always 27 bytes and the 72-hour span is fixed, so the hour index comes from the month, day and hour digits with no date library. One 64-byte AVX2 compare finds the spaces and the newline after the timestamp, which gives the method end, the endpoint end and the line end for almost every line. The latency (the digits before the newline) is decoded without a loop: the 16 bytes before the newline, minus `'0'`, with the leading non-digits masked off, are folded 2, 4 and 8 digits at a time with `maddubs`/`madd`.
+3. **Intern endpoints per thread.** Each thread has a fixed 8,192-slot open-addressing table keyed by a CRC32 of the endpoint's first and last eight bytes; names stay in the mapping and are confirmed with `memcmp`. A seed has 1,842 endpoints, so the table never needs to grow (the program stops with an error past 4,096).
+4. **File by hour.** Each line becomes a 6-byte record (`u32` latency, `u16` local endpoint id with the 5xx flag in the top bit) appended to a block list for its hour. Grouping by hour first keeps the next step small.
+5. **Merge the endpoint tables once.** All local tables are interned into one global table and sorted, so an endpoint's global id is its rank in unsigned byte order. Groups then come out in output order with no further sorting.
+6. **Finish each hour on its own.** Threads claim hours in order. For one hour (about 43k requests) a counting sort by endpoint rank lays the latencies out in an L2-sized scratch array, three `nth_element` calls per group give the nearest-rank p50, p95 and p99, and the lines are formatted. The hour's blocks are freed as soon as they are consumed.
+7. **Write while computing.** A writer thread waits on each hour in order and writes it as soon as it is ready, so output overlaps with the remaining hours.
 
 ## Dependencies
 
-None ($D = 1.0$). Written entirely using the Rust standard library (`std`).
+None. Standard library and compiler intrinsics only.
 
 ## With another 24 hours
 
-1. **AVX2 SIMD Newline and Delimiter Scanning:** Utilize `_mm256_cmpeq_epi8` vector instructions to locate spaces and newlines across 32-byte vectors simultaneously.
-2. **Lock-Free Flat HashTable:** Implement a lock-free open-addressing table using `AtomicU32` CAS for initial endpoint registration to eliminate the remaining mutex during the warmup phase.
-3. **Profile-Guided Optimization (PGO):** Integrate with `halloumee/speed-demon-rust:1.99.1-trixie-llvm-tools` to run PGO profile collection on generated sample logs.
+- A/B the SIMD latency decoder against a plain digit loop on the board (the laptop could not tell them apart; the loop is 10 lines shorter).
+- Measure page-fault cost of the record blocks on the box and try one large pre-sized arena instead of one allocation per block.
+- Try a two-pass layout (count, then scatter straight into final position) to drop the 2-byte key per record and cut memory.
+- S is 222 lines after `clang-format --style=LLVM` (reference 56); keep trimming only where it does not cost readability.

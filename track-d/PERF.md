@@ -1,86 +1,99 @@
-# Track D: Performance Log
+# Track D: performance log
 
-Every step from the reference to our optimized version, with measured metrics, architectural rationale, and verified SHA-256 correctness.
+Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
-| Step | Change | Run ID / Context | T (s) | M (MB) | S (lines) | K | Points |
-|---|---|---|---|---|---|---|---|
-| **0** | Official scoring box Python reference | `calibration-seed1.json` | 72.69 | 915.0 | 73 | 1.000 | 0.00 |
-| **0-local** | Python reference (Unofficial local WSL run) | Local reference | 46.80 | 915.0 | 73 | 1.000 | 0.00 |
-| **1** | Multi-threaded Forward Dijkstra in zero-dependency Rust with single-pass CSR, epoch-based distance tracking (zero array resets), and $O(1)$ in-degree/out-degree reachability pruning. | Unofficial local | 2.71 | 170.8 | 266 | 4.790 | 34.00 |
-| **2** | Experiment: Naive 4-ary Min-Heap (`QuadHeap`). *Rejected*: Bubble-down comparisons increased user CPU time from 9.66s to 13.03s, real time 3.67s. Reverted to standard `BinaryHeap`. | Unofficial local | 3.67 | 170.8 | 280 | 4.120 | 30.70 |
-| **3** | Experiment: Bidirectional Dijkstra with forward + backward CSR. *Evaluated*: User CPU time dropped from 10.19s to 7.33s (-28%), but graph setup and backward distance arrays increased peak RSS to 337 MB and real time to 3.42s. Retained forward Dijkstra as primary lean solution. | Unofficial local | 3.42 | 337.2 | 315 | 3.730 | 28.60 |
-| **4** | Multi-threaded Forward Dijkstra with single-pass ASCII parsing and in-memory CSR scatter. | Unofficial local | 2.71 | 170.8 | 266 | 4.790 | 34.00 |
-| **5** | **Official Board Submission (Baseline v1.0)**: Evaluated on official scoring machine (Intel Core i5-13500, pinned 12 threads, 8 GB RAM). 100% byte-identical SHA-256 match. | **Official Board Run** | **1.512** | **177.0** | **266** | **7.430230** | **43.550** |
-| **6** | Dynamic query scheduling via `AtomicUsize` work counter; interleaved 8-byte `EdgeTarget { to: u32, weight: u32 }` cache layout; out-of-bounds query node safety checks; epoch counter rollover protection. Replaced static chunking to eliminate thread straggler stalls on unbalanced query paths. Measured 23% reduction in CPU user time (17.88s $\to$ 13.83s). | Unofficial local | 2.38 | 170.8 | 295 | 5.080 | 35.80 |
-| **7** | **Monotone Radix Heap & 12 Hardware Threads**: Implemented 65-bucket RadixHeap exploiting Dijkstra's non-decreasing key property (O(1) amortized operations bucketed by highest differing bit, eliminating comparison overhead). Increased NUM_THREADS to 12 matching all available hardware threads on the official box. Full seed 1 verified byte-for-byte. | Official board run `045916e` | 0.886 | 314.0 | 332 | 8.214 | 45.728 |
-| **8** | **BFS Reordering + 4-byte Packed CSR + Dial's Ring Algorithm**: BFS node renumbering puts adjacent nodes close together; packs edge destination $\Delta v$ (16-bit) and weight $w$ (16-bit) into a single 32-bit `pk` entry (20 MB total edge storage). Implemented Dial's algorithm with 4096-bucket ring buffer ($O(V + E)$ without heap operations), unchecked memory accesses, THP disable via `prctl`, and instant reachability pruning. | Official board run `286d812` | 0.402 | 152.0 | 572 | 12.997 | 55.692 |
-| **9** | **Raw-Pointer Zero-Allocation Bucket Ring + 3-Level BFS Prefetching + Hardware Memory Streaming**: Replaced dynamic `Vec<Vec<u32>>` ring with raw pointer `Bucket` structs eliminating multi-level indirection; restored 12-thread hardware parallelism; added 3-level BFS prefetching (`perm[edges[e].v]`) cutting BFS time from 157 ms to 117 ms; added ahead-of-time distance array prefetching in inner relaxation loop cutting answer time to 305 ms. All three scales verified byte-for-byte exact SHA-256 match. | Target official run | ~0.280 | ~140.0 | 690 | ~22.5 | ~67.5 |
+| Step | Change | Run ID | T (s) | M (MB) | Points |
+|---|---|---|---|---|---|
+| 0 | The reference, unchanged | | 72.69 | 893 | 0 |
+| 1 | C++: parallel two-pass CSR build over mmap, Dijkstra per query on 12 threads with a binary heap, -1 for targets with no in-edge | pending | | | |
+| 2 | Nodes renumbered by level-synchronous parallel BFS, radix heap | pending | | | |
+| 3 | BFS in 12 regions without barriers, CSR copied into the new numbering | pending | | | |
+| 4 | Compact 512-node blobs chained across the map, distances in recycled 4 KB pages, final CSR placed by a third parse | pending | | | |
+| 5 | Weights kept from the second pass; CSR copied into the new numbering in two stages instead of a third parse | pending | | | |
+| 6 | malloc mmap threshold pinned, so freed build arrays really go back | pending | | | |
 
----
+The board app was not installed yet when these were made, so the T and M columns will be filled from board runs. Until then, the local measurements below are the evidence.
 
-### Step 0: Official Reference Reconciliation
-- The official scoring host calibration time for the Python reference on seed 1 full is **72.69 s**, with peak RSS of **915.0 MB**.
-- Earlier informal local reports cited 46.80s, which was measured on an unthrottled local developer workstation. All official scoring and K ratios are anchored against the 72.69s Falkenstein baseline.
+## Local measurements
 
-### Step 1: Multi-Threaded Forward Dijkstra Baseline
-- **Motivation:** Replace Python's interpreted graph representation and single-threaded search with a compact Compressed Sparse Row (CSR) graph and multi-core query execution.
-- **Approach:**
-  - Flat compact CSR graph: `offsets: Vec<u32>`, `edges_to: Vec<u32>`, `edges_weight: Vec<u32>`. Total graph memory for 1.74M nodes and 5M edges: ~47 MB.
-  - $O(1)$ pre-check: If $s == t$, return 0 immediately. If `out_degree[s] == 0` or `in_degree[t] == 0`, return -1 immediately.
-  - Self-loops ($u == v$) discarded during graph construction as they never contribute to shortest paths.
-  - Epoch-based distance reset: Nodes store `visited_epoch[u]` alongside `dist[u]`. Incrementing `cur_epoch` resets search state without allocating or clearing 1.74M elements.
-  - 6 worker threads using `std::thread::scope` with zero external crates ($D=1.000$).
-- **Result:** $T = 2.71\text{ s}$ locally, $M = 170.8\text{ MB}$. SHA-256 matches frozen reference hash byte-for-byte.
+Laptop (Ryzen 7840HS, 8 cores), full seed-1 data in a Docker volume, `--cpus=12`, cgroup `memory.peak`, wall time around the process inside the container. Every row produced the published `distances.txt` hash `a23dbdf0...`.
 
-### Step 2: 4-ary Min-Heap Experiment
-- **Motivation:** Test whether a 4-ary heap reduces tree depth and memory traffic.
-- **Finding:** A naive 4-ary heap requires multiple comparisons per level during sift-down. Standard `std::collections::BinaryHeap` benefits from hole/sift-down compiler optimizations and fewer child comparisons, outperforming naive 4-ary heap.
-- **Decision:** Reverted to standard `BinaryHeap`.
+| Step | Wall (s) | Peak (MB) | Where the time went |
+|---|---|---|---|
+| 1 | 1.09 to 1.11 | 225 | build 0.13, queries 0.97 (about 480 ns per settled node: random ids miss the cache) |
+| 2 | 0.59 to 0.91 | 244 | queries 0.24 to 0.30, but the BFS took 0.1 to 0.27 (thousands of levels, a barrier each) |
+| 3 | 0.62 to 0.68 | 246 | BFS 0.04, but queries 0.33 to 0.42: inside 12 huge regions BFS order is ring by ring |
+| 4 | 0.45 to 0.52 | 82 | queries 0.22 to 0.24, placement passes about 0.06 to 0.15 each |
+| 5 | 0.43 vs 0.50 for step 4 (same session) | 102 | third parse with random atomic placement replaced by a parallel copy |
+| 6 | 0.44, same as 5 | 85 | the 17 MB were freed vectors glibc kept |
+| 7 | Build arrays allocated with calloc (lazily zeroed by the kernel, first touched by the threads that fill them) instead of vectors zero-filled on one thread; new ids and per-node degrees in the new numbering filled in parallel | run-f9dd6c762386 | 0.360 | 102 | 60.53 |
+| 8 | Edges packed into one 32-bit word (head in the low 21 bits, weight above it, heavy weights in a sorted side list) in both numberings; transparent huge pages off | run-b8d2e5b996d8 | 0.346 | 64 | 62.76 |
+| 9 | Bidirectional Dijkstra over the packed forward graph and a packed reverse graph built in place; query ends mapped up front so the id map is freed first | run-9ea1a9d51d35 | 0.240 | 71 | 65.84 |
+| 10 | Count and fill passes in batches of 32 edges with every random line prefetched first; BFS and renumbering prefetch the nodes coming up | run-e72d02d00206 | 0.229 | 72 | 65.95 |
+| 11 | Search constants copied into the thread so the loop keeps them in registers; a queued node's offsets prefetched | run-23727a1a2adb | 0.228 | 73 | 65.96 |
+| 12 | Rewritten in Rust with a new build: one parse filing edges by tail range, each range's adjacency built in cache; in-edge check read off the reverse graph | run-18295702ad2c | 0.185 | 71 | 67.59 |
+| 13 | Numbers parsed with one 8-byte load each; Rust trimmed from 494 to 478 rustfmt lines | run-96410d780f29 | 0.174 | 71 | 68.34 |
+| 14 | 4-ary heaps instead of radix heaps; every node may seed a blob, so no serial pass for unreached nodes; the old graph freed on a side thread | run-71cc7da0e392 | 0.196 | 67 | 67.45 |
 
-### Step 3: Bidirectional Dijkstra Experiment
-- **Motivation:** Test meeting-in-the-middle search to halve settled nodes.
-- **Finding:** CPU search time dropped by 28% (user time 10.19s $\to$ 7.33s), but maintaining dual forward and backward CSR and per-thread backward distance arrays doubled memory from 170 MB to 337 MB. In the Speed Demon formula, the memory penalty offset the search speedup.
-- **Decision:** Forward Dijkstra with epoch arrays delivers a higher overall $K$ coefficient ($K = 4.79$ vs $K = 3.73$).
+## What the profile said, step by step
 
-### Step 4: Verification Across Multiple Scales & Seeds
-- Tiny scale (seed 1): hash matches Python reference.
-- Sample scale (seed 1): `a4c76ed030bc7e365db33191f6cf74708fba7f25eb48d64c8c4279f2e57046a0` (100% match).
-- Full scale (seed 1): `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e` (100% match).
-- Tiny seed 42: identical output against Python reference.
-- Sample seed 999: identical output against Python reference.
+**Step 1 to 2.** The queries were 90% of the run at about 480 ns per settled node, which is cache misses: ids are a random relabelling, so every neighbour, offset and distance is somewhere else in memory. Renumbering in BFS order cut the query phase by about 3.5x.
 
-### Step 5: Official Board Verification & Metrics
-- **Environment:** Dedicated official benchmark host (Intel i5-13500, 6 P-cores @ 2.5 GHz turbo off, 8 GB RAM, Linux offline container).
-- **Official Result:**
-  - $T = \mathbf{1.512\text{ s}}$ ($48.1\times$ faster than 72.69s reference).
-  - $M = \mathbf{177.0\text{ MB}}$ ($5.17\times$ leaner than 915.0 MB reference).
-  - $K = \mathbf{7.430230}$.
-  - **Points Earned:** $\mathbf{43.550}$ machine points.
-- **Correctness:** 100% SHA-256 match on full public dataset (`a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`).
+**Step 2 to 3.** A road network has thousands of BFS levels, and a level-synchronous BFS pays a barrier for each one. Letting each thread grow its own region removed the barriers, but the queries got slower again: within a region of 145,000 nodes the order is ring by ring, so a search's ball spans many thin rings and uses few nodes per cache line.
 
-### Step 6: Dynamic Work Stealing & Cache-Interleaved CSR
-- **Motivation:** Queries have highly uneven latency distributions (some paths settle in 5 steps; others explore 50,000 nodes). Static `chunks_mut` partitioning left threads idle while stragglers finished long queries. Separated `edges_to` and `edges_weight` arrays also caused dual cache misses per edge traversal.
-- **Approach:**
-  - Switched to dynamic query scheduling: an `AtomicUsize` counter where idle threads claim queries dynamically with `fetch_add(1, Relaxed)`, eliminating thread starvation.
-  - Interleaved edge representation: unified target and weight into `struct EdgeTarget { to: u32, weight: u32 }` (8 bytes), ensuring single cache-line fetches during edge relaxation.
-  - Added node query bounds checks (`sq >= n || tq >= n`) and epoch counter rollover handling.
-  - Attempted a `touched: Vec<u32>` reset array to replace epoch arrays: measurement revealed 63% CPU slowdown (user time jumped from 13.8s to 22.6s). Retained epoch arrays based on empirical proof.
-- **Result:** Total user CPU time decreased by **23%** (from 17.88s to 13.83s).
+**Step 3 to 4.** Small blobs (512 nodes, grown by BFS, chained by starting each blob from the last one's frontier) give 2-D locality. Peak memory was the per-thread distance arrays (12 x 14 MB); pages of 512 distances handed out on first touch and recycled per query brought the peak from 246 to 82 MB. The CSR copy in step 3 also held the graph twice (116 MB); building the final CSR by a third parse instead keeps one copy.
 
-### Step 8: BFS Renumbering + 4-Byte Packed CSR + Dial's Ring Algorithm
-- **Motivation:** Track D had been the dropped weakest track at 45.728 points (T=0.886s, M=314MB). Previous implementations stored 8-byte edges (or 16 bytes for forward+backward) and used priority queues (BinaryHeap or RadixHeap) with pointer-indirected distance tables.
-- **Approach:**
-  1. **BFS Node Renumbering:** A single BFS discovery traversal assigns contiguous IDs to topologically adjacent nodes.
-  2. **4-Byte Packed CSR:** Because neighboring nodes have small index offsets $|\Delta v| \le 32767$ and road network weights are $w < 65535$, each edge is packed into a single 32-bit integer: `((dv as i16 as u16 as u32) << 16) | (w & 0xFFFF)`. Total edge memory for 5M edges dropped from 80 MB (or 160 MB) to **20 MB**, fitting inside CPU L3 cache. Infrequent escape edges go into a compact sorted binary-search table.
-  3. **Dial's Algorithm with 4096-Bucket Ring Buffer:** Replaced priority heap with Dial's algorithm using a 4096-entry ring buffer. Edge relaxations are $O(1)$ direct array appends (`ring[nd & 4095].push(v)`), avoiding heap bubble-up/down or radix bucket redistribution.
-  4. **Flat Pointer Distances & Touched Cleanup:** Per-thread direct distance array `d32` with unchecked memory access; visited nodes recorded in a flat `touched` buffer and cleared in microseconds.
-  5. **Dijkstra Fallback:** Rare queries with $w \ge 4096$ or large sums seamlessly fall back to an exact 64-bit Dijkstra min-heap.
-- **Results:**
-  - Local wall time on WSL dropped from **4.19s** to **0.50s** (**7.2x faster**).
-  - Peak RSS dropped from **469 MB** to **143 MB** (**70% reduction**).
-  - 100% exact SHA-256 match on all three scales:
-    - Tiny: `ecaca77d3221fe3928109da36480cfdb39f288f2e57ecbc61d3d7706d5cb4bd5`
-    - Sample: `a4c76ed030bc7e365db33191f6cf74708fba7f25eb48d64c8c4279f2e57046a0`
-    - Full: `a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e`
-  - Zero external runtime dependencies ($D = 1.000$), zero compiler warnings.
-  - Expected official score: $K \ge 33$, projected **75+ points**.
+**Step 4 to 6.** The third parse placed every edge with a random atomic increment and a random write, about 0.11 to 0.15 s. Keeping the weights from the second pass (as a separate array next to the heads) and copying both into the new numbering in parallel is faster, and copying weights first, then heads, freeing each old array straight after, keeps the peak at about one and a half graphs. The measured peak was still 17 MB above that: glibc raises its mmap threshold after the first large free, so later large vectors came from the heap and stayed resident when freed. Pinning the threshold with `mallopt` fixed it.
+
+**Step 6 to 7.** Phase timers: count 0.04 s, fill 0.10, order 0.045, renumber 0.075, search 0.19. About 110 MB of build arrays (offsets, heads, weights, both renumbered copies, ids) were value-initialised by `std::vector`, a single-threaded memset that also took every page fault on one thread, before parallel passes overwrote them. With `calloc` (glibc skips the memset for fresh mmapped blocks) the zeroing happens lazily, spread over the threads that first write each page. The two serial loops that assign new ids from each thread's blob chain and scatter degrees into the new numbering now run in parallel. Locally 385 ms against 428 ms for step 6 over 9 alternating runs, same 84 MB peak and hash on all four datasets. Formatted code lines 277 to 290.
+
+Also measured and kept out at this step: dense per-thread distance arrays (no faster, 236 MB), and heads and weights interleaved into one array (no faster within noise, 97 MB).
+
+**Step 7 on the board.** run-f9dd6c762386: 0.360 s but 102 MiB against 83 MiB for step 6, so K fell from 16.79 to 16.24. Locally the peak did not move (84 MB), even with glibc asked for huge pages, so the box's transparent huge pages are the likely cause; step 8 turns them off for this process, as Tracks A, B and C already do.
+
+**Step 7 to 8.** Search costs about 85 ns per settled node, and two cheaper experiments showed the queue is not the limit: Dial's bucket queue (an 8,192-slot ring, which holds every main-body weight; the largest is under 3,500) was no faster and cost 9 MB, and 6 or 8 search threads were slower than 12. What the search waits on is memory, so the edges got smaller. Each edge is now one word: the head's id in the low bits (21 for 1.74M nodes) and the weight in the 11 bits above. A weight of 2,047 or more (about 0.1% of edges, plus the injected ones near 2^32) is stored as all ones, and its value sits in a list sorted by edge position, found by binary search. The fill pass writes that word in the old numbering (one random write per edge instead of two), the BFS reads heads through a mask, and the renumbering is one pass that maps the head and keeps the weight bits. Peak was the old heads and weights alive next to the new arrays; now it is one 20 MB array next to another. Locally (9 alternating runs): 359 ms and 65 MB against 402 ms and 84 MB. Same hash on full, sample, tiny, the worked example (which has 2^32 - 1 weights and an answer above 2^32) and a seed-7 sample checked against the reference.
+
+**Step 8 to 9.** `perf` (in a privileged throwaway container, since the Docker VM's kernel exposes the counters) split the CPU: search 56%, fill pass 17.5%, blob ordering 10.7%, renumbering 6.4%, count pass 4.5%. The leader's whole run fits in about 1.5 s of CPU on 12 threads; our searches alone took 2.2 s, about 95 ns per settled node. `perf annotate` put the two hottest instructions (about 26% between them) on the loads of the edge word and of the tentative distance: real cache misses, so the way down was fewer settled nodes, not cheaper ones. Bidirectional search was ruled out at step 3 because the reverse graph cost 40 MB; with packed edges it costs 20 MB plus offsets. The reverse graph is counted into `rfirst[v + 1]`, prefix-summed, filled using `rfirst[v]` as the cursor (which leaves it at v's end), then shifted up by one, so no second cursor array is needed. Each query grows the side with the smaller queue, records the best length where the sides meet, and stops once the two smallest queued keys add up to at least that length; a side that runs dry ends the search. Distances are read across sides with a lookup that does not hand out a page. The annotate also showed the relaxation loop reloading the shift, mask and edge pointer through the lambda's captures on every edge; they are locals now. Locally (9 alternating runs): 279 ms against 367 ms, peak 73 MB against 65. Same hash on full, sample, tiny, the worked example, seeds 7 and 13 at sample scale and seed 21 at tiny scale, each checked against the reference.
+
+**Step 9 on the board.** run-9ea1a9d51d35: 0.240 s against 0.346 s, 71 MiB, K 20.74, 65.84 points.
+
+**Step 9 to 10.** With the search halved, `perf` put the build ahead of it: the fill pass 25.5% of CPU (about 110 ns per edge), blob ordering 17%, renumbering 9%, the count pass 7%. The fill pass's cost is a property of x86: an atomic add waits for every store before it, so with one edge at a time each edge's cache miss (the random cursor, then the random slot) waited for the previous one's. Edges now go through in batches of 32: parse 32, prefetch all 32 cursors, take the 32 slots (now cache hits) while prefetching the 32 destinations, then write. The count pass does the same for its cursors and the in-edge flags. The BFS knows its queue ahead, so it fetches node offsets 8 entries ahead and edge lists 4 ahead; the renumbering walks old ids in order, so it fetches the new offsets and the heads' new ids 8 nodes ahead and the destination slots 4 ahead. Locally user CPU fell from 1.5 to 2.0 s to 1.2 to 1.35 s and wall time from about 0.26 s to about 0.18 to 0.24 s, same 73 MB; the fill pass is down to about 11% of CPU and the renumbering to 5.5%. Same hash on full, sample, tiny, the worked example and seeds 7, 13 and 21.
+
+**Step 10 on the board.** run-e72d02d00206: 0.229 s against 0.240 s, but the extra code took the formatted size from 362 to 400 lines, so K moved only from 20.74 to 20.84. In the same run Track A's unchanged code measured 0.039 s against its usual 0.031 s: the box's run-to-run spread is as large as most single steps.
+
+**Step 10 to 11.** The annotated search still reloaded the mask, shift and heavy-weight marker through the thread lambda's by-reference captures on every edge; they are copies inside the thread now. A node's offsets are prefetched when it is queued. The laptop could not separate this from noise (user CPU 1.4 to 1.7 s for both); it removes three loads per edge, so it stays, and the board run is the measurement. Same hash on all seven datasets.
+
+**After step 11: what was measured and not kept.** Wall-clock phase timers (local, ms): count pass about 30 to 40, fill 35 to 45, blob ordering about 35, new ids 9, renumbering 18, reverse graph 15, searches 60 to 75. Per-thread timers on the search showed all twelve threads finishing within about 5 ms of each other, so there is no tail of large queries to rebalance. Three ideas for the build did not separate from noise and were dropped: parsing the text once and keeping (tail, word) pairs for the fill pass (225 vs 223 ms, 3 MB more), pre-faulting each thread's slice of the input file with `MADV_POPULATE_READ`, and pre-faulting each thread's slice of the cursor and link arrays with `MADV_POPULATE_WRITE` (fill pass perhaps 3 ms faster, inside the spread). The laptop's run-to-run spread is about 15% and the box's up to 25%, so steps worth 5% or less can no longer be told apart; the next step for D has to be a larger structural change.
+
+**Step 11 to 12: Rust, and a different build.** The C++ build parsed the text twice (count, then fill) with a random atomic add per edge each time, about 75 ms of the run. The Rust version parses once: each thread appends every edge to one of about 27 lists by its tail's node range (sequential writes, 27 streams per thread), then each range is built on its own inside a 256 KB counter array. Phase timers: parse plus build 58 to 80 ms against 93 to 133 ms for the C++ count and fill passes in the same session. The first Rust build was only 4% faster overall because its search ran slower (120 to 140 ms against 90 to 130): bounds checks in the hottest loop. With unchecked access in the search, distance pages and heap buckets, it runs 12 to 15% faster than the C++ (local median 242 ms against 287, `perf stat -r 8` 0.237 to 0.246 s against 0.270 to 0.274), same 73 MB peak. Trimmed under `rustfmt` defaults from 523 to 494 lines (502 with the Dockerfile, against 401 counted for the C++): about 3% off K for size against about 8% on for time. Same hash on full, sample, tiny, the worked example and seeds 7, 13 and 21.
+
+**Step 12 on the board.** run-18295702ad2c: 0.185 s against 0.226 s for the C++, 71 MiB, 505 counted lines against 401; K 21.0 to 22.49, points 66.16 to 67.59. The box gained more than the laptop predicted (18% against 12 to 15%).
+
+**Step 12 to 13.** Phase timers (medians of 9, ms): parse 35, part build 24, blob order 22, new ids 6, renumbering 25, reverse graph 18, searches 106. The search matched the C++ one within about 10% in an interleaved run, so the parse was the cleaner target: it read 92 MB a byte at a time. Digits have bit 0x10 set and the space and newline that end a number do not, so one 8-byte load finds the end of any number of up to 7 digits (every node id; weights of 8 or more digits take the byte loop), and the digits combine in three multiply steps. The 8-byte reads needed the file mapped over a spare zero page, as the C++ had it. Parse median 40 to 32 ms. Then the source was trimmed under `rustfmt` from 507 to 478 lines without changing behaviour: one-line forms rustfmt keeps (a short if/else choosing the search side, `saturating_add` instead of an INF check, a direct pointer write instead of a setter), part sizes summed before the buckets move, and one atomic pointer for both reverse-graph passes. With the trims the run is about 5% fewer instructions (`perf stat -r 8`: 0.233 s against 0.240 s), peak 72 MB. Same hash on all seven datasets.
+
+**Step 13 to 14.** A flat `perf` profile put the search at 59% of all CPU and `RadixHeap::top` alone at 17%, so the heap looked like the target. It was not: a bitmask of non-empty buckets (no linear scan for the next bucket) and a 4-ary heap both measured the same wall time over interleaved `perf stat -r 8` rounds, and so did prefetching the edge list of the node due to be popped next. The search waits on memory, about 7.1 million settled nodes over the 2,000 queries, more than half of them in queries that settle over 20,000. Memory laps (cgroup `memory.current` and `memory.peak` at every phase) then showed the 72 MB peak was not the build (62 MB) but the search: each thread's two distance pools (about 0.9 MB together) and its two radix heaps, whose 65 bucket vectors each keep the capacity of their largest moment (about 0.55 MB). A 4-ary heap only ever holds the live frontier. With unchecked reads in its sift-down it costs no time (`std::collections::BinaryHeap` was 13 to 17% slower and smaller distance pages saved only 1 to 2 MB, so neither was kept), takes the peak from 73 to 68 MB locally, and is shorter than the radix heap. Two serial gaps between phases went as well: the blob scan no longer skips nodes without out-edges, so every node lands in some thread's chain and the 2 ms pass that numbered the unreached ones is gone, and the old graph (34 MB) is unmapped on a side thread while the reverse graph is built instead of in front of it. Four interleaved `perf stat -r 8` rounds: 0.164 s mean against 0.173 s for step 13. 473 rustfmt lines against 478. Same hash on all seven datasets, each run three times.
+
+**Step 14 on the board.** run-71cc7da0e392: memory moved as measured, 66.9 MiB against 72.2 MiB for step 13 (run-a37efeaff341), and the box counted 475 lines against 486. Time did not: 0.196 s against 0.174 s, so K fell from 23.30 to 22.33. The same push ran Track A's unchanged code at 0.0334 s against its usual 0.0301 s, 11% slower, so the box was slow for this whole run, and D's 13% sits inside that. The laptop's interleaved rounds put the step at about 5% faster; the next board run of the same code is the check.
+
+**Step 14 again.** run-f857e2a4c4e2 (same Track D code, commit 2de9bb9): 0.183 s, 66.9 MiB, K 23.14, 68.22 points. The box was still slow: Track A's unchanged code measured 0.0344 s in the same run, 14% over its best, while D was 5% over step 13's best. Measured against what the box did to unchanged code, step 14 is faster and lighter; its K stays just under step 13's best run (23.30) because that run had a faster box. Kept.
+
+## Tried and kept out
+
+- Level-synchronous parallel BFS (step 2): good order, too many barriers.
+- One large BFS region per thread (step 3): fast to build, poor locality.
+- Copying the whole CSR at once into the new numbering (step 3): 116 MB peak; the staged copy in step 5 gets the speed at 85 MB.
+- Blob sizes 128 and 2048 instead of 512: query time the same within noise.
+- Bidirectional search: would roughly halve settled nodes, but the reverse graph adds about 47 MB; on this formula the memory cost outweighs the time saved.
+
+## Board runs
+
+Runs measured on the scoring box after the team was registered. M is the box's cgroup peak in MiB; K and points as the board reports them.
+
+| Commit | Run ID | T (s) | M (MiB) | K | Points | What it measured |
+|---|---|---|---|---|---|---|
+| 8041c6b | run-e87fa4aef6e8 | 0.3766 | 79.6 | 16.62 | 61.04 | Steps 5 and 6 (staged copy, malloc threshold) |
+| b4606d2 | run-fa7637b07d93 | 0.3823 | 83.4 | 16.51 | 60.89 | Same Track D code |
+| c451b56 | run-66c30a95d45a | 0.3787 | 83.8 | 16.57 | 60.97 | Same Track D code |
+| 5a6463e | run-b2302fb71532 | 0.3722 | 113.8 | 15.57 | 59.62 | One parse with edges filed per owner instead of the second parse: no faster on the box and 30 MiB more; reverted |
+| 836c19e | run-f9dd6c762386 | 0.3599 | 102 | 16.24 | 60.53 | Step 7: calloc build arrays; faster, but 19 MiB more with huge pages on |
+| 33a36ec | run-b8d2e5b996d8 | 0.3456 | 64 | 18.00 | 62.76 | Step 8: packed edges, THP off |
