@@ -22,14 +22,16 @@ using u32 = uint32_t;
 using u64 = uint64_t;
 using i64 = int64_t;
 
+typedef u64 __attribute__((aligned(1))) u64_u;
+inline u64 load8(const char* p) { return *(const u64_u*)p; }
+
 template <class T>
-T* zeroed(size_t n) {
-    return (T*)mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+inline T* zeroed(size_t n) {
+    return (T*)mmap(nullptr, n * sizeof(T), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 }
 
 template <class T>
-void populate_share(T* p, size_t n, int t, int nt) {
+inline void populate_share(T* p, size_t n, int t, int nt) {
     size_t pg = (n * sizeof(T) + 4095) / 4096, f = pg * t / nt, to = pg * (t + 1) / nt;
     if (to > f) madvise((char*)p + f * 4096, (to - f) * 4096, MADV_POPULATE_WRITE);
 }
@@ -40,17 +42,10 @@ const char* map_file(const char* path, size_t& size) {
     size = lseek(fd, 0, SEEK_END);
     auto* p = (char*)mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (size && mmap(p, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0) == MAP_FAILED) {
-        perror("mmap");
-        _exit(1);
+        perror("mmap"); _exit(1);
     }
     close(fd);
     return p;
-}
-
-inline u64 load8(const char* p) {
-    u64 v;
-    memcpy(&v, p, 8);
-    return v;
 }
 
 inline u32 match32(const char* p, char c) {
@@ -83,10 +78,7 @@ inline const char* comma_after(const char* p) {
     return p + __builtin_ctzll((x - 0x0101010101010101) & ~x & 0x8080808080808080) / 8;
 }
 
-struct Text {
-    const char* at;
-    u32 raw, length;
-};
+struct Text { const char* at; u32 raw, length; };
 
 inline Text text(const char*& p) {
     const char* s = p;
@@ -149,6 +141,13 @@ private:
 struct Totals {
     u64 count = 0, id_sum = 0, name_bytes = 0, note_bytes = 0, distinct = 0;
     i64 amount_sum = 0, amount_min = INT64_MAX, amount_max = INT64_MIN;
+    void add(const Totals& t) {
+        count += t.count; id_sum += t.id_sum; name_bytes += t.name_bytes;
+        note_bytes += t.note_bytes; distinct += t.distinct;
+        amount_sum += t.amount_sum;
+        amount_min = std::min(amount_min, t.amount_min);
+        amount_max = std::max(amount_max, t.amount_max);
+    }
 };
 
 struct NamesSeen {
@@ -156,13 +155,8 @@ struct NamesSeen {
     std::atomic<u64>* bits = zeroed<std::atomic<u64>>(256 * WORDS);
 
     std::atomic<u64>& word(u32 c, u32 name) { return bits[c * WORDS + name / 64]; }
-
     void prefetch(u32 c, u32 name) { __builtin_prefetch(&word(c, name), 1); }
-
-    void mark(u32 c, u32 name) {
-        word(c, name).fetch_or(u64(1) << (name % 64), std::memory_order_relaxed);
-    }
-
+    void mark(u32 c, u32 name) { word(c, name).fetch_or(u64(1) << (name % 64), std::memory_order_relaxed); }
     u64 count(u32 c) const {
         u64 n = 0;
         for (u32 w = 0; w < WORDS; ++w)
@@ -230,32 +224,29 @@ void parse_records(const char* p, const char* end, const char* file_end,
 
 inline std::pair<u64, u32> region_line(const char*& p) {
     u64 x = load8(p) ^ 0x2C2C2C2C2C2C2C2C;
-    const char* comma = p + __builtin_ctzll((x - 0x0101010101010101) & ~x & 0x8080808080808080) / 8;
-    std::pair<u64, u32> line{digits(p, comma),
-        (u32(comma[1] - 'A') << 10) | (u32(comma[2] - 'A') << 5) | u32(comma[3] - 'A')};
-    for (p = comma + 4; *p++ != '\n';) {}
-    return line;
+    const char* c = p + __builtin_ctzll((x - 0x0101010101010101) & ~x & 0x8080808080808080) / 8;
+    std::pair<u64, u32> res{digits(p, c), (u32(c[1] - 'A') << 10) | (u32(c[2] - 'A') << 5) | u32(c[3] - 'A')};
+    for (p = c + 4; *p++ != '\n';) {}
+    return res;
 }
 
 struct Phase {
     std::atomic<int> claimed{0}, done{0};
     const int pieces;
-
-    template <class F>
-    void run(F&& f) {
+    template <class F> void run(F&& f) {
         for (int k; (k = claimed++) < pieces;)
             if (f(k), ++done == pieces) done.notify_all();
         for (int d; (d = done) < pieces;) done.wait(d);
     }
 };
 
-std::vector<size_t> split(const char* data, size_t from, size_t size, int n, std::string_view delim) {
-    std::vector<size_t> cut(n + 1, size);
+std::vector<size_t> split(const char* d, size_t from, size_t sz, int n, std::string_view delim) {
+    std::vector<size_t> cut(n + 1, sz);
     cut[0] = from;
     for (int t = 1; t < n; ++t) {
-        size_t c = std::max(cut[t - 1], from + (size - from) * t / n);
-        auto* hit = (const char*)memmem(data + c, size - c, delim.data(), delim.size());
-        cut[t] = hit ? hit - data + delim.size() : size;
+        size_t c = std::max(cut[t - 1], from + (sz - from) * t / n);
+        auto* hit = (const char*)memmem(d + c, sz - c, delim.data(), delim.size());
+        cut[t] = hit ? hit - d + delim.size() : sz;
     }
     return cut;
 }
@@ -263,12 +254,9 @@ std::vector<size_t> split(const char* data, size_t from, size_t size, int n, std
 int main(int argc, char** argv) {
     prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     const int nthreads = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
-    const char* rpath = argc > 1 ? argv[1] : "/data";
-    const char* opath = argc > 2 ? argv[2] : "/out";
-    char reg_file[256], rec_file[256], out_file[256];
-    snprintf(reg_file, sizeof(reg_file), "%s/regions.csv", rpath);
-    snprintf(rec_file, sizeof(rec_file), "%s/records.csv", rpath);
-    snprintf(out_file, sizeof(out_file), "%s/aggregates.txt", opath);
+    const char* reg_file = argc > 1 ? argv[1] : "/data/regions.csv";
+    const char* rec_file = argc > 2 ? argv[2] : "/data/records.csv";
+    const char* out_file = argc > 3 ? argv[3] : "/out/aggregates.txt";
 
     size_t rsize, size;
     const char* regions = map_file(reg_file, rsize);
@@ -326,52 +314,30 @@ int main(int argc, char** argv) {
 
     char buf[65536];
     char* o = buf;
-    auto put_num = [&](u64 v) {
-        *o++ = ' ';
-        o = std::to_chars(o, o + 32, v).ptr;
-    };
+    auto put_num = [&](u64 v) { *o++ = ' '; o = std::to_chars(o, o + 32, v).ptr; };
     auto put_cents = [&](i64 cents) {
         *o++ = ' ';
         if (cents < 0) *o++ = '-', cents = -cents;
-        u64 a = cents;
-        o = std::to_chars(o, o + 32, a / 100).ptr;
+        o = std::to_chars(o, o + 32, u64(cents) / 100).ptr;
         *o++ = '.';
-        *o++ = '0' + (a % 100 / 10);
-        *o++ = '0' + (a % 10);
+        *o++ = '0' + (u64(cents) % 100 / 10);
+        *o++ = '0' + (u64(cents) % 10);
     };
 
     for (u32 i = 1; i <= codes.size() + 1; ++i) {
         u32 c = i % (codes.size() + 1);
         Totals sum;
-        for (const auto& per_thread : totals) {
-            const Totals& t = per_thread[c];
-            sum.count += t.count;
-            sum.id_sum += t.id_sum;
-            sum.name_bytes += t.name_bytes;
-            sum.note_bytes += t.note_bytes;
-            sum.distinct += t.distinct;
-            sum.amount_sum += t.amount_sum;
-            sum.amount_min = std::min(sum.amount_min, t.amount_min);
-            sum.amount_max = std::max(sum.amount_max, t.amount_max);
-        }
+        for (const auto& th : totals) sum.add(th[c]);
         if (sum.count == 0) continue;
         if (c == 0) {
-            memcpy(o, "_UNMATCHED", 10);
-            o += 10;
+            memcpy(o, "_UNMATCHED", 10); o += 10;
         } else {
             u32 k = codes[c - 1];
-            *o++ = 'A' + (k >> 10);
-            *o++ = 'A' + (k >> 5 & 31);
-            *o++ = 'A' + (k & 31);
+            *o++ = 'A' + (k >> 10); *o++ = 'A' + (k >> 5 & 31); *o++ = 'A' + (k & 31);
         }
-        put_num(sum.count);
-        put_num(sum.id_sum);
-        put_cents(sum.amount_sum);
-        put_cents(sum.amount_min);
-        put_cents(sum.amount_max);
-        put_num(sum.distinct);
-        put_num(sum.name_bytes);
-        put_num(sum.note_bytes);
+        for (u64 x : {sum.count, sum.id_sum}) put_num(x);
+        for (i64 x : {sum.amount_sum, sum.amount_min, sum.amount_max}) put_cents(x);
+        for (u64 x : {sum.distinct, sum.name_bytes, sum.note_bytes}) put_num(x);
         *o++ = '\n';
     }
     int out_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
