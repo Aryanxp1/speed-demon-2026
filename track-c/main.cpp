@@ -135,7 +135,7 @@ struct NamesSeen {
 void parse_records(const char* p, const char* end, const char* file_end,
                    const u8* country_of, size_t regions, NameTable& names,
                    NamesSeen& seen, Totals* totals) {
-  constexpr u64 LAG = 16;
+  constexpr u64 LAG = 8;
   struct Pending { u64 name; u32 region, id, name_b, note_b; i64 cents; } pending[LAG];
   struct Mark { u32 country, id; } marks[LAG];
   u64 n = 0, last = UINT64_MAX;
