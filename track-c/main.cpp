@@ -84,10 +84,12 @@ public:
     __m128i m = _mm_loadu_si128((const __m128i*)(K + 16 - std::min(len, 16u)));
     __m128i head = _mm_and_si128(_mm_loadu_si128((const __m128i*)s), m);
     u64 h = (u64(_mm_cvtsi128_si64(head)) * 0x9E3779B97F4A7C15ull ^ len) + u64(_mm_extract_epi64(head, 1)) * 0xBF58476D1CE4E5B9ull;
-    for (u32 i = 16; i < len; i += 8) {
-      u64 w = load8(s + i);
-      (len - i < 8) ? (w &= (u64(1) << 8 * (len - i)) - 1) : 0;
-      h = (h ^ w) * 0x94D049BB133111EBull;
+    if (__builtin_expect(len > 16, 0)) {
+      for (u32 i = 16; i < len; i += 8) {
+        u64 w = load8(s + i);
+        (len - i < 8) ? (w &= (u64(1) << 8 * (len - i)) - 1) : 0;
+        h = (h ^ w) * 0x94D049BB133111EBull;
+      }
     }
     h = (h ^ h >> 31) * 0xD6E8FEB86659FD93ull;
     return (h ^ h >> 32) + (h == 0);
@@ -98,7 +100,7 @@ public:
     for (u32 i = k >> (64 - BITS) & ~3u;; i = (i + 4) & (SLOTS - 1)) {
       __m256i v = _mm256_load_si256((const __m256i*)&slots_[i]);
       u32 hit = mask64(_mm256_cmpeq_epi64(v, tgt));
-      if (hit) return i + __builtin_ctz(hit);
+      if (__builtin_expect(hit != 0, 1)) return i + __builtin_ctz(hit);
       for (u32 free = mask64(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())); free; free &= free - 1) {
         u32 j = i + __builtin_ctz(free);
         u64 s = 0;
@@ -157,6 +159,7 @@ void parse_records(const char* p, const char* end, const char* file_end,
     }
   };
 
+  __m256i lf_vec = _mm256_set1_epi8('\n');
   while (p < end) {
     (u8(*p) == 0xEF) ? (p += 3) : 0;
     const char* f1 = comma_after(p);
@@ -167,7 +170,7 @@ void parse_records(const char* p, const char* end, const char* file_end,
     u64 region = digits(p, f4);
     const char* amount = f4 + 1;
     __m256i v = _mm256_loadu_si256((const __m256i*)amount);
-    u32 lf = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('\n')));
+    u32 lf = _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, lf_vec));
     const char* eol = lf ? amount + __builtin_ctz(lf) : file_end;
     const char* amount_end = eol - (eol[-1] == '\r');
     bool negative = *amount == '-';
@@ -240,7 +243,7 @@ int main(int argc, char** argv) {
   };
 
   size_t start = size ? (char*)memchr(records, '\n', size) - records + 1 : 0;
-  const int pieces = 4 * nt;
+  const int pieces = 6 * nt;
   auto cut = split(records, start, size, pieces, "\r\n", 2);
   std::vector<std::array<Totals, 256>> totals(nt);
   NameTable names;
