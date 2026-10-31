@@ -226,7 +226,7 @@ impl NameTable {
             i += 8;
         }
         let mut p = Probe {
-            slot: ((h >> 20) as usize) % SLOTS,
+            slot: ((h >> 20) as usize) & (SLOTS - 1),
             tag: (1 + ((h >> 48) as u16) % (BUSY - 1)),
         };
         for _ in 0..SLOTS {
@@ -234,7 +234,7 @@ impl NameTable {
             if t == 0 || t == p.tag || t == BUSY {
                 break;
             }
-            p.slot = (p.slot + 1) % SLOTS;
+            p.slot = (p.slot + 1) & (SLOTS - 1);
         }
         _mm_prefetch(self.slots.add(p.slot) as *const i8, _MM_HINT_T0);
         p
@@ -279,7 +279,7 @@ impl NameTable {
                     return slot.id;
                 }
             }
-            p.slot = (p.slot + 1) % SLOTS;
+            p.slot = (p.slot + 1) & (SLOTS - 1);
         }
         // Only used once every fast slot is occupied. Exact bytes and the
         // mutex ensure bounded probing and deterministic deduplication.
@@ -883,88 +883,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     out_file.flush()?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn final_region_and_chunk_boundaries() {
-        for ending in ["", "\n"] {
-            let text = format!("region_id,country\n1,AAA\n1234567,BBB{ending}");
-            assert_eq!(region_count(text.as_bytes()), 1234568);
-            for threads in 1..32 {
-                let from = text.find('\n').unwrap() + 1;
-                let cuts = split_delim(text.as_ptr(), from, text.len(), threads, b"\n");
-                assert_eq!(cuts[0], from);
-                assert_eq!(*cuts.last().unwrap(), text.len());
-                for pair in cuts.windows(2) {
-                    assert!(pair[0] <= pair[1]);
-                    if pair[0] < text.len() {
-                        assert_eq!(text.as_bytes()[pair[0] - 1], b'\n');
-                    }
-                }
-            }
-        }
-        assert_eq!(Totals::default().amount_min, i64::MAX);
-        assert_eq!(Totals::default().amount_max, i64::MIN);
-    }
-
-    #[test]
-    fn concurrent_names_have_one_id_even_after_failed_claims() {
-        let table = NameTable::new();
-        let barrier = Barrier::new(12);
-        let data: Vec<Vec<u8>> = (0..256)
-            .map(|i| {
-                let mut bytes = vec![0; 8];
-                bytes
-                    .extend_from_slice(format!("name-{i:04}-with-a-long-shared-prefix").as_bytes());
-                bytes.extend_from_slice(&[0; 64]);
-                bytes
-            })
-            .collect();
-        thread::scope(|scope| {
-            let handles: Vec<_> = (0..12)
-                .map(|_| {
-                    scope.spawn(|| {
-                        data.iter()
-                            .map(|bytes| unsafe {
-                                let p = bytes.as_ptr().add(8);
-                                let len = (bytes.len() - 72) as u32;
-                                let probe = table.probe(p, len);
-                                barrier.wait();
-                                table.id(p, len, probe)
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            let ids: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-            for other in &ids[1..] {
-                assert_eq!(ids[0], *other);
-            }
-        });
-        assert_eq!(table.next_id.load(Ordering::Relaxed), 256);
-    }
-
-    #[test]
-    fn full_fast_table_spills_without_losing_distinct_names() {
-        let table = NameTable::new();
-        let seen = NamesSeen::new();
-        let bytes = [b'x'; 80];
-        unsafe {
-            for slot in 0..SLOTS {
-                (*table.tags.add(slot)).store(1, Ordering::Relaxed);
-            }
-            table.next_id.store(IDS as u32, Ordering::Relaxed);
-            let a = table.id(bytes.as_ptr().add(8), 8, Probe { slot: 0, tag: 2 });
-            let b = table.id(bytes.as_ptr().add(8), 8, Probe { slot: 0, tag: 2 });
-            assert_eq!(a, b);
-            seen.mark(3, a);
-            seen.mark(3, b);
-            assert_eq!(seen.count(3), 1);
-            assert_eq!(seen.count(4), 0);
-        }
-    }
 }

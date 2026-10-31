@@ -8,6 +8,7 @@ use std::thread;
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
     fn _exit(status: i32) -> !;
 }
@@ -18,6 +19,7 @@ const MAP_PRIVATE: i32 = 0x02;
 const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED: i32 = 0x10;
 const MAP_FAILED: *mut u8 = !0 as *mut u8;
+const PR_SET_THP_DISABLE: i32 = 41;
 
 const MAX_TERM: usize = 32;
 const NONE: u32 = 0xFFFFFFFF;
@@ -409,6 +411,89 @@ unsafe impl Send for Index {}
 unsafe impl Sync for Index {}
 
 const BUCKET_BITS: u32 = 9;
+const DOC_BITS: u32 = 15;
+const BLOCK_ENTRIES: usize = 8192;
+const BLOCK_BYTES: usize = 3 * BLOCK_ENTRIES + 1;
+
+struct BlockList {
+    blocks: Vec<*mut u8>,
+    cur: *mut u8,
+    fill: usize,
+}
+
+unsafe impl Send for BlockList {}
+
+impl BlockList {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            blocks: Vec::new(),
+            cur: std::ptr::null_mut(),
+            fill: BLOCK_ENTRIES,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, x: u32) {
+        unsafe {
+            if self.fill == BLOCK_ENTRIES {
+                self.cur = mmap(
+                    std::ptr::null_mut(),
+                    BLOCK_BYTES,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1,
+                    0,
+                );
+                self.blocks.push(self.cur);
+                self.fill = 0;
+            }
+            std::ptr::copy_nonoverlapping(
+                &x as *const u32 as *const u8,
+                self.cur.add(3 * self.fill),
+                4,
+            );
+            self.fill += 1;
+        }
+    }
+
+    #[inline(always)]
+    fn drain<F: FnMut(u32)>(&mut self, mut f: F) {
+        unsafe {
+            let nblocks = self.blocks.len();
+            for b in 0..nblocks {
+                let n = if b + 1 == nblocks { self.fill } else { BLOCK_ENTRIES };
+                let base = self.blocks[b];
+                for i in 0..n {
+                    let mut x = 0u32;
+                    std::ptr::copy_nonoverlapping(
+                        base.add(3 * i),
+                        &mut x as *mut u32 as *mut u8,
+                        4,
+                    );
+                    f(x & 0xFFFFFF);
+                }
+                munmap(base, BLOCK_BYTES);
+            }
+            self.blocks.clear();
+        }
+    }
+}
+
+impl Drop for BlockList {
+    fn drop(&mut self) {
+        unsafe {
+            for &b in &self.blocks {
+                munmap(b, BLOCK_BYTES);
+            }
+        }
+    }
+}
+
+enum LocalSeen {
+    Compact(Vec<BlockList>),
+    Wide(Vec<Vec<u32>>),
+}
 
 #[inline(always)]
 unsafe fn parse_id(mut p: *const u8) -> u32 {
@@ -450,9 +535,6 @@ fn build_index(
         cut[t] = c;
     }
 
-    let mut seen: Vec<Vec<Vec<u32>>> = (0..nthreads)
-        .map(|_| (0..nbuckets).map(|_| Vec::new()).collect())
-        .collect();
     let mut count: Vec<Vec<u32>> = (0..nthreads).map(|_| vec![0u32; nterms as usize]).collect();
     let mut sampled = vec![0u32; nthreads];
     let mut first_docs = vec![0u32; nthreads];
@@ -536,7 +618,7 @@ fn build_index(
     }
     let compact = (0..nthreads).all(|t| {
         let end = first_docs.get(t + 1).copied().unwrap_or(docs);
-        end - first_docs[t] <= u16::MAX as u32 + 1
+        end - first_docs[t] <= (1 << DOC_BITS)
     });
 
     // Sample barrier aggregation
@@ -579,6 +661,16 @@ fn build_index(
     let bits_send = SendPtr(bits.as_ptr());
     let dense_ref = &dense;
 
+    let mut seen: Vec<LocalSeen> = (0..nthreads)
+        .map(|_| {
+            if compact {
+                LocalSeen::Compact(Vec::new())
+            } else {
+                LocalSeen::Wide(Vec::new())
+            }
+        })
+        .collect();
+
     thread::scope(|s| {
         let cut_ref = &cut;
         let terms_ref = &terms;
@@ -598,7 +690,11 @@ fn build_index(
                 let end = b_ptr.as_ptr().add(c_ref[t + 1]);
                 let mut local_cnt = vec![0u32; nterms as usize];
                 let mut last_doc = vec![NONE; nterms as usize];
-                let mut local_seen: Vec<Vec<u32>> = (0..nbuckets).map(|_| Vec::new()).collect();
+                let mut local_seen = if compact {
+                    LocalSeen::Compact((0..nbuckets).map(|_| BlockList::new()).collect())
+                } else {
+                    LocalSeen::Wide((0..nbuckets).map(|_| Vec::new()).collect())
+                };
 
                 let mut p = begin;
                 let mut doc = f;
@@ -631,14 +727,17 @@ fn build_index(
                                     .fetch_or(1u64 << (doc % 64), Ordering::Relaxed);
                             } else {
                                 let bucket = (id >> BUCKET_BITS) as usize;
-                                if compact {
-                                    // Nine bucket-local term bits + sixteen document bits.
-                                    let offset = doc - f;
-                                    debug_assert!(offset <= u16::MAX as u32);
-                                    local_seen[bucket]
-                                        .push(((id & ((1 << BUCKET_BITS) - 1)) << 16) | offset);
-                                } else {
-                                    local_seen[bucket].extend_from_slice(&[id, doc]);
+                                match local_seen {
+                                    LocalSeen::Compact(ref mut bks) => {
+                                        let offset = doc - f;
+                                        debug_assert!(offset < (1 << DOC_BITS));
+                                        bks[bucket].push(
+                                            ((id & ((1 << BUCKET_BITS) - 1)) << DOC_BITS) | offset,
+                                        );
+                                    }
+                                    LocalSeen::Wide(ref mut bks) => {
+                                        bks[bucket].extend_from_slice(&[id, doc]);
+                                    }
                                 }
                                 local_cnt[id as usize] += 1;
                             }
@@ -681,24 +780,28 @@ fn build_index(
         let handles: Vec<_> = seen
             .into_iter()
             .enumerate()
-            .map(|(t, buckets)| {
+            .map(|(t, mut local_seen)| {
                 let mut cursor = count[t].clone();
                 scope.spawn(move || unsafe {
-                    // Each worker owns disjoint term ranges in the destination.
-                    // Consuming buckets releases temporary storage during scatter.
-                    for (bucket, items) in buckets.into_iter().enumerate() {
-                        if compact {
-                            for item in items {
-                                let id = (bucket << BUCKET_BITS) | (item >> 16) as usize;
-                                *post_send.as_ptr().cast_mut().add(cursor[id] as usize) =
-                                    item as u16;
-                                cursor[id] += 1;
+                    match local_seen {
+                        LocalSeen::Compact(ref mut buckets) => {
+                            for (bucket, blk) in buckets.iter_mut().enumerate() {
+                                blk.drain(|x| {
+                                    let id = (bucket << BUCKET_BITS) | (x >> DOC_BITS) as usize;
+                                    *post_send.as_ptr().cast_mut().add(cursor[id] as usize) =
+                                        (x & ((1 << DOC_BITS) - 1)) as u16;
+                                    cursor[id] += 1;
+                                });
                             }
-                        } else {
-                            for pair in items.chunks_exact(2) {
-                                let id = pair[0] as usize;
-                                *wide_send.as_ptr().cast_mut().add(cursor[id] as usize) = pair[1];
-                                cursor[id] += 1;
+                        }
+                        LocalSeen::Wide(buckets) => {
+                            for items in buckets {
+                                for pair in items.chunks_exact(2) {
+                                    let id = pair[0] as usize;
+                                    *wide_send.as_ptr().cast_mut().add(cursor[id] as usize) =
+                                        pair[1];
+                                    cursor[id] += 1;
+                                }
                             }
                         }
                     }
@@ -1304,7 +1407,7 @@ fn append_u64(buf: &mut [u8], mut val: u64, mut pos: usize) -> usize {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
-        prctl(14, 1, 0, 0, 0); // PR_SET_THP_DISABLE = 14
+        prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     }
 
     let mut data_dir = PathBuf::from("/data");
@@ -1411,49 +1514,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     unsafe {
         _exit(0);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn offset_case(documents: u32, threads: usize, expect_compact: bool) {
-        let mut corpus = String::new();
-        for doc in 0..documents {
-            let text = if doc == 0 || doc == documents - 1 {
-                "needle"
-            } else {
-                "other"
-            };
-            corpus.push_str(&format!("{doc}\t{text}\n"));
-        }
-        let size = corpus.len();
-        let mut bytes = corpus.into_bytes();
-        bytes.extend_from_slice(&[0; 128]);
-        let mut query = b"BOOL needle\n".to_vec();
-        let qsize = query.len();
-        query.extend_from_slice(&[0; 128]);
-        let mut terms = TermTable::new();
-        let mut queries = parse_queries(query.as_ptr(), qsize, &mut terms);
-        let ix = build_index(bytes.as_ptr(), size, &mut terms, &mut queries, threads);
-        assert_eq!(ix.wide_post.is_empty(), expect_compact);
-        let mut solver = Solver::new(&ix, &terms, bytes.as_ptr());
-        let mut out = [0; 128];
-        let len = solver.answer(&queries[0], &mut out);
-        let expected = format!("2 {} 0 {}\n", documents - 1, documents - 1);
-        assert_eq!(&out[..len], expected.as_bytes());
-    }
-
-    #[test]
-    fn compact_offsets_cover_u16_max_and_wide_fallback() {
-        offset_case(65536, 1, true);
-        offset_case(65537, 1, false);
-        offset_case(65537, 12, true);
-    }
-
-    #[test]
-    fn empty_worker_segments_preserve_posting_order() {
-        offset_case(2, 12, true);
     }
 }

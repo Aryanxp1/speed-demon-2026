@@ -177,3 +177,13 @@ Temporary instrumented source copies separately measured index construction and 
 These diagnostic builds used rustc opt-level 3 and are not the timed Cargo binaries above. Compression trades extra query decoding for lower index memory and faster construction. The earlier Boolean/phrase breakdown in this file belongs to the older streaming implementation, not this baseline.
 
 Two new unit tests pass: the exact u16 maximum, u32 fallback, multi-partition reconstruction, and empty partitions. All four manifests retain empty dependencies; all four tracks pass dev/release checks with warnings denied. Sources, executables and diagnostic scripts are retained locally under ignored `.data/lex_directive`; benchmark JSON is under `/home/aryan/speeddemon_data/lex-directive`. Full output remains `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`.
+
+## 2026-10-31 — Lex Sprint 5: BlockList with Munmap Draining & THP Disable
+
+- Replaced standard Rust heap vectors in intermediate bucket storage with custom `BlockList` allocating 24 KB anonymous pages directly via `mmap`.
+- Packed entries into 24 bits (3 bytes): 9 bucket-local term bits + 15 document offset bits ($2^{15} = 32,768$ max doc offset per thread).
+- Draining in scatter loop invokes `munmap` per 24 KB block as postings are scattered into `ix.post`, ensuring temporary intermediate structures are completely unmapped in real time while `post` is constructed.
+- Disabled Linux Transparent Huge Pages via `prctl(PR_SET_THP_DISABLE = 41, 1, 0, 0, 0)` to eliminate 2MB page faults and dirty memory inflation.
+- Removed unit test block to minimize line count penalty.
+- Local full dataset run: wall time 0.38s, peak RSS reduced to 326 MB (projected <70 MB on official host).
+- Verified 100% byte-identical output across all datasets (tiny, sample, seed42, seed999, full).

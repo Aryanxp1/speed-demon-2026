@@ -20,6 +20,7 @@ const MAP_ANONYMOUS: i32 = 0x20;
 const MAP_FIXED: i32 = 0x10;
 const MAP_FAILED: *mut u8 = !0 as *mut u8;
 const MADV_DONTNEED: i32 = 4;
+const PR_SET_THP_DISABLE: i32 = 41;
 
 const HOURS: usize = 72;
 const KEY_BITS: u32 = 12;
@@ -240,7 +241,7 @@ fn append_u32(buf: &mut [u8], mut val: u32, mut pos: usize) -> usize {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
-        prctl(14, 1, 0, 0, 0); // PR_SET_THP_DISABLE = 14
+        prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
     }
 
     let mut data_dir = PathBuf::from("/data");
@@ -395,8 +396,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 while !done_ref[h].load(Ordering::Acquire) {
                     std::thread::yield_now();
                 }
-                let buf = text_ref[h].lock().unwrap();
+                let mut buf = text_ref[h].lock().unwrap();
                 out_file.write_all(&buf).ok();
+                *buf = Vec::new();
             }
             out_file.flush().ok();
         });
