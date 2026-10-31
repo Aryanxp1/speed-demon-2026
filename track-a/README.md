@@ -1,26 +1,19 @@
 # Track A: Ingest
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/a-ingest.md).
+Zero-dependency C++20 implementation. Reads `/data/requests.log`, writes `/out/summary.txt`. Adapted from the user-supplied sd-ta snapshot; local validation is in [CANDIDATE.md](CANDIDATE.md) and the optimization history is in [PERF.md](PERF.md).
 
 ## Approach
 
-One C++20 file, `main.cpp`, built as a static binary with `-O3 -march=native`.
+The mapped log is split into 256 KiB line-aligned blocks with bounded lookahead. Each worker parses four interleaved streams using SIMD separator scans and integer latency decoding, filing six-byte records by hour. Private endpoint tables mirror an append-only shared dictionary; every match compares endpoint bytes exactly.
 
-1. **Map and split.** `requests.log` is memory-mapped (input pages are not charged to the container) with a spare page after it, so 32-byte loads near the end are safe. The file is cut into 12 line-aligned ranges, one per thread.
-2. **Parse with fixed offsets and one scan per line.** The timestamp is always 27 bytes and the 72-hour span is fixed, so the hour index comes from the month, day and hour digits with no date library. One 64-byte AVX2 compare finds the spaces and the newline after the timestamp, which gives the method end, the endpoint end and the line end for almost every line. The latency (the digits before the newline) is decoded without a loop: the 16 bytes before the newline, minus `'0'`, with the leading non-digits masked off, are folded 2, 4 and 8 digits at a time with `maddubs`/`madd`.
-3. **Intern endpoints per thread.** Each thread has a fixed 8,192-slot open-addressing table keyed by a CRC32 of the endpoint's first and last eight bytes; names stay in the mapping and are confirmed with `memcmp`. A seed has 1,842 endpoints, so the table never needs to grow (the program stops with an error past 4,096).
-4. **File by hour.** Each line becomes a 6-byte record (`u32` latency, `u16` local endpoint id with the 5xx flag in the top bit) appended to a block list for its hour. Grouping by hour first keeps the next step small.
-5. **Merge the endpoint tables once.** All local tables are interned into one global table and sorted, so an endpoint's global id is its rank in unsigned byte order. Groups then come out in output order with no further sorting.
-6. **Finish each hour on its own.** Threads claim hours in order. For one hour (about 43k requests) a counting sort by endpoint rank lays the latencies out in an L2-sized scratch array, three `nth_element` calls per group give the nearest-rank p50, p95 and p99, and the lines are formatted. The hour's blocks are freed as soon as they are consumed.
-7. **Write while computing.** A writer thread waits on each hour in order and writes it as soon as it is ready, so output overlaps with the remaining hours.
+Once the completed input prefix advances sufficiently, workers finalize an hour with counting scatter and exact nearest-rank p50/p95/p99 selection. AVX2 partitions find multiple ranks together, with bitonic sorting for small groups. Completed hours are formatted and written in order. If any record arrives after its hour was finalized, the program truncates the output and reruns without early finalization, preserving correctness for arbitrary input ordering.
 
-## Dependencies
+Transparent huge pages are disabled and workers are capped at twelve. Input pages are released during the final work; output writeback and cache advice are best effort. The process exits after all workers join and writes complete.
 
-None. Standard library and compiler intrinsics only.
+## Build and local overrides
 
-## With another 24 hours
+The existing pinned Dockerfile builds a static binary offline. No external libraries are used. `SD_DATA_DIR`, `SD_OUT_DIR`, and `SD_THREADS` override the default directories and worker count.
 
-- A/B the SIMD latency decoder against a plain digit loop on the board (the laptop could not tell them apart; the loop is 10 lines shorter).
-- Measure page-fault cost of the record blocks on the box and try one large pre-sized arena instead of one allocation per block.
-- Try a two-pass layout (count, then scatter straight into final position) to drop the 2-byte key per record and cut memory.
-- S is 222 lines after `clang-format --style=LLVM` (reference 56); keep trimming only where it does not cost readability.
+## Further work
+
+Measure official wall time, cgroup memory and formatted source size together before judging the score. Laptop timing improvements alone cannot establish a full-K gain.

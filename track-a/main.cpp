@@ -1,367 +1,626 @@
-// Speed Demon 2026, Track A (Ingest).
-//
-// One pool of threads does everything in two phases.
-//
-// Phase 1, parse. The log is memory-mapped and cut into line-aligned ranges,
-// one per thread. The timestamp is always 27 bytes and the 72-hour span is
-// fixed, so a line's hour index comes from its day and hour digits alone. One
-// 64-byte scan after the timestamp finds the method's end, the endpoint's end
-// and the line's end. Endpoints are interned in one lock-free table shared by
-// all threads, and each line files a 4-byte record (latency, endpoint id, 5xx
-// flag) under its hour.
-//
-// Between the phases the last thread to arrive sorts the names, so each
-// endpoint id gets its rank in output order.
-//
-// Phase 2, hours. Threads claim hours in order. An hour's ~43k latencies are
-// counting-sorted by endpoint rank into per-thread scratch and three
-// selections per group give the percentiles. Each group's numbers are kept
-// (24 bytes a line) along with the exact size the hour's text will take, since
-// a number's width is known without formatting it.
-//
-// Phase 3, text. The last thread into the barrier turns the sizes into
-// offsets, sizes the output file and maps it; then every thread formats its
-// hours straight into the file. No hour waits for another and no write call
-// queues on the file's lock, and the output's pages fill only after the
-// records have been released.
+// Adapted from the user-supplied sd-ta snapshot; see PERF.md for provenance.
+// Track A: per-hour, per-endpoint request counts, p50/p95/p99 and 5xx rates.
+// The log is nearly time-ordered: blocks are parsed into per-hour runs and an
+// hour is finalized once the finished file prefix is kLag hours past it.
+// A late line that breaks this is detected and the run is repeated exactly.
 #include <algorithm>
 #include <atomic>
-#include <barrier>
 #include <charconv>
-#include <cstdint>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
 #include <memory>
-#include <string_view>
+#include <mutex>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <thread>
 #include <unistd.h>
-#include <utility>
 #include <vector>
 
-using u32 = uint32_t;
-using u64 = uint64_t;
+namespace {
+constexpr uint32_t kHours = 72, kIds = 2048, kBlock = 256 << 10, kStreams = 4;
+constexpr uint32_t kLag = 2, kNever = 1000, kKeep = 2;
+constexpr uint32_t kMaxLine = 178, kRunCap = kBlock / 40 + 16, kPartCap = kIds * 256;
+const char *const kDays[] = {"2026-10-30", "2026-10-31", "2026-11-01",
+                             "2026-11-02"};
 
-constexpr int HOURS = 72;  // 2026-10-30T18:00Z to 2026-11-02T17:59:59Z
-// A record packs the latency above a 13-bit key: a 12-bit endpoint id and
-// the 5xx flag. Latencies of 2^19 us or more (about 3% of lines) do not fit
-// and are kept on a side list with their key instead.
-constexpr u32 KEY_BITS = 13, ERR = 1u << 12, ID_MASK = ERR - 1, PACKED_MAX = 1u << 19;
+struct __attribute__((packed)) Rec {
+  uint32_t lat;
+  uint16_t tag;
+}; // tag: id | 5xx << 11
+using Run = std::pair<Rec *, uint32_t>;
+using Part =
+    std::pair<std::unique_ptr<char[]>, size_t>; // output text, its length
 
-// Bit i is set when byte i of the 32 at p equals c.
-inline u32 eq32(const char* p, char c) {
-    __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
-    return _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c)));
+[[noreturn]] void fail(const char *what) {
+  std::perror(what);
+  std::exit(1);
+}
+__m256i load(const void *p) {
+  return _mm256_loadu_si256(static_cast<const __m256i *>(p));
+}
+uint64_t load64(const void *p) {
+  uint64_t v;
+  std::memcpy(&v, p, 8);
+  return v;
+}
+uint32_t spaces(const char *p) {
+  return _mm256_movemask_epi8(
+      _mm256_cmpeq_epi8(load(p), _mm256_set1_epi8(' ')));
+}
+// Index of the first space at or after q + 64.
+uint32_t far_space(const char *q) {
+  uint32_t k = 64, m;
+  while (!(m = spaces(q + k)))
+    k += 32;
+  return k + __builtin_ctz(m);
+}
+// The value of eight decimal digits (0..9 per byte, most significant first).
+uint64_t digits8(uint64_t v) {
+  __m128i x = _mm_maddubs_epi16(_mm_cvtsi64_si128(v), _mm_set1_epi16(0x010a));
+  x = _mm_madd_epi16(x, _mm_set1_epi32(0x00010064));
+  const uint64_t r = _mm_cvtsi128_si64(x);
+  return (r & 0xffffffff) * 10000 + (r >> 32);
 }
 
-// The number of decimal digits in x.
-inline u32 width(u32 x) {
-    static constexpr u32 p10[] = {1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000};
-    u32 t = (32 - __builtin_clz(x | 1)) * 1233 >> 12;  // about bit length x log10(2)
-    return t + ((x | 1) >= p10[t]);
-}
-
-// The value of the len (1 to 10) digits ending just before end, with no loop:
-// the 16 bytes before end, minus '0' and with the bytes ahead of the number
-// zeroed, are combined 2, 4 and then 8 digits at a time. (A digit loop here
-// cost about 5% more instructions in all.)
-inline u32 decode(const char* end, u32 len) {
-    __m128i v = _mm_subs_epu8(_mm_loadu_si128((const __m128i*)(end - 16)), _mm_set1_epi8('0'));
-    __m128i lane = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-    v = _mm_and_si128(v, _mm_cmpgt_epi8(lane, _mm_set1_epi8(char(15 - len))));
-    v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));  // pairs (10, 1)
-    v = _mm_madd_epi16(v, _mm_set1_epi32(0x00010064));  // pairs (100, 1)
-    v = _mm_madd_epi16(_mm_packus_epi32(v, v), _mm_set1_epi32(0x00012710));
-    return u32(_mm_cvtsi128_si32(v)) * u64(100000000) + u32(_mm_extract_epi32(v, 1));
-}
-
-// Puts the k-th smallest of a[0, n) at a[k], the smaller ones before it,
-// without a branch on the data: each step partitions around the median of
-// three by Lomuto's scheme with an unconditional swap, the boundary moving
-// by the comparison's result. (std::nth_element mispredicted at about every
-// other element.) Many equal values could make a round shrink the range by
-// only one, so after 40 rounds the library's selection finishes.
-inline void select(u32* a, u32 n, u32 k) {
-    for (int round = 0; n > 1; ++round) {
-        if (round == 40) return std::nth_element(a, a + k, a + n);
-        u32 m = n / 2;  // sort a[0], a[m], a[n - 1], then the median is the pivot
-        if (a[m] < a[0]) std::swap(a[m], a[0]);
-        if (a[n - 1] < a[m]) std::swap(a[n - 1], a[m]);
-        if (a[m] < a[0]) std::swap(a[m], a[0]);
-        std::swap(a[m], a[n - 1]);
-        u32 pivot = a[n - 1], lt = 0;
-        for (u32 i = 0; i + 1 < n; ++i) {
-            u32 x = a[i];
-            a[i] = a[lt], a[lt] = x, lt += x < pivot;
-        }
-        std::swap(a[lt], a[n - 1]);
-        if (k == lt) return;
-        if (k < lt) n = lt;
-        else a += lt + 1, k -= lt + 1, n -= lt + 1;
-    }
-}
-
-// The first c at or after s; one is known to follow.
-inline const char* next_byte(const char* s, char c) {
-    for (;; s += 32)
-        if (u32 m = eq32(s, c)) return s + __builtin_ctz(m);
-}
-
-// Endpoint names to ids, one table for all threads. Open addressing on a CRC
-// of the name's first and last eight bytes (masked when the name is shorter;
-// the rest of the line keeps both loads in bounds), and a name's id is its
-// slot. A new name is copied into the arena, so the names compared on every
-// line sit together, and then published with one compare-and-swap; a thread
-// that loses the race for the slot compares against the winner's name.
-struct Names {
-    static constexpr u32 SLOTS = 1 << 12, ARENA = SLOTS * 128;  // a seed has 1,842
-    std::atomic<u64> slot[SLOTS];  // length << 32 | arena offset, 0 if free
-    std::atomic<u32> used{0};
-    char arena[ARENA + 64];  // 64 spare bytes keep the last compare in bounds
-
-    std::string_view name(u64 v) const { return {arena + u32(v), size_t(v >> 32)}; }
-
-    u32 operator()(std::string_view s) {
-        u64 a, b = 0;
-        memcpy(&a, s.data(), 8);
-        if (s.size() >= 8) memcpy(&b, s.data() + s.size() - 8, 8);
-        else a &= (u64(1) << 8 * s.size()) - 1;
-        for (u32 i = _mm_crc32_u64(_mm_crc32_u64(s.size(), a), b), end = i + SLOTS; i != end; ++i) {
-            u64 v = slot[i % SLOTS].load(std::memory_order_acquire);
-            if (v == 0) {
-                u32 at = used.fetch_add(s.size());
-                if (at + s.size() > ARENA) _exit(2);
-                memcpy(arena + at, s.data(), s.size());
-                if (slot[i % SLOTS].compare_exchange_strong(v, u64(s.size()) << 32 | at)) return i % SLOTS;
-            }
-            if (same(name(v), s)) return i % SLOTS;
-        }
-        _exit(2);  // more names than slots
-    }
-
-    // 64 bytes can always be read from either name (the rest of the line and
-    // the spare page follow one, the arena's spare bytes the other), so a name
-    // of up to 64 bytes (94% of lines) is compared in two steps, not memcmp.
-    static bool same(std::string_view x, std::string_view s) {
-        if (x.size() != s.size() || s.size() > 64) return x == s;
-        auto eq = [&](int i) { return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(x.data() + i)), _mm256_loadu_si256((const __m256i*)(s.data() + i))))); };
-        return (~(eq(0) | u64(eq(32)) << 32) & (~u64(0) >> (64 - s.size()))) == 0;
-    }
+// Lane permutations that compress the lanes of an 8-bit mask to the bottom
+// (kLow) or, for the lanes outside the mask, to the top (kHigh) of a vector.
+struct Lanes {
+  uint8_t low[256][8]{}, high[256][8]{};
+  constexpr Lanes() {
+    for (int m = 0; m < 256; ++m)
+      for (int lane = 0, in = 0, out = 0; lane < 8; ++lane)
+        if (m >> lane & 1)
+          low[m][in++] = lane;
+        else
+          high[m][__builtin_popcount(m) + out++] = lane;
+  }
 };
-static Names endpoints;  // zero pages until written
+constexpr Lanes kLanes;
 
-// One hour's records from one thread, in a chain of 16 KB chunks carved in
-// order from a region the thread maps up front (one mmap, so no lock is
-// shared). The output file's pages count toward peak memory as it is written,
-// so chunks are handed back while it grows: see Parser::release.
-struct Chunk {
-    static constexpr u32 CAP = (16384 - 16) / 4;
-    Chunk* prev;
-    u32 n, hour;
-    u32 rec[CAP];
-};
-
-struct Parser {
-    Chunk* last[HOURS] = {};
-    // (latency, key) of the long ones.
-    std::vector<std::pair<u32, u32>> wide[HOURS];
-    // next: where the next chunk is carved; kept: first one not yet released.
-    Chunk *next = nullptr, *kept = nullptr;
-
-    // Room for a log of `size` bytes: a line is at least 40 bytes, and each
-    // hour may leave one chunk part full. Pages are charged only once written.
-    void map(size_t size) {
-        size_t bytes = (size / 40 / Chunk::CAP + 1 + HOURS) * sizeof(Chunk);
-        next = kept = (Chunk*)mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    }
-
-    void run(const char* p, const char* end) {
-        while (p < end) {
-            // YYYY-MM-DDTHH: month's last digit at 6, day at 8-9, hour at 11-12.
-            int day = (p[8] - '0') * 10 + (p[9] - '0'), hour = (p[11] - '0') * 10 + (p[12] - '0');
-            int h = (p[6] == '0' ? day - 30 : day + 1) * 24 + hour - 18;
-
-            // Spaces and newlines in the 64 bytes after the timestamp. Only an
-            // endpoint near its 125-byte maximum pushes past the window.
-            const char* m = p + 28;
-            u64 sp = eq32(m, ' ') | u64(eq32(m + 32, ' ')) << 32;
-            u64 nl = eq32(m, '\n') | u64(eq32(m + 32, '\n')) << 32;
-            const char* name = m + __builtin_ctzll(sp) + 1;
-            const char* name_end = nl ? m + __builtin_ctzll(sp & (sp - 1)) : next_byte(name, ' ');
-            const char* eol = nl ? m + __builtin_ctzll(nl) : next_byte(name_end + 5, '\n');
-            u32 key = endpoints(std::string_view(name, name_end - name)) | (name_end[1] == '5' ? ERR : 0);
-            u32 latency = decode(eol, eol - name_end - 5);  // after " SSS "
-            p = eol + 1;
-
-            if (__builtin_expect(latency >= PACKED_MAX, 0)) {
-                wide[h].push_back({latency, key});
-                continue;
-            }
-            Chunk*& c = last[h];
-            if (!c || c->n == Chunk::CAP) next->prev = c, next->n = 0, next->hour = h, c = next++;
-            c->rec[c->n++] = latency << KEY_BITS | key;
-        }
-    }
-
-    // The log is in arrival order, so chunks are carved roughly hour by hour
-    // and hours finish in the same order: the run of chunks at the front whose
-    // hours are all finished grows steadily. Hand it back once it reaches 64
-    // KB, in one madvise, instead of one call (and TLB shootdown) per chunk;
-    // larger batches left about 1 MB more resident at the peak.
-    void release(const std::atomic<bool>* finished) {
-        Chunk* c = kept;
-        while (c < next && finished[c->hour]) ++c;
-        if (c - kept >= 4 || (c == next && c > kept)) {
-            madvise(kept, (c - kept) * sizeof(Chunk), MADV_DONTNEED);
-            kept = c;
-        }
-    }
-
-    // Calls f(endpoint rank, key, latency) for every record of hour h.
-    template <class F>
-    void each(int h, const u32* rank, F&& f) const {
-        for (const Chunk* c = last[h]; c; c = c->prev)
-            for (u32 i = 0; i < c->n; ++i) f(rank[c->rec[i] & ID_MASK], c->rec[i] & ERR, c->rec[i] >> KEY_BITS);
-        for (auto [latency, key] : wide[h]) f(rank[key & ID_MASK], key & ERR, latency);
-    }
-};
-
-int main(int argc, char** argv) {
-    // With transparent huge pages, a chunk region written only in part could be
-    // backed by whole 2 MB pages and count against peak memory.
-    prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
-    const int nt = std::clamp<int>(std::thread::hardware_concurrency(), 1, 12);
-    int in = open(argc > 1 ? argv[1] : "/data/requests.log", O_RDONLY);
-    int out = open(argc > 2 ? argv[2] : "/out/summary.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (in < 0 || out < 0) return perror("open"), 1;
-
-    // Map the log over one spare zero page, so the 64-byte scans stay in bounds.
-    size_t size = lseek(in, 0, SEEK_END);
-    auto* log = (char*)mmap(nullptr, size + 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (size && mmap(log, size, PROT_READ, MAP_PRIVATE | MAP_FIXED, in, 0) == MAP_FAILED) return perror("mmap"), 1;
-    // Line-aligned pieces, eight per thread, claimed in order: a thread that
-    // starts late or shares its core takes fewer.
-    const int pieces = 8 * nt;
-    std::vector<size_t> cut(pieces + 1, size);
-    cut[0] = 0;
-    for (int k = 1; k < pieces; ++k)
-        for (cut[k] = std::max(cut[k - 1], size * k / pieces); cut[k] < size && log[cut[k] - 1] != '\n';) ++cut[k];
-    std::atomic<int> claim_piece{0};
-
-    // Between the phases, endpoints are ranked in unsigned byte order (a
-    // proper prefix first), which is the order lines are printed in an hour.
-    std::vector<Parser> parsers(nt);
-    std::vector<std::string_view> names;
-    std::vector<u32> rank(Names::SLOTS);  // endpoint id -> rank
-    u32 most = 0;  // records in the largest hour
-    std::barrier ranked(nt, [&]() noexcept {
-        for (int h = 0; h < HOURS; ++h) {
-            u32 n = 0;
-            for (auto& ps : parsers) ps.each(h, rank.data(), [&](u32, u32, u32) { ++n; });
-            most = std::max(most, n);
-        }
-        std::vector<std::pair<std::string_view, u32>> by_name;
-        for (u32 id = 0; id < Names::SLOTS; ++id)
-            if (u64 v = endpoints.slot[id]) by_name.push_back({endpoints.name(v), id});
-        std::sort(by_name.begin(), by_name.end());
-        for (auto [name, id] : by_name) rank[id] = names.size(), names.push_back(name);
-    });
-
-    // An hour is finished once its records are copied out; one thread at a
-    // time then releases whatever chunks that frees.
-    std::vector<std::atomic<bool>> finished(HOURS);
-    std::atomic_flag releasing;
-    std::atomic<int> claim{0}, claim_text{0};
-    struct Line {
-        u32 e, n, p50, p95, p99, errors;
+// Copies src[lo, hi) to dst so that the values below pivot come first; returns
+// how many there are. Values are int32 (latencies with the sign bit flipped).
+uint32_t split(const int32_t *src, int32_t *dst, uint32_t lo, uint32_t hi,
+               int32_t pivot) {
+  const __m256i bound = _mm256_set1_epi32(pivot);
+  uint32_t i = lo, l = lo, r = hi;
+  for (; hi - i >= 16; i += 8) {
+    const __m256i v = load(src + i);
+    const uint32_t m = _mm256_movemask_ps(
+        _mm256_castsi256_ps(_mm256_cmpgt_epi32(bound, v)));
+    auto lanes = [&](const uint8_t *idx) {
+      return _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)idx));
     };
-    auto ppm = [](const Line& l) { return u32(u64(l.errors) * 1000000 / l.n); };
-    std::vector<std::vector<Line>> lines(HOURS);
-    std::vector<u64> at(HOURS + 1);  // an hour's text size, then its offset
-    char* text = nullptr;
-    std::barrier sized(nt, [&]() noexcept {
-        // Every hour is finished: whatever chunks the last releases left go
-        // back now, before the output's pages start to count.
-        for (auto& ps : parsers) ps.release(finished.data());
-        u64 total = 0;
-        for (int h = 0; h < HOURS; ++h) total += std::exchange(at[h], total);
-        at[HOURS] = total;
-        if (total == 0) return;
-        if (ftruncate(out, total) != 0) _exit(1);
-        text = (char*)mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, out, 0);
-        if (text == MAP_FAILED) _exit(1);
-    });
+    _mm256_storeu_si256((__m256i *)(dst + l),
+                        _mm256_permutevar8x32_epi32(v, lanes(kLanes.low[m])));
+    _mm256_storeu_si256((__m256i *)(dst + r - 8),
+                        _mm256_permutevar8x32_epi32(v, lanes(kLanes.high[m])));
+    l += __builtin_popcount(m);
+    r -= 8 - __builtin_popcount(m);
+  }
+  for (; i < hi; ++i) {
+    const int32_t v = src[i];
+    dst[l] = dst[r - 1] = v;
+    l += v < pivot;
+    r -= v >= pivot;
+  }
+  return l - lo;
+}
 
+// Sorts the first n <= 16 values of a (plus 16 readable slots) into out[0, 16)
+// with a bitonic network on two vectors; unused lanes sort to the end.
+template <int M> __m256i step(__m256i v, __m256i other) {
+  return _mm256_blend_epi32(_mm256_min_epi32(v, other),
+                            _mm256_max_epi32(v, other), M);
+}
+__m256i sort8(__m256i v) {
+  const __m256i flip = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+  v = step<0xAA>(v, _mm256_shuffle_epi32(v, 0xB1));
+  v = step<0xCC>(v, _mm256_shuffle_epi32(v, 0x1B));
+  v = step<0xAA>(v, _mm256_shuffle_epi32(v, 0xB1));
+  v = step<0xF0>(v, _mm256_permutevar8x32_epi32(v, flip));
+  v = step<0xCC>(v, _mm256_shuffle_epi32(v, 0x4E));
+  return step<0xAA>(v, _mm256_shuffle_epi32(v, 0xB1));
+}
+__m256i merge8(__m256i v) { // v is a bitonic sequence
+  v = step<0xF0>(v, _mm256_permute2x128_si256(v, v, 1));
+  v = step<0xCC>(v, _mm256_shuffle_epi32(v, 0x4E));
+  return step<0xAA>(v, _mm256_shuffle_epi32(v, 0xB1));
+}
+void sort16(const int32_t *a, uint32_t n, int32_t *out) {
+  const __m256i iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
+                big = _mm256_set1_epi32(INT32_MAX), count = _mm256_set1_epi32(n);
+  __m256i x = _mm256_blendv_epi8(big, load(a), _mm256_cmpgt_epi32(count, iota)),
+          y = _mm256_blendv_epi8(
+              big, load(a + 8),
+              _mm256_cmpgt_epi32(count, _mm256_add_epi32(iota, _mm256_set1_epi32(8))));
+  x = sort8(x);
+  y = _mm256_permutevar8x32_epi32(sort8(y), _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0));
+  _mm256_storeu_si256((__m256i *)out, merge8(_mm256_min_epi32(x, y)));
+  _mm256_storeu_si256((__m256i *)(out + 8), merge8(_mm256_max_epi32(x, y)));
+}
+
+// Stores the values at the sorted positions k[0..nk) of a[lo, hi) into out;
+// the positions are ascending and inside the range. a and b swap roles at each
+// level (b is scratch of the same size).
+void multiselect(int32_t *a, int32_t *b, uint32_t lo, uint32_t hi,
+                 const uint32_t *k, int nk, int32_t *out, int depth = 0) {
+  if (hi - lo <= 16) {
+    alignas(32) int32_t sorted[16];
+    sort16(a + lo, hi - lo, sorted);
+    for (int i = 0; i < nk; ++i)
+      out[i] = sorted[k[i] - lo];
+    return;
+  }
+  if (depth > 40) {
+    std::sort(a + lo, a + hi);
+    for (int i = 0; i < nk; ++i)
+      out[i] = a[k[i]];
+    return;
+  }
+  const int32_t x = a[lo], y = a[lo + (hi - lo) / 2], z = a[hi - 1];
+  int32_t pivot = std::max(std::min(x, y), std::min(std::max(x, y), z));
+  uint32_t cut = lo + split(a, b, lo, hi, pivot);
+  if (cut == lo) { // pivot is the minimum: peel off its duplicates
+    if (pivot == INT32_MAX) {
+      std::fill(out, out + nk, pivot);
+      return;
+    }
+    cut = lo + split(a, b, lo, hi, pivot + 1);
+    for (int i = 0; i < nk && k[i] < cut; ++i)
+      out[i] = pivot;
+    if (cut == hi)
+      return;
+    int done = std::lower_bound(k, k + nk, cut) - k;
+    if (done < nk)
+      multiselect(b, a, cut, hi, k + done, nk - done, out + done, depth + 1);
+    return;
+  }
+  const int left = std::lower_bound(k, k + nk, cut) - k;
+  if (left)
+    multiselect(b, a, lo, cut, k, left, out, depth + 1);
+  if (left < nk)
+    multiselect(b, a, cut, hi, k + left, nk - left, out + left, depth + 1);
+}
+
+// Dictionary inserts are tiny and bursty at startup, so waiters spin instead of
+// sleeping.
+struct SpinLock {
+  std::atomic_flag held = ATOMIC_FLAG_INIT;
+  void lock() {
+    for (int i = 0; held.test_and_set(std::memory_order_acquire); ++i)
+      if (i < 64)
+        _mm_pause();
+      else
+        sched_yield();
+  }
+  void unlock() { held.clear(std::memory_order_release); }
+};
+
+// Exact endpoint dictionary. The global part is an append-only log (key image,
+// length, fingerprint) behind a lock whose size is published with a release
+// store; entries below it never change. Each worker mirrors the log in a private
+// bucket table, so the hot lookups are plain SIMD reads without sharing. Keys
+// are stored after a space and zero-padded, so n + 1 equal bytes prove equality.
+struct Names {
+  alignas(64) char img[kIds][128]{};
+  uint32_t len[kIds]{}, hash[kIds]{};
+  std::atomic<uint32_t> size{0};
+  std::vector<uint16_t> sorted; // ids in byte order of their names (under mu)
+  SpinLock mu;
+
+  bool same(uint32_t id, const char *ep, uint32_t n) const {
+    auto eq = [&](int i) {
+      return uint64_t(uint32_t(_mm256_movemask_epi8(
+                 _mm256_cmpeq_epi8(load(ep + i), load(img[id] + i)))))
+             << i;
+    };
+    return !_bzhi_u64(~(eq(0) | eq(32)), n + 1) &&
+           (n < 64 || !std::memcmp(img[id] + 64, ep + 64, n - 63));
+  }
+};
+
+struct Local { // one worker's private open-addressing view of the dictionary
+  static constexpr uint32_t kSlots = 1 << 14;
+  uint16_t slot[kSlots]{}; // id + 1, or 0 when free
+  uint32_t synced = 0;
+
+  void put(uint32_t h, uint32_t id) {
+    uint32_t i = h >> 18;
+    while (slot[i])
+      i = (i + 1) % kSlots;
+    slot[i] = id + 1;
+  }
+  int lookup(const Names &names, const char *ep, uint32_t n, uint32_t h) const {
+    for (uint32_t i = h >> 18; slot[i]; i = (i + 1) % kSlots)
+      if (names.same(slot[i] - 1, ep, n))
+        return slot[i] - 1;
+    return -1;
+  }
+  // Copies the log entries published since the last visit.
+  void sync(const Names &names) {
+    for (const uint32_t end = names.size.load(std::memory_order_acquire);
+         synced < end; ++synced)
+      put(names.hash[synced], synced);
+  }
+  uint32_t add(Names &names, const char *ep, uint32_t n, uint32_t h) {
+    sync(names);
+    if (const int id = lookup(names, ep, n, h); id >= 0)
+      return id;
+    std::lock_guard<SpinLock> lock(names.mu);
+    sync(names); // another worker may have published it meanwhile
+    if (const int id = lookup(names, ep, n, h); id >= 0)
+      return id;
+    const uint32_t id = names.size.load(std::memory_order_relaxed);
+    if (id >= kIds)
+      fail("too many endpoints");
+    std::memcpy(names.img[id], ep, n);
+    names.img[id][n] = ' ';
+    names.len[id] = n;
+    names.hash[id] = h;
+    names.sorted.insert(
+        std::lower_bound(names.sorted.begin(), names.sorted.end(), id,
+                         [&](uint32_t x, uint32_t y) {
+                           return std::memcmp(names.img[x], names.img[y], 128) <
+                                  0;
+                         }),
+        id);
+    names.size.store(id + 1, std::memory_order_release);
+    put(h, id);
+    synced = id + 1;
+    return id;
+  }
+  __attribute__((always_inline)) uint32_t find(Names &names, const char *ep,
+                                               uint32_t n) {
+    const uint64_t keep = n < 8 ? n * 8 : 64;
+    const uint64_t x = _bzhi_u64(load64(ep), keep),
+                   y = _bzhi_u64(load64(ep + std::max(n, 8u) - 8), keep);
+    const uint32_t h = _mm_crc32_u64(_mm_crc32_u64(n, x), y);
+    const int id = lookup(names, ep, n, h);
+    return id >= 0 ? id : add(names, ep, n, h);
+  }
+};
+
+// Where a stream appends: the hour of its previous line is remembered.
+struct Stream {
+  const char *pos, *stop;
+  uint64_t date = 0; // bytes 5..12 of the previous line
+  Rec **at = nullptr;
+};
+
+// The eight decimal digits of v < 10^8 as bytes 0..9, most significant first.
+uint64_t digits_of(uint32_t v) {
+  uint64_t x = v / 10000 | uint64_t{v % 10000} << 32;
+  uint64_t q = (x * 5243 >> 19) & 0x0000007f0000007f;
+  x = q | (x - q * 100) << 16;
+  q = (x * 103 >> 10) & 0x000f000f000f000f;
+  return q | (x - q * 10) << 8;
+}
+// Appends a space and v; 16 bytes of slack must follow.
+__attribute__((always_inline)) inline char *put(char *out, uint32_t v) {
+  *out++ = ' ';
+  if (v >= 100000000)
+    return std::to_chars(out, out + 10, v).ptr;
+  const uint64_t d = digits_of(v);
+  const uint32_t skip = __builtin_ctzll(d | uint64_t{1} << 56) / 8;
+  const uint64_t text = (d + 0x3030303030303030) >> 8 * skip;
+  std::memcpy(out, &text, 8);
+  return out + 8 - skip;
+}
+
+struct Job {
+  const char *base;
+  size_t size;
+  uint32_t lag, nblocks, threads;
+  int fd;
+  Names names;
+  std::mutex mu, out_mu;
+  std::condition_variable cv;
+  std::vector<Run> runs[kHours]; // per hour, from the registered blocks
+  std::vector<int> top; // per block: its last hour, or -1 until registered
+  uint32_t next_block = 0, watermark = 0, prefix_max = 0, registered = 0,
+           next_hour = 0;
+  bool bad = false; // a line arrived after its hour was finalized
+  Part parts[kHours];
+  off_t end[kHours + 1]{}; // output offset after each hour
+  uint32_t written = 0;    // hours written so far
+  bool writing = false;
+  std::atomic<size_t> zapped{0}; // 4 MiB steps of the mapping released
+  std::vector<Rec *> runbufs; // free buffers, guarded by mu
+  std::vector<std::vector<int32_t>> latbufs;
+  std::vector<std::unique_ptr<char[]>> outbufs;
+
+  Job(const char *b, size_t n, uint32_t l, int f, uint32_t t)
+      : base(b), size(n), lag(l), nblocks((n + kBlock - 1) / kBlock),
+        threads(t), fd(f), top(nblocks, -1) {}
+  ~Job() {
+    for (Rec *r : runbufs)
+      std::free(r);
+  }
+
+  template <class T> T take(std::vector<T> &pool) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (pool.empty())
+      return T();
+    T t = std::move(pool.back());
+    pool.pop_back();
+    return t;
+  }
+  static const char *next_line(const char *p) {
+    while (p[-1] != '\n')
+      ++p;
+    return p;
+  }
+  const char *align(uint32_t block) const {
+    return block ? next_line(base +
+                             std::min<size_t>(size_t{block} * kBlock, size))
+                 : base;
+  }
+
+  // Parses one line of the stream; 256 readable bytes must follow it.
+  __attribute__((always_inline)) void line(Local &local, Stream &st,
+                                           Rec *(&wp)[kHours],
+                                           Rec *(&bp)[kHours]) {
+    const char *p = st.pos;
+    if (const uint64_t date = load64(p + 5); date != st.date) {
+      st.date = date;
+      st.at = wp + (p[9] + (p[6] & 1)) * 24 + p[11] * 10 + p[12] - 1698;
+      if (!*st.at) {
+        Rec *r = take(runbufs);
+        *st.at = bp[st.at - wp] =
+            r ? r
+              : static_cast<Rec *>(
+                    std::malloc(kRunCap * sizeof(Rec) + sizeof(uint64_t)));
+      }
+    }
+    _mm_prefetch(p + 1280, _MM_HINT_T0);
+    _mm_prefetch(p + 1344, _MM_HINT_T0);
+    const char *q = p + 28;
+    uint64_t m = spaces(q) | uint64_t{spaces(q + 32)} << 32;
+    const uint32_t k1 = __builtin_ctzll(m);
+    m &= m - 1;
+    const uint32_t k2 = m ? __builtin_ctzll(m) : far_space(q);
+    const uint32_t id = local.find(names, q + k1 + 1, k2 - k1 - 1);
+    const char *s = q + k2 + 1;
+    const uint32_t error = *s == '5';
+    s += 4;
+    uint64_t v = load64(s) ^ 0x3030303030303030, lat;
+    const uint64_t other = ((v + 0x7676767676767676) | v) & 0x8080808080808080;
+    if (other) {
+      const uint32_t digits = __builtin_ctzll(other) >> 3;
+      lat = digits8(v << (64 - 8 * digits));
+      s += digits;
+    } else {
+      for (lat = digits8(v), s += 8; *s != '\n'; ++s)
+        lat = lat * 10 + (*s - '0');
+    }
+    const uint64_t rec = lat | uint64_t{id | error << 11} << 32;
+    std::memcpy((*st.at)++, &rec, sizeof(Rec));
+    st.pos = s + 1;
+  }
+
+  void parse(Local &local, uint32_t block) {
+    Rec *wp[kHours]{}, *bp[kHours]{};
+    Stream st[kStreams]; // interleaved streams overlap their latencies
+    const char *p = align(block), *end = align(block + 1);
+    for (uint32_t i = 0; i < kStreams; ++i) {
+      st[i].pos = i ? next_line(p + (end - p) * i / kStreams) : p;
+      st[i].stop = i + 1 < kStreams ? nullptr : end;
+    }
+    for (uint32_t i = 0; i + 1 < kStreams; ++i)
+      st[i].stop = st[i + 1].pos;
+    // Every line has at most kMaxLine bytes, so this many lines are in range.
+    for (size_t rounds = 1; rounds;) {
+      size_t room = SIZE_MAX;
+      for (const Stream &x : st)
+        room = std::min<size_t>(room, x.stop - x.pos);
+      for (rounds = room / kMaxLine; rounds--;) {
+#pragma GCC unroll 4
+        for (Stream &x : st)
+          line(local, x, wp, bp);
+      }
+      rounds = room / kMaxLine;
+    }
+    for (Stream &x : st)
+      while (x.pos < x.stop)
+        line(local, x, wp, bp);
+
+    std::lock_guard<std::mutex> lock(mu);
+    int last = 0;
+    for (uint32_t h = 0; h < kHours; ++h) {
+      if (!bp[h])
+        continue;
+      last = h;
+      if (h < next_hour) {
+        bad = true;
+        runbufs.push_back(bp[h]);
+      } else
+        runs[h].push_back({bp[h], static_cast<uint32_t>(wp[h] - bp[h])});
+    }
+    top[block] = last;
+    for (++registered; watermark < nblocks && top[watermark] >= 0; ++watermark)
+      prefix_max = std::max<int>(prefix_max, top[watermark]);
+    cv.notify_all();
+  }
+
+  void finalize(uint32_t hour) {
+    std::vector<Run> mine;
+    std::vector<uint16_t> order;
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      mine.swap(runs[hour]);
+      std::lock_guard<SpinLock> names_lock(names.mu);
+      order = names.sorted;
+    }
+    uint32_t count[2 * kIds] = {}, pos[kIds],
+                       total = 0; // by tag: ids, then their 5xx
+    for (const auto &[rec, n] : mine)
+      for (uint32_t i = 0; i < n; ++i)
+        ++count[rec[i].tag];
+    uint16_t live[kIds]; // the endpoints seen in this hour, in output order
+    uint32_t seen = 0;
+    for (const uint16_t id : order) {
+      const uint32_t n = count[id] + count[id + kIds];
+      pos[id] = total;
+      total += n;
+      live[seen] = id;
+      seen += n != 0;
+    }
+    std::vector<int32_t> lat = take(latbufs);
+    lat.reserve(1 << 17);
+    lat.resize(total + 16);
+    for (const auto &[rec, n] : mine)
+      for (uint32_t i = 0; i < n; ++i)
+        lat[pos[rec[i].tag % kIds]++] = rec[i].lat ^ 0x80000000;
+
+    static thread_local std::vector<int32_t> scratch;
+    std::unique_ptr<char[]> text = take(outbufs);
+    if (!text)
+      text.reset(new char[kPartCap + 256]);
+    char *out = text.get(), label[22];
+    std::snprintf(label, sizeof label, "%sT%02u:00:00Z ",
+                  kDays[(hour + 18) / 24], (hour + 18) % 24);
+    for (uint32_t i = 0; i < seen; ++i) {
+      const uint16_t id = live[i];
+      const uint32_t errors = count[id + kIds], n = count[id] + errors;
+      int32_t *const a = lat.data() + pos[id] - n;
+      const uint32_t ranks[3] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
+                                 (99 * n + 99) / 100 - 1};
+      int32_t value[3];
+      if (scratch.size() < n + 16)
+        scratch.resize(n + 16);
+      multiselect(a, scratch.data(), 0, n, ranks, 3, value);
+      std::memcpy(out, label, 21);
+      for (uint32_t i = 0; i < 128; i += 32)
+        _mm256_storeu_si256((__m256i *)(out + 21 + i), load(names.img[id] + i));
+      out += 21 + names.len[id];
+      out = put(put(put(put(put(out, n), uint32_t(value[0]) ^ 0x80000000),
+                        uint32_t(value[1]) ^ 0x80000000),
+                    uint32_t(value[2]) ^ 0x80000000),
+                errors);
+      out = errors ? put(out, uint64_t{errors} * 1000000 / n) : put(out, 0);
+      *out++ = '\n';
+    }
+    const size_t length = out - text.get();
+    {
+      std::lock_guard<std::mutex> lock(mu);
+      latbufs.push_back(std::move(lat));
+      for (const auto &[rec, n] : mine)
+        runbufs.push_back(rec);
+    }
+    emit(hour, {std::move(text), length});
+  }
+
+  // Whoever completes an hour writes all hours that are ready in order (a
+  // thread that finds a writer active just leaves its part), starts their
+  // writeback and drops older cached output pages (best effort).
+  void emit(uint32_t hour, Part ready) {
+    std::unique_lock<std::mutex> lock(out_mu);
+    parts[hour] = std::move(ready);
+    if (writing)
+      return;
+    for (writing = true; written < kHours && parts[written].first; ++written) {
+      Part part = std::move(parts[written]);
+      lock.unlock();
+      for (size_t done = 0; done < part.second;) {
+        const ssize_t w =
+            write(fd, part.first.get() + done, part.second - done);
+        if (w <= 0)
+          fail("write summary");
+        done += w;
+      }
+      end[written + 1] = end[written] + part.second;
+      sync_file_range(fd, end[written], part.second, SYNC_FILE_RANGE_WRITE);
+      if (written >= kKeep)
+        posix_fadvise(fd, 0, end[written - kKeep + 1], POSIX_FADV_DONTNEED);
+      {
+        std::lock_guard<std::mutex> pool_lock(mu);
+        outbufs.push_back(std::move(part.first));
+      }
+      lock.lock();
+    }
+    writing = false;
+  }
+
+  bool claimable() const {
+    return next_hour < kHours &&
+           (registered == nblocks || next_hour + lag <= prefix_max);
+  }
+
+  // Finalizes hours once they are safe and otherwise parses blocks, but never
+  // more than two per worker past the oldest unfinished one.
+  void work() {
+    const auto local = std::make_unique<Local>();
+    std::unique_lock<std::mutex> lock(mu);
+    for (;;) {
+      if (claimable()) {
+        const uint32_t hour = next_hour++;
+        cv.notify_all();
+        lock.unlock();
+        finalize(hour);
+        lock.lock();
+      } else if (next_block < nblocks && next_block < watermark + 2 * threads) {
+        const uint32_t block = next_block++;
+        lock.unlock();
+        parse(*local, block);
+        lock.lock();
+      } else if (next_hour >= kHours) {
+        lock.unlock(); // drop the file mapping in shared 4 MiB steps so that
+                       // exit is cheaper
+        constexpr size_t kStep = 4 << 20;
+        for (size_t at; (at = zapped++ * kStep) < size;)
+          madvise(const_cast<char *>(base) + at, std::min(kStep, size - at),
+                  MADV_DONTNEED);
+        return;
+      } else {
+        cv.wait(lock);
+      }
+    }
+  }
+  bool run() {
     std::vector<std::thread> pool;
-    for (int t = 0; t < nt; ++t) pool.emplace_back([&, t] {
-        parsers[t].map(size);
-        for (int k; (k = claim_piece++) < pieces;) parsers[t].run(log + cut[k], log + cut[k + 1]);
-        ranked.arrive_and_wait();
+    for (uint32_t i = 1; i < threads; ++i)
+      pool.emplace_back([this] { work(); });
+    work();
+    for (auto &t : pool)
+      t.join();
+    return !bad;
+  }
+};
+} // namespace
 
-        {  // the scratch goes before the text phase, where the output counts
-        const u32 ne = names.size();
-        // Sized once: a buffer that grows is remapped, which stalls every
-        // thread's page faults.
-        std::vector<u32> start(ne + 1), errors(ne);
-        std::unique_ptr<u32[]> latency(new u32[most]);  // not zeroed: only pages used count
-        for (int h; (h = claim++) < HOURS;) {
-            // Counting sort of the hour's latencies by endpoint rank: count into
-            // start[e + 1], prefix, then place each latency at its group's cursor.
-            std::fill(start.begin(), start.end(), 0);
-            std::fill(errors.begin(), errors.end(), 0);
-            for (auto& ps : parsers) ps.each(h, rank.data(), [&](u32 e, u32 err, u32) { ++start[e + 1], errors[e] += err != 0; });
-            for (u32 e = 0; e < ne; ++e) start[e + 1] += start[e];
-            std::vector<u32> cursor(start.begin(), start.end() - 1);
-            for (auto& ps : parsers) ps.each(h, rank.data(), [&](u32 e, u32, u32 l) { latency[cursor[e]++] = l; });
-            finished[h] = true;
-            if (!releasing.test_and_set()) {
-                for (auto& ps : parsers) ps.release(finished.data());
-                releasing.clear();
-            }
-
-            u64 size = 0;
-            for (u32 e = 0; e < ne; ++e) {
-                u32 n = start[e + 1] - start[e];
-                if (n == 0) continue;
-                // Nearest rank p is index ceil(p * n / 100) - 1. A selection
-                // leaves only larger values after its rank, so each higher rank
-                // is selected among those: half the group for p95, a twentieth
-                // for p99. (An equal rank is already in place.)
-                u32* a = latency.get() + start[e];
-                u32 r50 = (50 * n + 99) / 100 - 1, r95 = (95 * n + 99) / 100 - 1, r99 = (99 * n + 99) / 100 - 1;
-                for (u32 from = 0; u32 r : {r50, r95, r99})
-                    if (r >= from) select(a + from, n - from, r - from), from = r + 1;
-                const Line& l = lines[h].emplace_back(e, n, a[r50], a[r95], a[r99], errors[e]);
-                // Label, name, six numbers each after a space, newline.
-                size += 21 + names[e].size() + 7;
-                for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)}) size += width(x);
-            }
-            at[h] = size;
-        }
-        }
-        sized.arrive_and_wait();
-
-        for (int h; (h = claim_text++) < HOURS;) {
-            char label[32];
-            int day = (h + 18) / 24;
-            snprintf(label, sizeof label, "2026-%02d-%02dT%02d:00:00Z ", day < 2 ? 10 : 11, day < 2 ? 30 + day : day - 1, (h + 18) % 24);
-            char* o = text + at[h];
-            for (const Line& l : lines[h]) {
-                o = std::copy_n(label, 21, o);
-                o = std::copy(names[l.e].begin(), names[l.e].end(), o);
-                for (u32 x : {l.n, l.p50, l.p95, l.p99, l.errors, ppm(l)}) {
-                    *o++ = ' ';
-                    o = std::to_chars(o, o + 10, x).ptr;
-                }
-                *o++ = '\n';
-            }
-            std::vector<Line>().swap(lines[h]);
-        }
-    });
-    for (auto& th : pool) th.join();
-    close(out);
-    _exit(0);
+int main() {
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  const char *const dir = std::getenv("SD_DATA_DIR"),
+                    *const out = std::getenv("SD_OUT_DIR"),
+                    *const forced = std::getenv("SD_THREADS");
+  const int in = open(
+      (std::string(dir ? dir : "/data") + "/requests.log").c_str(), O_RDONLY);
+  const size_t bytes = in < 0 ? 0 : lseek(in, 0, SEEK_END);
+  // Zero pages follow the file so that the last lines can be scanned past its
+  // end.
+  char *map = static_cast<char *>(mmap(nullptr, bytes + 8192, PROT_READ,
+                                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  if (in < 0 || map == MAP_FAILED ||
+      (bytes && mmap(map, bytes, PROT_READ, MAP_PRIVATE | MAP_FIXED, in, 0) ==
+                    MAP_FAILED))
+    fail("map requests");
+  const int fd =
+      open((std::string(out ? out : "/out") + "/summary.txt").c_str(),
+           O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0)
+    fail("open summary");
+  cpu_set_t cpus{};
+  sched_getaffinity(0, sizeof cpus, &cpus);
+  const uint32_t threads = forced ? std::clamp(std::atoi(forced), 1, 12) : std::clamp(CPU_COUNT(&cpus), 1, 12);
+  if (!(new Job(map, bytes, kLag, fd, threads))->run()) {
+    if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET))
+      fail("rewind summary");
+    (new Job(map, bytes, kNever, fd, threads))->run();
+  }
+  _exit(0); // the kernel reclaims everything faster than free() does
 }
