@@ -279,3 +279,20 @@ Official CSR result: run-48d4d8968533, implementation f3c7439234d329268c7a211a77
 A complete fresh board read generated 2026-11-01 20:37:32 UTC (02:07:32 IST, November 2) verified Lex FIRST in Track D by K: Lex 30.722809 / 74.373046, SweetDreamsHalloween second 30.442281 / 74.173859, SweetDreams third 30.340046 / 74.100812. The observed lead is 0.280528 K. Retained source and build remain those evaluated at f3c7439; this follow-up records evidence only.
 
 Additional targeted validation passed optimized, ASan/UBSan and ThreadSanitizer at 1/4/12: 600-node directed chains totaling 2^32-2, 2^32-1, 2^32 and 5,990,000,000 (including bidirectional halves individually fitting u32), plus a 70,005-node skewed star with every vertex marked terminal and exact large/heavy two-edge paths. No Track A/B/C files were edited by this adaptation.
+
+
+## 2026-11-02: 75-point challenger, unique claims and final-ID packing
+
+Rollback source f3c7439 is first-place CSR. Its documentation-only rerun 789ebdb scored K=30.801549 / 74.428628, T=0.100098 s, M=60,833,792, S=634 (run-5817dbf0cd8d), improving the first 74.373046 result without source changes.
+
+Selected challenger: global atomic fetch-or claims with a read filter replace per-worker membership bitmaps; claims are monotone and each raw vertex has one region owner. Region base prefixes are computed before mapping, allowing final IDs to be written directly. The map stores three bytes per ID when final IDs fit 24 bits, with a four-byte fallback, checked allocation and padded safe loads. Unique ownership permits non-overlapping three-byte writes; all writes complete before remapping reads. Queue ring is 64 rather than 2048. Exhausted narrow probes with no overflow can report proven unreachable directly; finite results at/above UINT32_MAX and any overflow still trigger exact u64 retry. Standard joined worker phases reduce S relative to the persistent pool. AVX2, generator bytes, pinned build and twelve-worker seed-17 PGO are unchanged.
+
+39-way interleaved full-data trial medians: baseline 93.476 ms, 64-ring 91.061, atomic claims 91.816, direct u32 map 93.049, packed map/persistent pool 90.667, selected packed map/joined workers 89.585. Sampled peak anonymous KiB: baseline 56,312; selected 54,320. Canonical source estimate including unchanged build: baseline S=634, selected S=617. These are WSL proxies, not official axes.
+
+Fresh 41-round-per-seed confirmation: seed1 baseline/candidate medians 92.686/93.597 ms, selected wins 26/41 and median paired ratio 0.9820; seed17 93.433/90.518 ms, wins 25/41, ratio 0.9822. Absolute medians and paired ratios differ under scheduling variation; no gain is claimed solely from the initial 4% result. Lower source and sampled memory support an official complete-K trial.
+
+Rejected: construction caps 4/6/8 were slower (101.949/85.902/80.953 vs 77.920 ms baseline); shared retry label/queue caches did not lower the construction peak and were slower; non-PGO compilation was slower; shorter probes, additional prefetch hints and unconditional atomic claims did not establish better complete trade-offs. All timed public full outputs were checked byte-for-byte.
+
+Optimized PGO, ASan/UBSan and TSan pass public tiny/sample/full, 70 existing fixtures, 88 supplied differential cases, 60 u32-boundary cases, 30 lattice plus 30 contraction-shape cases, shuffled 70,004-node cycle, empty/single queries and exact large-u64 paths at 1/4/12 workers. A scratch forced-four-byte-map ASan/UBSan build passes the same suite. All four builds pass 600-node paths totaling UINT32_MAX-1 / UINT32_MAX / UINT32_MAX+1 / 5,990,000,000 and a 70,005-node skewed star with all vertices terminal and heavy edges. Sanitizers halt on error with no findings; program-lifetime leak checks and TSan exit grace sleep are disabled as previously documented.
+
+New official T/M/S/K/points/run ID pending. Only Track D source/documentation are included in this challenger.

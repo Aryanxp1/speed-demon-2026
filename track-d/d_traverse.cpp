@@ -1,13 +1,11 @@
 // Track D CSR engine adapted from the user-provided sd-td snapshot.
-// Lex retains its scoped persistent pool, AVX2 scanner and allocation guards.
+// Lex: unique vertex claims, packed final IDs, AVX2 and exact wide retry.
 #include <algorithm>
 #include <atomic>
-#include <barrier>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
-#include <functional>
 #include <immintrin.h>
 #include <numeric>
 #include <queue>
@@ -44,38 +42,13 @@ template <class T> T *alloc(size_t n) {
 }
 template <class T> void release(T *p, size_t n) { munmap(p, n * sizeof(T)); }
 
-struct PhasePool {
-  unsigned capacity;
-  std::barrier<> start, done;
-  std::function<void(unsigned)> job;
-  std::vector<std::thread> workers;
-  explicit PhasePool(unsigned n) : capacity(n), start(n), done(n) {
-    for (unsigned t = 1; t < n; ++t)
-      workers.emplace_back([this, t] {
-        for (;;) {
-          start.arrive_and_wait();
-          job(t);
-          done.arrive_and_wait();
-        }
-      });
-  }
-};
-// Main-thread phase executor; workers live until process exit. No scoped job
-// remains published after the completion barrier.
-static PhasePool *pool = nullptr;
-template <class F> static void parallel(unsigned threads, F &&f) {
-  if (!pool)
-    pool = new PhasePool(threads);
-  if (threads > pool->capacity)
-    std::abort();
-  pool->job = [&](unsigned t) {
-    if (t < threads)
-      f(t);
-  };
-  pool->start.arrive_and_wait();
-  pool->job(0);
-  pool->done.arrive_and_wait();
-  pool->job = {};
+template <class F> void parallel(unsigned threads, F f) {
+  std::vector<std::thread> pool;
+  for (unsigned t = 1; t < threads; ++t)
+    pool.emplace_back(f, t);
+  f(0);
+  for (auto &t : pool)
+    t.join();
 }
 
 // ---------------------------------------------------------------- parsing
@@ -338,22 +311,18 @@ struct Grower {
   };
   const Graph &raw;
   const Bits &bypass;
-  Bits &claimed, mine;
+  Bits &claimed;
   Region &reg;
   std::vector<Walk> walks;
-  u64 sink = 0;
 
-  // Claims race without locked instructions: a vertex claimed twice leaves a
-  // copy that no edge reaches, as every head resolves through one map entry.
-  // The private bitmap answers most checks, as a region mostly meets itself.
+  // A read filter avoids locked operations for already claimed vertices.
+  // The atomic bit test grants each raw vertex exactly one region owner.
   void claim(u32 z) {
     u64 bit = u64(1) << (z & 63), *word = &claimed[z >> 6];
-    if (mine[z >> 6] & bit)
+    if (__atomic_load_n(word, __ATOMIC_RELAXED) & bit)
       return;
-    mine[z >> 6] |= bit;
-    u64 seen = __atomic_load_n(word, __ATOMIC_RELAXED);
-    __atomic_store_n(seen & bit ? &sink : word, seen | bit, __ATOMIC_RELAXED);
-    reg.order[reg.len] = z, reg.len += !(seen & bit);
+    if (!(__atomic_fetch_or(word, bit, __ATOMIC_RELAXED) & bit))
+      reg.order[reg.len++] = z;
   }
   void put(u32 pos, u32 z, u64 w) {
     if (w >= raw.mask)
@@ -430,37 +399,47 @@ struct Grower {
 // concatenates them into the forward graph and renames the query endpoints.
 Graph *contract(Graph *raw, const Bits &bypass, unsigned threads,
                 std::vector<u32> &ends) {
-  u32 n = raw->n, m = raw->off[n], lbits = id_bits(n + 1);
+  u32 n = raw->n, m = raw->off[n];
   Bits claimed(bypass.size());
   std::vector<Region> regions(threads);
   parallel(threads, [&](unsigned t) {
     Region &reg = regions[t];
     reg.order = alloc<u32>(n), reg.ends = alloc<u32>(n),
     reg.out = alloc<u32>(m);
-    Grower grower{*raw, bypass, claimed, Bits(claimed.size()), reg};
+    Grower grower{*raw, bypass, claimed, reg};
     for (u32 x = cut(n, t, threads); x < cut(n, t + 1, threads); ++x)
       if (!test(bypass, x))
         grower.grow(x);
   });
   u32 wbits = raw->wbits, mask = raw->mask;
   delete raw;
-  // Raw id -> region << lbits | position. A vertex claimed twice is named by
-  // the entry that lands last, the same for every head.
-  u32 *where = alloc<u32>(n);
-  parallel(threads, [&](unsigned t) {
-    for (u32 i = 0; i < regions[t].len; ++i)
-      __atomic_store_n(&where[regions[t].order[i]], t << lbits | i,
-                       __ATOMIC_RELAXED);
-    release(regions[t].order, n);
-  });
+  // Compute final IDs before building the raw-to-final map.
   std::vector<u32> base(threads + 1, 0), edges(threads + 1, 0);
   for (unsigned t = 0; t < threads; ++t) {
     base[t + 1] = base[t] + regions[t].len;
     edges[t + 1] = edges[t] + regions[t].edges;
   }
-  auto locate = [&](u32 r) {
-    return base[r >> lbits] + (r & ((1u << lbits) - 1));
+  unsigned width = base[threads] <= (1u << 24) ? 3 : 4;
+  // Successful claims are unique, so packed map writes never overlap.
+  auto *where = alloc<unsigned char>(size_t(n) * width);
+  u32 idmask = width == 3 ? 0xffffffu : ~0u;
+  auto id = [&](u32 v) {
+    u32 x;
+    memcpy(&x, where + size_t(v) * width, 4);
+    return x & idmask;
   };
+  parallel(threads, [&](unsigned t) {
+    for (u32 i = 0; i < regions[t].len; ++i) {
+      u32 x = base[t] + i;
+      auto *p = where + size_t(regions[t].order[i]) * width;
+      if (width == 3) {
+        memcpy(p, &x, 2);
+        p[2] = x >> 16;
+      } else
+        memcpy(p, &x, 4);
+    }
+    release(regions[t].order, n);
+  });
   Graph *g = new Graph(base[threads], edges[threads]);
   std::vector<Escapes> escapes(threads);
   parallel(threads, [&](unsigned t) {
@@ -472,7 +451,7 @@ Graph *contract(Graph *raw, const Bits &bypass, unsigned threads,
       for (; pos < reg.ends[i]; ++pos) {
         u32 e = reg.out[pos], w = e & mask;
         u64 weight = w == mask ? esc++->second : w;
-        g->put(edges[t] + pos, locate(where[e >> wbits]), weight, escapes[t]);
+        g->put(edges[t] + pos, id(e >> wbits), weight, escapes[t]);
       }
     }
     release(reg.ends, n), release(reg.out, m);
@@ -480,8 +459,8 @@ Graph *contract(Graph *raw, const Bits &bypass, unsigned threads,
   g->off[g->n] = edges[threads];
   g->merge(escapes);
   for (u32 &v : ends)
-    v = locate(where[v]);
-  release(where, n);
+    v = id(v);
+  release(where, size_t(n) * width);
   return g;
 }
 
@@ -506,7 +485,7 @@ Graph *transpose(const Graph &g, unsigned threads) {
 // push always writes the entry but counts it only when `take`, so relaxations
 // need no branch.
 struct Queue {
-  static constexpr u32 B = 2048;
+  static constexpr u32 B = 64;
   struct Bucket {
     u32 *data = nullptr, size = 0, cap = 0;
   } bucket[B];
@@ -650,7 +629,7 @@ template <class L> struct Worker {
     while (fs < 256) {
       u64 f = fwd.queue.lower_bound(), known = fwd.dist.get(t);
       if (known < f || f == INF)
-        return known;
+        return f == INF && known == Labels<L>::NONE ? INF : known;
       fs += fwd.drain(bwd, best);
     }
     bwd.start(t);
@@ -702,7 +681,8 @@ int main() {
     for (size_t k; (k = next++) < queries;) {
       u32 i = by_source[k], s = ends[2 * i], t = ends[2 * i + 1];
       u64 d = narrow.solve(s, t);
-      if (narrow.fwd.wide || narrow.bwd.wide || d >= Labels<u32>::NONE) {
+      if (narrow.fwd.wide || narrow.bwd.wide ||
+          (d >= Labels<u32>::NONE && d < INF)) {
         if (!wide)
           wide = new Worker<u64>{Side<u64>(*fwd), Side<u64>(*rev)};
         d = wide->solve(s, t);
