@@ -113,18 +113,19 @@ static WORD: [bool; 256] = {
 /// The key of the token of len (at most 32) bytes at p: its bytes lowercased
 /// (OR-ing 0x20 lowercases letters and keeps digits) and zero padded.
 unsafe fn key(p: *const u8, len: usize) -> __m256i {
-    let order = _mm256_setr_epi64x(
-        0x0706050403020100,
-        0x0f0e0d0c0b0a0908,
-        0x1716151413121110,
-        0x1f1e1d1c1b1a1918,
-    );
-    _mm256_and_si256(
-        _mm256_or_si256(_mm256_loadu_si256(p.cast()), _mm256_set1_epi8(0x20)),
-        _mm256_cmpgt_epi8(_mm256_set1_epi8(len as i8), order),
-    )
+    static KEEP: [u8; 64] = {
+        let (mut k, mut i) = ([0; 64], 0);
+        while i < 32 {
+            (k[i], i) = (0xFF, i + 1);
+        }
+        k
+    };
+    let v = _mm256_or_si256(_mm256_loadu_si256(p.cast()), _mm256_set1_epi8(0x20));
+    _mm256_and_si256(v, _mm256_loadu_si256(KEEP.as_ptr().add(32 - len).cast()))
 }
 
+/// Twelve inline bytes avoid a separate key fetch for short words.
+/// Longer words retain full 32-byte equality checks.
 unsafe fn prefix(p: *const u8, len: usize) -> __m128i {
     static MASK: [u8; 32] = [
         255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0,
@@ -144,9 +145,16 @@ fn same(a: __m256i, b: __m256i) -> bool {
     unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) == -1 }
 }
 
-/// A SIMD word holds twelve exact bytes and an ID. Long entries use an
-/// eight-byte prefix and full-key index. Every hash/prefix collision is checked.
-struct Entries(*mut __m128i, usize);
+/// Exact short words and IDs share a 16-byte entry. Long entries hold an
+/// eight-byte prefix and a full-key index. Two entries are probed with AVX2;
+/// collisions always continue until full equality or the first empty slot.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct Entry {
+    prefix: [u8; 12],
+    id: u32,
+}
+struct Entries(*mut Entry, usize);
 unsafe impl Send for Entries {}
 unsafe impl Sync for Entries {}
 impl Entries {
@@ -163,7 +171,7 @@ impl Entries {
                 munmap(raw, before);
             }
             munmap((address + bytes) as *mut u8, align - before);
-            let ptr = address as *mut __m128i;
+            let ptr = address as *mut Entry;
             madvise(ptr.cast(), bytes, 14);
             madvise(ptr.cast(), bytes, 23);
             prctl(41, 1u64, 0u64, 0u64, 0u64);
@@ -172,13 +180,13 @@ impl Entries {
     }
 }
 impl std::ops::Deref for Entries {
-    type Target = [__m128i];
-    fn deref(&self) -> &[__m128i] {
+    type Target = [Entry];
+    fn deref(&self) -> &[Entry] {
         unsafe { std::slice::from_raw_parts(self.0, self.1) }
     }
 }
 impl std::ops::DerefMut for Entries {
-    fn deref_mut(&mut self) -> &mut [__m128i] {
+    fn deref_mut(&mut self) -> &mut [Entry] {
         unsafe { std::slice::from_raw_parts_mut(self.0, self.1) }
     }
 }
@@ -202,8 +210,7 @@ impl Terms {
             return self.n as u32;
         }
         let at = self.locate(t);
-        ((unsafe { _mm_extract_epi32::<3>(self.entries[at]) as u32 } & 0x7fffffff).wrapping_sub(1))
-            .min(self.n as u32)
+        ((self.entries[at].id & 0x7fffffff).wrapping_sub(1)).min(self.n as u32)
     }
     fn locate(&self, t: Token) -> usize {
         let (k, h, p, len) = t;
@@ -218,17 +225,20 @@ impl Terms {
                 let mut candidates = ((m & (m >> 1) & ((m >> 2) | longmask)) | (m >> 3)) & 0x11;
                 while candidates != 0 {
                     let at = i + (candidates.trailing_zeros() / 4) as usize;
-                    let e = *self.entries.get_unchecked(at);
-                    let id = _mm_extract_epi32::<3>(e) as u32;
-                    if id == 0 {
+                    let e = self.entries.get_unchecked(at);
+                    if e.id == 0 {
                         return at;
                     }
                     if if len <= 12 {
-                        id >> 31 == 0
+                        e.id >> 31 == 0
                     } else {
-                        id >> 31 != 0
+                        e.id >> 31 != 0
                             && same(
-                                *self.long.get_unchecked(_mm_extract_epi32::<2>(e) as usize),
+                                *self
+                                    .long
+                                    .get_unchecked(u32::from_le_bytes(
+                                        e.prefix[8..12].try_into().unwrap(),
+                                    ) as usize),
                                 key(p as *const u8, len),
                             )
                     } {
@@ -241,16 +251,8 @@ impl Terms {
         }
     }
     fn renumber(&mut self, new: &[u32]) {
-        unsafe {
-            for e in self.entries.iter_mut() {
-                let id = _mm_extract_epi32::<3>(*e) as u32;
-                if id != 0 {
-                    *e = _mm_insert_epi32::<3>(
-                        *e,
-                        ((id & 0x80000000) | (new[(id & 0x7fffffff) as usize - 1] + 1)) as i32,
-                    );
-                }
-            }
+        for e in self.entries.iter_mut().filter(|e| e.id != 0) {
+            e.id = (e.id & 0x80000000) | (new[(e.id & 0x7fffffff) as usize - 1] + 1);
         }
     }
 
@@ -259,19 +261,22 @@ impl Terms {
         let k = unsafe { prefix(term.as_ptr(), term.len()) };
         let h = prefix_hash(k);
         let at = self.locate((k, h, term.as_ptr() as usize, term.len()));
-        let old = unsafe { _mm_extract_epi32::<3>(self.entries[at]) as u32 };
+        let old = self.entries[at].id;
         if old != 0 {
             return (old & 0x7fffffff) - 1;
         }
-        let (k, flag) = if term.len() > 12 {
-            let full = unsafe { key(term.as_ptr(), term.len()) };
-            let k = unsafe { _mm_insert_epi32::<2>(k, self.long.len() as i32) };
-            self.long.push(full);
-            (k, 1u32 << 31)
+        let mut bytes: [u8; 16] = unsafe { std::mem::transmute(k) };
+        let flag = if term.len() > 12 {
+            bytes[8..12].copy_from_slice(&(self.long.len() as u32).to_le_bytes());
+            self.long.push(unsafe { key(term.as_ptr(), term.len()) });
+            1 << 31
         } else {
-            (k, 0)
+            0
         };
-        self.entries[at] = unsafe { _mm_insert_epi32::<3>(k, (flag | (self.n as u32 + 1)) as i32) };
+        self.entries[at] = Entry {
+            prefix: bytes[..12].try_into().unwrap(),
+            id: flag | (self.n as u32 + 1),
+        };
         self.n += 1;
         self.n as u32 - 1
     }
