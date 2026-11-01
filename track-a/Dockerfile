@@ -8,7 +8,7 @@ FROM gcc:16@sha256:43978d7710a803d1c3d32f4117c1528ec7285a4ce2c0a51e982ec1a6e3d87
 WORKDIR /src
 COPY main.cpp .
 COPY --from=training /training /training
-RUN flags='-std=c++20 -O3 -march=native -fno-exceptions -fno-rtti -fomit-frame-pointer -static -pthread' \
+RUN flags='-std=c++20 -O3 -march=native -fno-exceptions -fno-rtti -fomit-frame-pointer -fno-peel-loops -static -pthread' \
  && g++ $flags -fprofile-generate=/tmp/profile -fprofile-update=atomic -o /ingest main.cpp \
  && mkdir -p /training/out \
  && SD_DATA_DIR=/training/seed37 SD_OUT_DIR=/training/out /ingest \
