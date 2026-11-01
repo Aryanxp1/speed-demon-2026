@@ -22,7 +22,7 @@
 #include <vector>
 
 namespace {
-constexpr uint32_t kHours = 72, kIds = 2048, kBlock = 256 << 10, kStreams = 4;
+constexpr uint32_t kHours = 72, kIds = 2048, kBlock = 768 << 10, kStreams = 4;
 constexpr uint32_t kLag = 2, kNever = 1000, kKeep = 2;
 constexpr uint32_t kMaxLine = 178, kRunCap = kBlock / 40 + 16, kPartCap = kIds * 256;
 const char *const kDays[] = {"2026-10-30", "2026-10-31", "2026-11-01",
@@ -552,7 +552,7 @@ struct Job {
   }
 
   // Finalizes hours once they are safe and otherwise parses blocks, but never
-  // more than two per worker past the oldest unfinished one.
+  // more than one per worker past the oldest unfinished one.
   void work() {
     const auto local = std::make_unique<Local>();
     std::unique_lock<std::mutex> lock(mu);
@@ -563,7 +563,7 @@ struct Job {
         lock.unlock();
         finalize(hour);
         lock.lock();
-      } else if (next_block < nblocks && next_block < watermark + 2 * threads) {
+      } else if (next_block < nblocks && next_block < watermark + threads) {
         const uint32_t block = next_block++;
         lock.unlock();
         parse(*local, block);
@@ -616,11 +616,11 @@ int main() {
     fail("open summary");
   cpu_set_t cpus{};
   sched_getaffinity(0, sizeof cpus, &cpus);
-  const uint32_t threads = forced ? std::clamp(std::atoi(forced), 1, 12) : std::clamp(CPU_COUNT(&cpus), 1, 12);
+  const uint32_t threads = forced ? std::clamp(std::atoi(forced), 1, 12) : std::clamp(CPU_COUNT(&cpus), 1, 6);
   if (!(new Job(map, bytes, kLag, fd, threads))->run()) {
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET))
       fail("rewind summary");
     (new Job(map, bytes, kNever, fd, threads))->run();
   }
-  std::exit(0); // Flushes counters in the instrumented training build.
+  _exit(0); // the kernel reclaims everything faster than free() does
 }

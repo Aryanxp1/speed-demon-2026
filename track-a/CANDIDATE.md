@@ -1,6 +1,6 @@
 # Track A candidate — November 1, 2026
 
-Historical validation of the November 1 baseline. The November 2 optimization and its official evaluation are recorded in [PERF.md](PERF.md); the current percentile implementation and offline profile-guided build are described in [README.md](README.md).
+Historical validation of the November 1 baseline. The November 2 experiments and their official evaluations are recorded in [PERF.md](PERF.md); the current parser settings and build are described in [README.md](README.md).
 
 Status: activated in `main.cpp` after the user confirmed that Antigravity is assigned only to Track C. The static build was repeated after activation and the full seed-1 output hash matched. Earlier concurrent restoration was observed, but its cause is unknown.
 
