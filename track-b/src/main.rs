@@ -15,7 +15,7 @@ const ANONYMOUS: i32 = 0x4022;
 const HUGE_PAGE: usize = 1 << 21;
 const CLAIM: usize = 1 << 18;
 
-const PHASE_CLAIMS: usize = 64;
+const PHASE_CLAIMS: usize = 200;
 
 const HEADER: usize = 1;
 
