@@ -59,3 +59,10 @@ Researched grouped SIMD hashing (https://abseil.io/about/design/swisstables), pa
 Randomized alternating, launch-inclusive WSL comparisons with affinity CPUs 0-11 and all output bytes checked: 27-run baseline median 22.072 ms versus combined candidate 20.928 ms; subsequent 41-run baseline 22.787 ms versus candidate 21.473 ms (5.8% faster). Local machine is i7-12700H/GCC 15.2; these are not board timings. Memory structures and capacities are unchanged. Rejected aligned totals, AES hashing, prechecking bitmap bits, larger/smaller work pieces, sixteen-slot probe groups, fewer workers, and direct first-bit counting with lock BTS; the BTS combination was slower than the retained challenger. Original source and experimental variants are preserved outside the submission in /home/aryan/lex-c-80.
 
 Official evaluation pending. The requested approximately 80 points has not yet been confirmed. Only Track C is changed; concurrent Track D work is excluded from staging.
+
+
+### First official result and smaller follow-up
+
+`run-1a9beab954da`, implementation `2c9f85b`: all gates passed; T=0.031880 s, M=10,342,400 bytes, S=328, D=1, K=36.798488, **78.291499 points**. Previous best remains 78.469422 at 0.033112 s / 9,134,080 bytes / 323 lines. The wider probe is removed: its runtime gain did not compensate for the official memory/source costs.
+
+Retained follow-up uses the original four-slot probing and the four-record pipeline. Removed forced loop unrolling from the Docker build; ordinary O3 retains the compiler's normal profitability choices. A randomized 41-run comparison checked every output: original median 24.470 ms, original without forced unrolling 23.804 ms, four-record pipeline with forced unrolling 23.955 ms, four-record pipeline without forced unrolling 23.061 ms. O2 and LTO did not beat it. No change to memory layout or hash representation. The preceding candidate passed AddressSanitizer on full input, repeated stored-reference tests, and fresh tiny seeds 7/81/311/2026. Further official evaluation pending; approximately 80 points is still not confirmed.
