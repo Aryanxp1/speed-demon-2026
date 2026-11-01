@@ -26,14 +26,14 @@ const BUCKETS: usize = 1 << 15;
 const BUCKET_SLOTS: usize = 7;
 const ID_BLOCK: usize = 32;
 const MAX_TERMS: usize = BUCKETS * BUCKET_SLOTS + 64 * ID_BLOCK;
-const AHEAD: usize = 20;
+const AHEAD: usize = 8;
 const HEAVY: u32 = 1 << 31;
 const OVERFLOW: u32 = 1 << 30;
 const ANCHOR: u32 = 1 << 29;
 const MAX_HEAVY: usize = 4096;
 const SHARDS: usize = 64;
 const DOC_BITS: u32 = 18;
-const CHUNK: usize = 64;
+const CHUNK: usize = 128;
 const QUERY_BATCH: usize = 64;
 
 const WORKSPACE: usize = 32 << 20;
