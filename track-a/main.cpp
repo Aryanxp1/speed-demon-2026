@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <malloc.h>
 #include <memory>
 #include <mutex>
 #include <sched.h>
@@ -160,23 +161,50 @@ void multiselect(int32_t *a, int32_t *b, uint32_t lo, uint32_t hi,
       out[i] = sorted[k[i] - lo];
     return;
   }
-  if (depth <= 40) {
-    const int32_t x = a[lo], y = a[lo + (hi - lo) / 2], z = a[hi - 1];
-    int32_t pivot = std::max(std::min(x, y), std::min(std::max(x, y), z));
-    uint32_t cut = lo + split(a, b, lo, hi, pivot);
-    if (cut > lo) {
-      const int left = std::lower_bound(k, k + nk, cut) - k;
-      if (left)
-        multiselect(b, a, lo, cut, k, left, out, depth + 1);
-      if (left < nk)
-        multiselect(b, a, cut, hi, k + left, nk - left, out + left, depth + 1);
+  if (depth > 40) {
+    std::sort(a + lo, a + hi);
+    for (int i = 0; i < nk; ++i)
+      out[i] = a[k[i]];
+    return;
+  }
+  const int32_t x = a[lo], y = a[lo + (hi - lo) / 2], z = a[hi - 1];
+  int32_t pivot = std::max(std::min(x, y), std::min(std::max(x, y), z));
+  uint32_t cut = lo + split(a, b, lo, hi, pivot);
+  if (cut == lo) { // pivot is the minimum: peel off its duplicates
+    if (pivot == INT32_MAX) {
+      std::fill(out, out + nk, pivot);
       return;
     }
+    cut = lo + split(a, b, lo, hi, pivot + 1);
+    for (int i = 0; i < nk && k[i] < cut; ++i)
+      out[i] = pivot;
+    if (cut == hi)
+      return;
+    int done = std::lower_bound(k, k + nk, cut) - k;
+    if (done < nk)
+      multiselect(b, a, cut, hi, k + done, nk - done, out + done, depth + 1);
+    return;
   }
-  std::sort(a + lo, a + hi);
-  for (int i = 0; i < nk; ++i)
-    out[i] = a[k[i]];
+  const int left = std::lower_bound(k, k + nk, cut) - k;
+  if (left)
+    multiselect(b, a, lo, cut, k, left, out, depth + 1);
+  if (left < nk)
+    multiselect(b, a, cut, hi, k + left, nk - left, out + left, depth + 1);
 }
+
+// Dictionary inserts are tiny and bursty at startup, so waiters spin instead of
+// sleeping.
+struct SpinLock {
+  std::atomic_flag held = ATOMIC_FLAG_INIT;
+  void lock() {
+    for (int i = 0; held.test_and_set(std::memory_order_acquire); ++i)
+      if (i < 64)
+        _mm_pause();
+      else
+        sched_yield();
+  }
+  void unlock() { held.clear(std::memory_order_release); }
+};
 
 // Exact endpoint dictionary. The global part is an append-only log (key image,
 // length, fingerprint) behind a lock whose size is published with a release
@@ -189,7 +217,7 @@ struct Names {
   uint32_t len[kIds]{}, hash[kIds]{};
   std::atomic<uint32_t> size{0};
   std::vector<uint16_t> sorted; // ids in byte order of their names (under mu)
-  std::mutex mu;
+  SpinLock mu;
 
   bool same(uint32_t id, const char *ep, uint32_t n) const {
     auto eq = [&](int i) {
@@ -229,7 +257,7 @@ struct Local { // one worker's private open-addressing view of the dictionary
     sync(names);
     if (const int id = lookup(names, ep, n, h); id >= 0)
       return id;
-    std::lock_guard<std::mutex> lock(names.mu);
+    std::lock_guard<SpinLock> lock(names.mu);
     sync(names); // another worker may have published it meanwhile
     if (const int id = lookup(names, ep, n, h); id >= 0)
       return id;
@@ -270,9 +298,24 @@ struct Stream {
   Rec **at = nullptr;
 };
 
-inline char *put(char *out, uint32_t v) {
+// The eight decimal digits of v < 10^8 as bytes 0..9, most significant first.
+uint64_t digits_of(uint32_t v) {
+  uint64_t x = v / 10000 | uint64_t{v % 10000} << 32;
+  uint64_t q = (x * 5243 >> 19) & 0x0000007f0000007f;
+  x = q | (x - q * 100) << 16;
+  q = (x * 103 >> 10) & 0x000f000f000f000f;
+  return q | (x - q * 10) << 8;
+}
+// Appends a space and v; 16 bytes of slack must follow.
+__attribute__((always_inline)) inline char *put(char *out, uint32_t v) {
   *out++ = ' ';
-  return std::to_chars(out, out + 10, v).ptr;
+  if (v >= 100000000)
+    return std::to_chars(out, out + 10, v).ptr;
+  const uint64_t d = digits_of(v);
+  const uint32_t skip = __builtin_ctzll(d | uint64_t{1} << 56) / 8;
+  const uint64_t text = (d + 0x3030303030303030) >> 8 * skip;
+  std::memcpy(out, &text, 8);
+  return out + 8 - skip;
 }
 
 struct Job {
@@ -294,12 +337,14 @@ struct Job {
   bool writing = false;
   std::atomic<size_t> zapped{0}; // 4 MiB steps of the mapping released
   std::vector<Rec *> runbufs;    // free buffers, guarded by mu
-  std::vector<std::vector<int32_t>> latbufs;
-  std::vector<std::unique_ptr<char[]>> outbufs;
 
   Job(const char *b, size_t n, uint32_t l, int f, uint32_t t)
       : base(b), size(n), lag(l), nblocks((n + kBlock - 1) / kBlock),
         threads(t), fd(f), top(nblocks, -1) {}
+  ~Job() {
+    for (Rec *r : runbufs)
+      std::free(r);
+  }
 
   template <class T> T take(std::vector<T> &pool) {
     std::lock_guard<std::mutex> lock(mu);
@@ -411,7 +456,7 @@ struct Job {
     {
       std::lock_guard<std::mutex> lock(mu);
       mine.swap(runs[hour]);
-      std::lock_guard<std::mutex> names_lock(names.mu);
+      std::lock_guard<SpinLock> names_lock(names.mu);
       order = names.sorted;
     }
     uint32_t count[2 * kIds] = {}, pos[kIds],
@@ -428,7 +473,7 @@ struct Job {
       live[seen] = id;
       seen += n != 0;
     }
-    std::vector<int32_t> lat = take(latbufs);
+    std::vector<int32_t> lat;
     lat.reserve(1 << 17);
     lat.resize(total + 16);
     for (const auto &[rec, n] : mine)
@@ -436,9 +481,7 @@ struct Job {
         lat[pos[rec[i].tag % kIds]++] = rec[i].lat ^ 0x80000000;
 
     static thread_local std::vector<int32_t> scratch;
-    std::unique_ptr<char[]> text = take(outbufs);
-    if (!text)
-      text.reset(new char[kPartCap + 256]);
+    std::unique_ptr<char[]> text(new char[kPartCap + 256]);
     char *out = text.get(), label[22];
     std::snprintf(label, sizeof label, "%sT%02u:00:00Z ",
                   kDays[(hour + 18) / 24], (hour + 18) % 24);
@@ -467,7 +510,6 @@ struct Job {
     const size_t length = out - text.get();
     {
       std::lock_guard<std::mutex> lock(mu);
-      latbufs.push_back(std::move(lat));
       for (const auto &[rec, n] : mine)
         runbufs.push_back(rec);
     }
@@ -496,10 +538,6 @@ struct Job {
       sync_file_range(fd, end[written], part.second, SYNC_FILE_RANGE_WRITE);
       if (written >= kKeep)
         posix_fadvise(fd, 0, end[written - kKeep + 1], POSIX_FADV_DONTNEED);
-      {
-        std::lock_guard<std::mutex> pool_lock(mu);
-        outbufs.push_back(std::move(part.first));
-      }
       lock.lock();
     }
     writing = false;
@@ -554,6 +592,7 @@ struct Job {
 
 int main() {
   prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+  mallopt(M_MMAP_THRESHOLD, 128 << 10);
   const char *const dir = std::getenv("SD_DATA_DIR"),
                     *const out = std::getenv("SD_OUT_DIR"),
                     *const forced = std::getenv("SD_THREADS");

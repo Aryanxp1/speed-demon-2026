@@ -4,9 +4,11 @@ Zero-dependency C++20 implementation. Reads `/data/requests.log`, writes `/out/s
 
 ## Approach
 
-The mapped log is split into 256 KiB line-aligned blocks with bounded lookahead. Each worker parses four interleaved streams using SIMD separator scans and integer latency decoding, filing six-byte records by hour. Private endpoint tables mirror an append-only shared dictionary; every match compares endpoint bytes exactly. A standard mutex serializes dictionary inserts.
+The mapped log is split into 256 KiB line-aligned blocks with bounded lookahead. Each worker parses four interleaved streams using SIMD separator scans and integer latency decoding, filing six-byte records by hour. Private endpoint tables mirror an append-only shared dictionary; every match compares endpoint bytes exactly.
 
-Once the completed input prefix advances sufficiently, workers finalize an hour with counting scatter and exact nearest-rank p50/p95/p99 selection. AVX2 partitions find multiple ranks together, with bitonic sorting for small groups and a full-sort fallback for degenerate partitions. Standard integer formatting emits the exact numbers. Completed hours are written in order. If any record arrives after its hour was finalized, the program truncates the output and reruns without early finalization, preserving correctness for arbitrary input ordering.
+Once the completed input prefix advances sufficiently, workers finalize an hour with counting scatter and exact nearest-rank p50/p95/p99 selection. AVX2 partitions find multiple ranks together, with bitonic sorting for small groups. Completed hours are formatted and written in order. If any record arrives after its hour was finalized, the program truncates the output and reruns without early finalization, preserving correctness for arbitrary input ordering.
+
+Each completed hour releases its scatter buffer and output text instead of retaining them in process-wide pools. A fixed allocator threshold keeps large allocations separately mapped so their pages can be returned promptly. Parsed record buffers remain reusable.
 
 Transparent huge pages are disabled and workers are capped at twelve. Input pages are released during the final work; output writeback and cache advice are best effort. The process exits after all workers join and writes complete.
 
