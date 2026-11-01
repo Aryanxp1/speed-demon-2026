@@ -24,9 +24,11 @@ inline void pop_share(void* p, size_t n, int t, int nt) {
 }
 const char* map_file(const char* path, size_t& size) {
   int fd = open(path, O_RDONLY);
+  (fd < 0) ? _exit(1) : (void)0;
   size = lseek(fd, 0, SEEK_END);
   auto* p = (char*)mmap(0, size + 4096, 1, 0x22, -1, 0);
-  return mmap(p, size, 1, 0x12, fd, 0), close(fd), p;
+  (size && mmap(p, size, 1, 0x12, fd, 0) == (void*)-1) ? _exit(1) : (void)0;
+  return close(fd), p;
 }
 
 inline u64 money(const char* s, const char* e) {
@@ -179,16 +181,18 @@ int main(int argc, char** argv) {
   cpu_set_t cpus;
   sched_getaffinity(0, sizeof(cpus), &cpus);
   int nt = std::clamp(CPU_COUNT(&cpus), 1, 12);
-  const char *reg_file = argv[1], *rec_file = argv[2], *out_file = argv[3];
-  size_t rsize, size;
+  const char *reg_file = argc > 1 ? argv[1] : "/data/regions.csv",
+             *rec_file = argc > 2 ? argv[2] : "/data/records.csv",
+             *out_file = argc > 3 ? argv[3] : "/out/aggregates.txt";
+  size_t rsize = 0, size = 0;
   const char *regions = map_file(reg_file, rsize), *records = map_file(rec_file, size);
   const char* last = (const char*)memrchr(regions, '\n', rsize - 1) + 1;
   size_t nreg = atoll(last) + 1;
   u8* country_of = zeroed(u8, nreg + 1);
   size_t roff = strchr(regions, '\n') - regions + 1;
   auto rcut = split(regions, roff, rsize, nt, "\n", 1);
-  std::atomic<u8> present[1 << 15]{};
-  u8 index_of[1 << 15]{};
+  std::vector<std::atomic<u8>> present(1 << 15);
+  std::array<u8, 1 << 15> index_of{};
   std::vector<u32> codes;
   auto number_countries = [&]() noexcept {
     if (codes.empty())
@@ -199,7 +203,7 @@ int main(int argc, char** argv) {
   size_t start = size ? (char*)memchr(records, '\n', size) - records + 1 : 0;
   const int pieces = 8 * nt;
   auto cut = split(records, start, size, pieces, "\r\n", 2);
-  Totals totals[12][256]{};
+  std::vector<std::array<Totals, 256>> totals(nt);
   NameTable names;
   std::atomic<u64>* seen_bits = zeroed(std::atomic<u64>, 256 * WORDS);
   std::atomic<int> claim{0};
@@ -218,17 +222,17 @@ int main(int argc, char** argv) {
     sync.arrive_and_wait();
     for (int k; (k = claim++) < pieces;) {
       parse_records(records + cut[k], records + cut[k + 1], records + size,
-                    country_of, nreg, names, seen_bits, totals[t]);
+                    country_of, nreg, names, seen_bits, totals[t].data());
     }
     sync.arrive_and_wait();
     for (u32 c = t; c <= codes.size(); c += nt)
       for (u32 w = 0; w < WORDS; ++w) totals[t][c].distinct += __builtin_popcountll(seen_bits[c * WORDS + w]);
   };
 
-  std::thread pool[12];
-  for (int t = 1; t < nt; ++t) pool[t] = std::thread(worker, t);
+  std::vector<std::thread> pool;
+  for (int t = 1; t < nt; ++t) pool.emplace_back(worker, t);
   worker(0);
-  for (int t = 1; t < nt; ++t) pool[t].join();
+  for (auto& th : pool) th.join();
 
   char buf[65536], *o = buf;
   auto put_u = [&](u64 v) { *o++ = ' ', o = std::to_chars(o, o + 32, v).ptr; };
