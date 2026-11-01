@@ -56,16 +56,16 @@ template <class T> struct Array : std::unique_ptr<T, MappingDelete> {
 
 struct PhasePool {
   unsigned capacity;
-  std::barrier<> gate;
+  std::barrier<> start, done;
   std::function<void(unsigned)> job;
   std::vector<std::thread> workers;
-  explicit PhasePool(unsigned n) : capacity(n), gate(n) {
+  explicit PhasePool(unsigned n) : capacity(n), start(n), done(n) {
     for (unsigned t = 1; t < n; ++t)
       workers.emplace_back([this, t] {
         for (;;) {
-          gate.arrive_and_wait();
+          start.arrive_and_wait();
           job(t);
-          gate.arrive_and_wait();
+          done.arrive_and_wait();
         }
       });
   }
@@ -82,9 +82,9 @@ template <class F> static void parallel(unsigned threads, F &&f) {
     if (t < threads)
       f(t);
   };
-  pool->gate.arrive_and_wait();
+  pool->start.arrive_and_wait();
   pool->job(0);
-  pool->gate.arrive_and_wait();
+  pool->done.arrive_and_wait();
   pool->job = {};
 }
 
