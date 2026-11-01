@@ -113,9 +113,11 @@ static WORD: [bool; 256] = {
 /// The key of the token of len (at most 32) bytes at p: its bytes lowercased
 /// (OR-ing 0x20 lowercases letters and keeps digits) and zero padded.
 unsafe fn key(p: *const u8, len: usize) -> __m256i {
-    let order = _mm256_setr_epi8(
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28, 29, 30, 31,
+    let order = _mm256_setr_epi64x(
+        0x0706050403020100,
+        0x0f0e0d0c0b0a0908,
+        0x1716151413121110,
+        0x1f1e1d1c1b1a1918,
     );
     _mm256_and_si256(
         _mm256_or_si256(_mm256_loadu_si256(p.cast()), _mm256_set1_epi8(0x20)),
