@@ -81,7 +81,6 @@ struct Run {
 
     parsed: Vec<AtomicU32>,
 
-    sealed: AtomicUsize,
     early: bool,
     dirty: AtomicBool,
     next_hour: AtomicUsize,
@@ -134,8 +133,8 @@ impl Run {
             }
 
             let (mut key, mut low, mut high) = (u64::MAX, HOURS, 0);
-            let (mut owned, mut skip) = ([0u8; HOURS], false);
-            for start in (claim..(claim + CLAIM).min(self.len)).step_by(BLOCK) {
+            let mut owned = [false; HOURS];
+            'blocks: for start in (claim..(claim + CLAIM).min(self.len)).step_by(BLOCK) {
                 let newline = _mm256_set1_epi8(b'\n' as i8);
                 let (mut count, mut at) = (0, start);
                 while at < (start + BLOCK).min(self.len) {
@@ -158,22 +157,16 @@ impl Run {
                             (day * 24 + (clock >> 24 & 15) * 10 + (clock >> 32 & 15) - 18) as usize;
                         cursor = cursors[hour];
                         (low, high) = (low.min(hour), high.max(hour));
-                        if owned[hour] == 0 {
-                            owned[hour] = if self.active[hour]
+                        if !owned[hour] {
+                            if self.active[hour]
                                 .try_update(AcqRel, Acquire, |n| (n < SEALED).then_some(n + 1))
-                                .is_ok()
+                                .is_err()
                             {
-                                1
-                            } else {
-                                2
-                            };
+                                self.dirty.store(true, Relaxed);
+                                break 'blocks;
+                            }
+                            owned[hour] = true;
                         }
-                        skip = owned[hour] == 2;
-                    }
-                    if skip {
-                        self.dirty.store(true, Relaxed);
-                        line = end.add(1);
-                        continue;
                     }
 
                     let method = spaces_in(read(line.add(28))).trailing_zeros() as usize / 8;
@@ -214,7 +207,7 @@ impl Run {
             }
 
             for (state, &held) in self.active.iter().zip(&owned) {
-                if held == 1 {
+                if held {
                     state.fetch_sub(1, Release);
                 }
             }
@@ -234,18 +227,14 @@ impl Run {
             self.dirty.fetch_or((info >> 8 & 255) + 1 < top, Relaxed);
             top = top.max((info & 255) * self.early as usize);
         }
-        for hour in self.sealed.load(Acquire)..sealed {
-            match self.active[hour].compare_exchange(0, SEALED, AcqRel, Acquire) {
-                Ok(_) => {}
-                Err(SEALED) => {}
-                Err(_) => break,
-            }
-            self.sealed.fetch_max(hour + 1, Release);
+        let hour = self.next_hour.load(Relaxed);
+        if hour >= sealed {
+            return;
         }
-        let sealed = |hour| (hour < self.sealed.load(Acquire)).then_some(hour + 1);
-        let Ok(hour) = self.next_hour.try_update(Relaxed, Relaxed, sealed) else {
+        let Ok(_) = self.active[hour].compare_exchange(0, SEALED, AcqRel, Acquire) else {
             return;
         };
+        self.next_hour.store(hour + 1, Relaxed);
 
         let order = {
             let names = self.names.lock().unwrap();
@@ -462,7 +451,6 @@ fn solve(early: bool, data: &str, out: &str) -> bool {
         claimed: [const { AtomicUsize::new(0) }; HOURS],
         order: Mutex::default(),
         parsed: (0..len.div_ceil(CLAIM)).map(|_| 0.into()).collect(),
-        sealed: AtomicUsize::new(0),
         early,
         dirty: AtomicBool::new(false),
         next_hour: AtomicUsize::new(0),
