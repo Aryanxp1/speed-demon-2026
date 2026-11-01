@@ -8,20 +8,16 @@ extern "C" {
     fn _exit(status: i32) -> !;
 }
 
-const HUGE_PAGE: usize = 1 << 21;
-const MAX_RECORDS: usize = 32 * 64 / 11 + 5;
-const NAME_MASK: u64 = (1 << 17) - 1;
-const SEEN_WORDS: usize = 1 << 11;
 const BIAS: i64 = 1 << 40;
 
 static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static REGION_GROUP: [AtomicU8; 1_000_001] = [const { AtomicU8::new(0) }; 1_000_001];
-static LETTERS: [OnceLock<u8>; 26 * 26 * 26] = [const { OnceLock::new() }; 26 * 26 * 26];
+static LETTERS: [OnceLock<u8>; 17576] = [const { OnceLock::new() }; 17576];
 static TOTALS: Mutex<[[i64; 8]; 256]> = Mutex::new([[0; 8]; 256]);
 static COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 #[repr(C)]
-struct Tables([[AtomicU64; 8]; 1 << 15], [AtomicU64; 256 * SEEN_WORDS]);
+struct Tables([[AtomicU64; 8]; 1 << 15], [AtomicU64; 524288]);
 
 struct Run(&'static [u8], &'static [u8], &'static Tables, Barrier);
 
@@ -67,8 +63,8 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
     (_mm_cvtsi128_si64(mixed) as u64 | 1, quotes)
 }
 
-fn take_block(counter: &AtomicUsize, size: usize, len: usize) -> Option<usize> {
-    Some(counter.fetch_add(size, Relaxed)).filter(|&at| at < len)
+fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
+    Some(c.fetch_add(s, Relaxed)).filter(|&a| a < len)
 }
 
 impl Run {
@@ -84,7 +80,7 @@ impl Run {
         });
         match low | high << 4 {
             0 => self.insert(index, tag, spare),
-            f => (bucket[f.trailing_zeros() as usize].load(Relaxed) & NAME_MASK) as usize,
+            f => (bucket[f.trailing_zeros() as usize].load(Relaxed) & 0x1FFFF) as usize,
         }
     }
 
@@ -105,7 +101,7 @@ impl Run {
                 }
             }
             if h >> 17 == tag {
-                return (h & NAME_MASK) as usize;
+                return (h & 0x1FFFF) as usize;
             }
         }
         unreachable!()
@@ -117,7 +113,7 @@ impl Run {
             scope.spawn(move || unsafe { self.start(scope, share - 1) });
             descendants -= share;
         }
-        let page = NEXT[2].fetch_add(1, Relaxed) * HUGE_PAGE;
+        let page = NEXT[2].fetch_add(1, Relaxed) << 21;
         if page < size_of::<Tables>() {
             (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
         }
@@ -145,11 +141,11 @@ impl Run {
         prctl(41, 1usize, 0usize, 0usize, 0usize);
         let (input, len) = (self.0.as_ptr() as *mut u8, self.0.len());
         let mut stats = [[0i64; 8]; 256];
-        let mut pos = [0u32; MAX_RECORDS * 5];
+        let mut pos = [0u32; 191 * 5];
         let mut quotes = [(0u64, 0u32); 1024];
-        let [mut hashes, mut lengths] = [[0u64; MAX_RECORDS]; 2];
-        let (mut signs, mut spare) = ([0i64; MAX_RECORDS], 0..0);
-        let (mut digits, mut numbers) = ([[0u64; MAX_RECORDS]; 3], [[0u32; MAX_RECORDS]; 3]);
+        let [mut hashes, mut lengths] = [[0u64; 191]; 2];
+        let (mut signs, mut spare) = ([0i64; 191], 0..0);
+        let (mut digits, mut numbers) = ([[0u64; 191]; 3], [[0u32; 191]; 3]);
         let ones = _mm_set1_epi8(-1);
 
         while let Some(claim) = take_block(&NEXT[1], 1 << 20, len) {
@@ -236,7 +232,7 @@ impl Run {
                     s[4] = s[4].max(BIAS + amount);
                     s[5] = s[5].max(BIAS - amount);
                     let name = self.intern(hashes[at], &mut spare);
-                    let word = group * SEEN_WORDS + name / 64;
+                    let word = (group << 11) + name / 64;
                     _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
                     hashes[at] = (word << 6 | name % 64) as u64;
                 }
@@ -271,8 +267,8 @@ unsafe fn map(path: &str) -> &'static [u8] {
 }
 
 unsafe fn zeroed<T>() -> &'static T {
-    let r = mmap(null_mut(), size_of::<T>() + HUGE_PAGE, 3, 0x4022, -1, 0);
-    let a = r.add(r.align_offset(HUGE_PAGE));
+    let r = mmap(null_mut(), size_of::<T>() + (1 << 21), 3, 0x4022, -1, 0);
+    let a = r.add(r.align_offset(1 << 21));
     madvise(a, size_of::<T>(), 14);
     &*a.cast()
 }
@@ -293,7 +289,7 @@ fn main() {
     let mut out_str = String::with_capacity(32768);
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
-        let row = &run.2 .1[group * SEEN_WORDS..][..SEEN_WORDS];
+        let row = &run.2 .1[group * 2048..][..2048];
         let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
         let [sum, min, max] =
             [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
