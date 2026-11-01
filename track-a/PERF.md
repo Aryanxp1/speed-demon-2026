@@ -167,6 +167,18 @@ The actual final candidate passes all 16 differential datasets at 1/4/12 workers
 
 Four-buffer-cache `6307074`, `run-cc6bce34f916`: 84.454079 points, K=48.874415, T=0.017477 s, M=20,414,464 bytes, S=579, D=1. All gates passed. This is the closest candidate: lower official memory than the standing best, but the time sample was slower. A follow-up removes the four-line `Job` destructor: jobs are allocated with `new` and never deleted, and normal success uses `_exit`, so the destructor is unused. The intended runtime behavior, four-buffer limit and allocator settings are unchanged, with four fewer canonical source lines. Timing variation remains a factor; the follow-up is accepted only if official K beats the standing best.
 
-Four-buffer-cache/dead-code follow-up official result: pending.
+Four-buffer-cache/dead-code follow-up `216d284`, `run-653387d104bf`: 83.699489 points, K=47.205194, T=0.018795 s, M=20,357,120 bytes, S=575, D=1. All gates passed. This C++ experiment is superseded by the explicit user request to combine the earlier Rust code with Thor.
 
 The canonical C++ count returns to 568. Local static builds before and after destructor removal have byte-identical `.text` sections, and the full seed-1 output hash still matches. This is a source-axis improvement with the same executed machine code locally; no new timing gain is attributed to removing the destructor.
+
+## November 2: user-requested Rust merge with Thor
+
+Source: C:/Users/aryan/OneDrive/Videos/Thor/thor/track-a, combined with earlier Team Lex Rust behavior from 1f1e6df. The provided log reports 86.17 points at run-478de8bfb446; that belongs to the supplied source, not this merge. Replaced the active C++ file with one Rust implementation, keeping old C++ source/builds in Git history and local snapshots.
+
+Adapted streaming claims, newline-first SIMD parsing, escaped four-byte rows, in-place hour radix sorting and parallel ordered writes. Retained exact endpoint identity from the Rust base: hashes filter candidates, padded name bytes decide equality. Added per-hour active-claim leases so early reclamation cannot race a parser; late records are skipped in that pass and force the complete exact rerun. Kept input/output compatibility and capped workers at twelve. Removed unnecessary source comments. No crates added; pinned static offline Rust build.
+
+Verification: 16 byte-exact reference datasets at 1/4/12 workers, all 16 under AddressSanitizer at 1/12 workers, endpoint lengths 1..125, latency boundaries, dense and reordered inputs, and forced endpoint-hash collisions. Full SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Nine randomized interleaved full-data rounds, CPUs 0..11, checked every timed hash: earlier Rust 27.488 ms, supplied Thor 15.804 ms, merged exact implementation 18.805 ms. These are local launch-inclusive timings, not official scores. Warnings-denied release builds pass. Actual offline Cargo build and official evaluation follow.
+
+Rust/Thor merge official result: pending.
+
+Final packaging: the actual offline Cargo release build passes and produces a stripped static-PIE executable with the expected full hash. The selected source has no unnecessary comments. No Track C or D files are included in this change.

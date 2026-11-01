@@ -1,3 +1,5 @@
+Historical C++ candidate; the active user-requested Rust merge is described in README.md and the latest PERF.md entry.
+
 # Track A candidate — November 1, 2026
 
 Historical validation of the November 1 baseline. The November 2 experiments and their official evaluations are recorded in [PERF.md](PERF.md); the current parser settings and build are described in [README.md](README.md).

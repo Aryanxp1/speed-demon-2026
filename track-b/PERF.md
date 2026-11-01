@@ -348,3 +348,15 @@ Follow-up: represent each existing 16-byte entry directly as a SIMD word, removi
 
 
 Official follow-up 9e634fc: run-31d37b81345d, all gates passed; T=0.170788 s, M=46,698,496 bytes, S=761, D=1, K=28.542919, points=72.774920. The local simplification did not improve the scoring-box result. Restored src/main.rs byte-for-byte to aaf7e2a (Rust best 73.817646). The packed byte-index constant at 251f10e was queued but is superseded by this restoration. Build recipe and manifests remain unchanged from the passing Rust submission. No Track A/C/D files changed.
+
+## November 2: user-requested Rust merge with Thor
+
+Source: C:/Users/aryan/OneDrive/Videos/Thor/thor/track-b, combined with the active Team Lex Rust base from aaf7e2a. The supplied log reports 78.57 points at run-97ec79f353b0 and 78.58 at run-82b2e3580122; these are provenance, not results for this merge.
+
+Adapted phased indexing, paired VAES hashing, token batches, transposed 64-document heavy bitmaps, sorted sparse postings, futex coordination and phased tallies. Preserved exact matching from the Rust base using three inline short keys per cache-line bucket, with full normalized-word checks for longer terms. Fingerprint collisions and overflow chains never substitute for equality. Phrase hashes are followed by exact word comparisons. Query publication uses release/acquire ordering and the shared Boolean-use flag is atomic. Density-dependent phase sizing preserves u16 offsets. Input/output compatibility, pinned offline static build and twelve-worker cap remain. No crates added. Removed unnecessary source comments.
+
+Verification: 24 reference datasets at 1/4/12 CPU affinities and all 24 under AddressSanitizer, including token boundaries, Unicode separators, dense results, left-to-right operators and CRC collisions. An independent fixture covers every one/two-character alphanumeric key, leading zeros, case folding and random 3..9-byte keys. Forced dictionary and phrase hash collisions pass. Full SHA-256 remains f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927. Plain whole-word verification and a lossless short-hash prototype did not preserve enough of Thor's local speed advantage; the selected version reuses the earlier Rust inline-key idea. Local timings are diagnostic; official K decides the points. Warnings-denied release builds pass. Actual offline Cargo build and official evaluation follow.
+
+Rust/Thor merge official result: pending.
+
+Final selected comparison, nine randomized interleaved full-data rounds on CPUs 0..11 with every hash checked: earlier Rust 120.511 ms, supplied Thor 71.520 ms, initial whole-word guard 115.953 ms, selected inline-key merge 100.681 ms (16.45% below the earlier Rust in that round). The earlier lossless-hash and plain guarded-lookup variants were not retained. The actual offline Cargo release build passes and produces a stripped static executable with the expected full hash. Final source contains no unnecessary comments. No Track C or D files are included in this change.
