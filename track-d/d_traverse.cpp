@@ -33,35 +33,25 @@ static void set(Bits &bits, u32 v) { bits[v >> 6] |= u64(1) << (v & 63); }
 
 // Uninitialized, lazily faulted storage, so memory is committed only where it
 // is written.
-template <class T> struct Array {
-  T *p = nullptr;
+struct MappingDelete {
   size_t bytes = 0;
+  void operator()(void *p) const { munmap(p, bytes); }
+};
+template <class T> struct Array : std::unique_ptr<T, MappingDelete> {
+  using Base = std::unique_ptr<T, MappingDelete>;
   Array() = default;
-  explicit Array(size_t n, bool sparse = false) : bytes(n * sizeof(T) + 64) {
-    void *q = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (q == MAP_FAILED)
+  explicit Array(size_t n, bool sparse = false)
+      : Base(static_cast<T *>(mmap(nullptr, n * sizeof(T) + 64,
+                                   PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)),
+             MappingDelete{n * sizeof(T) + 64}) {
+    if (this->get() == MAP_FAILED)
       fail("mmap");
-    p = static_cast<T *>(q);
-    // Partly used arrays would round up to whole huge pages.
     if (sparse)
-      madvise(q, bytes, MADV_NOHUGEPAGE);
+      madvise(this->get(), n * sizeof(T) + 64, MADV_NOHUGEPAGE);
   }
-  Array(Array &&o) noexcept : p(o.p), bytes(o.bytes) { o.p = nullptr; }
-  Array &operator=(Array &&o) noexcept {
-    release();
-    std::swap(p, o.p);
-    bytes = o.bytes;
-    return *this;
-  }
-  ~Array() { release(); }
-  void release() {
-    if (p)
-      munmap(p, bytes);
-    p = nullptr;
-  }
-  T &operator[](size_t i) { return p[i]; }
-  const T &operator[](size_t i) const { return p[i]; }
+  void release() { this->reset(); }
+  T &operator[](size_t i) const { return this->get()[i]; }
 };
 
 template <class F> static void parallel(unsigned threads, F &&f) {
@@ -171,10 +161,12 @@ using Run = std::pair<const Entry *, u32>;
 
 // One thread's edges partitioned by u >> shift into short chunk runs, so each
 // bucket can be built in cache.
+static constexpr size_t BIN_GROUP = 16;
 class alignas(64) Binner { // aligned for the same reason as Region
   static constexpr u32 CHUNK = 256;
-  Array<Entry> pool_;
-  size_t used_ = 0;
+  size_t stride_;
+  Array<unsigned char> pool_;
+  std::vector<size_t> used_;
   std::vector<Entry *> fill_, limit_;
   std::vector<std::vector<Run>> runs_;
   std::vector<std::pair<const Entry *, u32>> heavy_;
@@ -187,15 +179,20 @@ class alignas(64) Binner { // aligned for the same reason as Region
 
 public:
   Binner(unsigned shift, unsigned bits, size_t buckets, size_t edges)
-      : pool_(edges + (buckets + 1) * CHUNK, true), fill_(buckets),
+      : stride_(((edges + (BIN_GROUP + 1) * CHUNK) * sizeof(Entry) + 4095) &
+                ~size_t(4095)),
+        pool_(stride_ * ((buckets + BIN_GROUP - 1) / BIN_GROUP), true),
+        used_((buckets + BIN_GROUP - 1) / BIN_GROUP), fill_(buckets),
         limit_(buckets), runs_(buckets), shift_(shift), bits_(bits) {}
   void add(u32 u, u32 v, u32 w) {
     size_t b = u >> shift_;
     if (fill_[b] == limit_[b]) {
       close(b);
-      fill_[b] = pool_.p + used_;
+      size_t g = b / BIN_GROUP;
+      fill_[b] =
+          reinterpret_cast<Entry *>(pool_.get() + g * stride_) + used_[g];
       limit_[b] = fill_[b] + CHUNK;
-      used_ += CHUNK;
+      used_[g] += CHUNK;
     }
     if (w >= 0xFFFF)
       heavy_.push_back({fill_[b], w});
@@ -215,6 +212,11 @@ public:
     return std::lower_bound(heavy_.begin(), heavy_.end(),
                             std::make_pair(&e, 0u))
         ->second;
+  }
+  void reclaim(size_t g) {
+    if (used_[g])
+      madvise(pool_.get() + g * stride_,
+              (used_[g] * sizeof(Entry) + 4095) & ~size_t(4095), MADV_DONTNEED);
   }
   template <class F> void each(size_t b, F &&f) const {
     for (const Run &r : runs_[b])
@@ -302,7 +304,7 @@ struct Rows {
 
 // Builds the raw rows one tail bucket at a time in cache and marks bypassable
 // vertices: out-degree <= 2 and not a query endpoint.
-static void fill_rows(const std::vector<Binner> &bins, unsigned shift,
+static void fill_rows(std::vector<Binner> &bins, unsigned shift,
                       const Bits &terminal, Rows &raw, Bits &bypass,
                       unsigned threads) {
   size_t buckets = (size_t(raw.n) + (size_t(1) << shift) - 1) >> shift;
@@ -312,23 +314,29 @@ static void fill_rows(const std::vector<Binner> &bins, unsigned shift,
   parallel(threads, [&](unsigned t) {
     std::vector<u32> degree(size_t(1) << shift), placed(size_t(1) << shift);
     Rows::Cursor cursor;
-    for (size_t b; (b = next.fetch_add(1)) < buckets;) {
-      u32 lo = u32(b << shift),
-          hi = u32(std::min<size_t>(raw.n, lo + (size_t(1) << shift)));
-      std::fill(degree.begin(), degree.end(), 0);
-      std::fill(placed.begin(), placed.end(), 0);
-      for (const Binner &bin : bins)
-        bin.each(b, [&](const Entry &e) { ++degree[e.key >> bits]; });
-      for (u32 u = lo; u < hi; ++u) {
-        raw.open(u, degree[u - lo], cursor);
-        if (degree[u - lo] <= 2 && !test(terminal, u))
-          set(bypass, u); // buckets are word aligned
+    for (size_t g;
+         (g = next.fetch_add(1)) < (buckets + BIN_GROUP - 1) / BIN_GROUP;) {
+      for (size_t b = g * BIN_GROUP; b < std::min(buckets, (g + 1) * BIN_GROUP);
+           ++b) {
+        u32 lo = u32(b << shift),
+            hi = u32(std::min<size_t>(raw.n, lo + (size_t(1) << shift)));
+        std::fill(degree.begin(), degree.end(), 0);
+        std::fill(placed.begin(), placed.end(), 0);
+        for (const Binner &bin : bins)
+          bin.each(b, [&](const Entry &e) { ++degree[e.key >> bits]; });
+        for (u32 u = lo; u < hi; ++u) {
+          raw.open(u, degree[u - lo], cursor);
+          if (degree[u - lo] <= 2 && !test(terminal, u))
+            set(bypass, u); // buckets are word aligned
+        }
+        for (const Binner &bin : bins)
+          bin.each(b, [&](const Entry &e) {
+            u32 x = e.key >> bits, v = e.key & ((u32(1) << bits) - 1);
+            raw.put(raw.at(lo + x, placed[x]++), v, bin.weight(e), escapes[t]);
+          });
       }
-      for (const Binner &bin : bins)
-        bin.each(b, [&](const Entry &e) {
-          u32 x = e.key >> bits, v = e.key & ((u32(1) << bits) - 1);
-          raw.put(raw.at(lo + x, placed[x]++), v, bin.weight(e), escapes[t]);
-        });
+      for (Binner &bin : bins)
+        bin.reclaim(g);
     }
   });
   merge(raw.escapes, escapes);
