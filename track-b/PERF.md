@@ -305,3 +305,12 @@ The final source comparison replaces the parallel query parse/interner/copy phas
 Local evidence is mixed: representative 31-pair medians selected parallel 110.904 ms, serial with atomic interning 113.346 ms, serial with plain interning 113.126 ms. Another comparison: 116.353 versus 119.305 ms. Locally formatted code approximation falls by 26 lines. This is not a claimed speed or K gain; official measurement is needed because the scoring host's six SMT cores can rank coordination costs differently. Source is retained only if the board confirms a higher K. Baseline rollback remains 9dc2aee.
 
 Serial candidate passes optimized, ASan+UBSan and TSan on all 23 datasets at 1/4/12 workers, including the constructed CRC collision, empty inputs and token/phrase boundaries. None of the failed dictionary-capacity or input-release experiments is included. Only Track B changed; 75 remains unconfirmed.
+
+
+## Retained result: 73.996964 points
+
+Official serial-query result run-558160697e76, implementation 6efd846: all gates pass; T=0.166030 s, M=41,324,544 bytes, S=664, D=1, K=29.901146, 73.784391 points. Its source reduction did not compensate for slower execution. Restore source and Dockerfile byte-for-byte to 9dc2aee, the best measured C++ implementation.
+
+Retained official result: run-b5cf222b8139, K=30.195296, **73.996964 points**, T=0.160806 s, M=41,443,328 bytes, S=692, D=1. Every gate passed. The incoming verified best was 73.103392 points; improvement is 0.893572 points. The user's 75-point target has NOT been achieved. Retain exact dictionary equality and the verified best source instead of a slower speculative replacement.
+
+Restoration requires no new algorithm test: the code/build are identical to the evaluated 9dc2aee implementation, whose activated source passed all 23 datasets at 1/4/12 and environment-only invocation, with core optimized/ASan+UBSan/TSan verification and the deliberate CRC-collision test. Other tracks' source/builds are untouched by these commits. Experiments and raw timings remain outside the submission under /home/aryan/lex-b-75-next and the corresponding Windows Temp directory. Follow-up documentation records results only; no claim of 75+ or an unverified leaderboard rank is made.

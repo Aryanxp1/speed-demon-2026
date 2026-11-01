@@ -175,16 +175,18 @@ struct Dictionary {
   // Thread-safe: a slot is claimed by compare-and-swap, then its ID published.
   u32 intern(const char *p, u64 key, u32 &next) {
     for (u32 i = hash_of(key), j = 0;; j = (j + 1) % 4, i += !j) {
-      auto &b = buckets[i & mask()];
-      if (!b.key[j]) {
-        u32 id = next++;
-        words[id] = p;
-        b.key[j] = key;
-        b.meta[j] = id;
+      Bucket &b = buckets[i & mask()];
+      atomic_ref<u64> slot(b.key[j]), meta(b.meta[j]);
+      u64 seen = slot.load(memory_order_acquire), id;
+      if (!seen && slot.compare_exchange_strong(seen, key)) {
+        words[id = next++] = p;
+        meta.store(id, memory_order_release);
         return id;
       }
-      if (b.key[j] == key && (key >> 62 != 2 || same(b.meta[j], p)))
-        return b.meta[j];
+      while (seen == key && !(id = meta.load(memory_order_acquire)))
+        ;
+      if (seen == key && (key >> 62 != 2 || same(id, p)))
+        return id;
     }
   }
 };
@@ -240,57 +242,85 @@ struct Engine {
 
   // Threads parse line-aligned parts of the query file, then intern their
   // terms concurrently into a table sized for the term count.
-  void parse(const char *q, size_t size, u32) {
-    u32 occurrences = 0;
-    for (const char *p = q, *end = q + size, *eol; p < end; p = eol + 1) {
-      eol = (const char *)memchr(p, '\n', end - p);
-      if (!eol)
-        eol = end;
-      u32 spaces = count(p, eol, ' ');
-      occurrences += *p == 'B' ? (spaces + 1) / 2 : spaces;
-    }
-    if (occurrences >= 1 << 20)
-      fail("too many query terms");
-    dict.buckets.resize(bit_ceil(occurrences / 4 + 1024));
-    dict.words.resize(occurrences + 1);
-    u32 next = 1;
-    vector<u32> e(512);
-    for (const char *p = q, *end = q + size, *eol; p < end;
-         p = eol + 1, ++queries) {
-      eol = (const char *)memchr(p, '\n', end - p);
-      if (!eol)
-        eol = end;
-      if (e.size() < size_t(eol - p) + 72)
-        e.resize(eol - p + 72);
-      u32 n = edges(p, eol - p, e.data()) / 2, is_bool = n > 1 && *p == 'B';
-      if (n < 2 || n > (is_bool ? 12 : 9) || (is_bool && n % 2))
-        fail("invalid query");
-      auto term = [&](u32 i) {
-        const char *at = p + e[2 * i];
-        u64 key = key_of(at, e[2 * i + 1] - e[2 * i]);
-        if (!key)
-          fail("invalid query term");
-        return dict.intern(at, key, next);
-      };
-      if (is_bool) {
-        Bool b{queries, n / 2};
-        for (u32 i = 1; i < n; ++i)
-          i % 2 ? b.term[i / 2] = term(i) : b.op[i / 2 - 1] = p[e[2 * i]];
-        b.shape = b.n;
-        for (char op : b.op)
-          b.shape = b.shape << 2 | (op & 3);
-        bools.push_back(b);
-      } else {
-        Phrase f{queries, n - 1};
-        for (u32 i = 1; i < n; ++i)
-          f.term[i - 1] = term(i);
-        phrases.push_back(f);
+  void parse(const char *q, size_t size, u32 workers) {
+    struct Part {
+      vector<Bool> bools;
+      vector<Phrase> phrases;
+      vector<const char *> at;
+      vector<u64> keys;
+      u32 lines = 0;
+    };
+    vector<Part> parts(workers);
+    parallel(workers, [&](u32 t) {
+      Part &w = parts[t];
+      vector<u32> e(512);
+      const char *p = line_at(q, size, size * t / workers),
+                 *end = line_at(q, size, size * (t + 1) / workers), *eol;
+      w.at.reserve((end - p) / 2), w.keys.reserve((end - p) / 2);
+      w.bools.reserve((end - p) / 7), w.phrases.reserve((end - p) / 7);
+      for (; p < end; p = eol + 1, w.lines++) {
+        eol = (const char *)memchr(p, '\n', end - p);
+        eol = eol ? eol : end;
+        if (e.size() < size_t(eol - p) + 72)
+          e.resize(eol - p + 72);
+        u32 n = edges(p, eol - p, e.data()) / 2, is_bool = n > 1 && *p == 'B';
+        if (n < 2 || n > (is_bool ? 12 : 9) || (is_bool && n % 2))
+          fail("invalid query");
+        auto term = [&](u32 i) {
+          w.at.push_back(p + e[2 * i]);
+          w.keys.push_back(key_of(w.at.back(), e[2 * i + 1] - e[2 * i]));
+          if (!w.keys.back())
+            fail("invalid query term");
+          return w.at.size() - 1;
+        };
+        if (is_bool) {
+          Bool &b = w.bools.emplace_back(Bool{w.lines, n / 2});
+          for (u32 i = 1; i < n; i++)
+            i % 2 ? b.term[i / 2] = term(i) : b.op[i / 2 - 1] = p[e[2 * i]];
+          b.shape = b.n;
+          for (char op : b.op)
+            b.shape = b.shape << 2 | (op & 3);
+        } else {
+          Phrase &f = w.phrases.emplace_back(Phrase{w.lines, n - 1});
+          for (u32 i = 1; i < n; i++)
+            f.term[i - 1] = term(i);
+        }
       }
+    });
+    // Each part numbers its new terms from its own first ID, and its plans
+    // start at its own offsets.
+    vector<u32> first_id(workers + 1, 1), nb(workers + 1), np(workers + 1),
+        nq(workers + 1);
+    for (u32 t = 0; t < workers; t++) {
+      first_id[t + 1] = first_id[t] + parts[t].at.size();
+      nb[t + 1] = nb[t] + parts[t].bools.size();
+      np[t + 1] = np[t] + parts[t].phrases.size();
+      nq[t + 1] = nq[t] + parts[t].lines;
     }
-    dict.words.resize(next);
-    first.reset(new First[queries]);
-    bound.reset(new atomic<u32>[queries]);
-    for (u32 q = 0; q < queries; ++q)
+    if (first_id[workers] >= 1 << 20)
+      fail("too many query terms");
+    dict.buckets.resize(bit_ceil(first_id[workers] / 4 + 1024));
+    dict.words.resize(first_id[workers]);
+    bools.resize(nb[workers]), phrases.resize(np[workers]);
+    queries = nq[workers];
+    parallel(workers, [&](u32 t) {
+      Part &w = parts[t];
+      for (size_t i = 0; i < w.at.size(); i++) {
+        if (i + 16 < w.at.size())
+          dict.prefetch(w.keys[i + 16]);
+        w.keys[i] = dict.intern(w.at[i], w.keys[i], first_id[t]);
+      }
+      auto place = [&](auto &all, auto &part, u32 at) {
+        for (auto &x : part) {
+          for (u32 i = 0; i < x.n; i++)
+            x.term[i] = w.keys[x.term[i]];
+          x.query += nq[t], all[at++] = x;
+        }
+      };
+      place(bools, w.bools, nb[t]), place(phrases, w.phrases, np[t]);
+    });
+    first.reset(new First[queries]), bound.reset(new atomic<u32>[queries]);
+    for (u32 q = 0; q < queries; q++)
       bound[q].store(~0u, memory_order_relaxed);
   }
 
