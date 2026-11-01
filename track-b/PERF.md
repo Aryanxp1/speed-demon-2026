@@ -265,3 +265,8 @@ A 17-run randomized comparison favored retained working arrays (141.020 ms versu
 ### Confirmed 73+ result
 
 Official board `run-00d2156ded87`, implementation commit `4a879b90598763b219293970b0511aa6c787f268`, completed 2026-11-01 06:28:51 UTC: **73.006619 points**, K=28.849108, T=0.174186 s, M=47,599,616 bytes, S=647, D=1. All check/build/correctness/timeout/sandbox gates passed. This meets the latest requested 73+ Track B target. The preceding architecture adaptation scored 72.796357; the previous implementation's best was 71.327156. Only Track B source/documentation were changed; A/C/D were not edited. The retained-buffer follow-up passed the five stored and six fresh reference sets, all targeted regressions including a four-byte one-document corpus, the sanitizer cases, and an activated offline warnings-denied release build reproducing the full output hash. Local conditional-resize experiments did not show enough additional gain to replace this evaluated implementation.
+
+
+### Official highest Track B result
+
+Official board `run-237d62c0cf7c`, implementation commit `2c9f85b`: **73.103392 points**, **K=28.977962**, T=0.172813 s, M=47,480,832 bytes (47.48 MB), S=647, D=1. All check/build/correctness/timeout/sandbox gates passed. This establishes the retained Team Lex record on Track B.

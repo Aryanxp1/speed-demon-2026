@@ -19,4 +19,4 @@ None. The Rust standard library, `std::arch` intrinsics, and `mmap` and `mallopt
 
 ## Validation and measurements
 
-Official best: **73.006619 points**, run `run-00d2156ded87`, implementation `4a879b9`; all gates passed. See [PERF.md](PERF.md) for experiments and official board results. Local comparisons validate exact bytes against the Python reference; local launch-inclusive timings and sampled anonymous RSS are distinct from the board's execution time and cgroup memory measurements.
+Official best: **73.103392 points**, run `run-237d62c0cf7c`, implementation `2c9f85b`; all gates passed. See [PERF.md](PERF.md) for experiments and official board results. Local comparisons validate exact bytes against the Python reference; local launch-inclusive timings and sampled anonymous RSS are distinct from the board's execution time and cgroup memory measurements.

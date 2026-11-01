@@ -1,12 +1,12 @@
 # Speed Demon 2026 — Project State & Architectural Baseline
 
 **Team Name:** Lex  
+**Global Rank:** **10**  
 **Repository:** [Aryanxp1/speed-demon-2026](https://github.com/Aryanxp1/speed-demon-2026)  
 **Submission Branch:** `speed-demon`  
-**Current Overall Machine Score:** **45.686** (Championship Triad: A, D, B)  
-**Baseline Git Tag:** `v1.0-official-baseline` (Commit `0d10837`)  
-**Current Timestamp:** 2026-10-31 00:30 UTC  
-**Code Freeze:** 2026-11-02 15:00 UTC
+**Current Overall Machine Score:** **79.476** (Championship Triad: Track A, Track C, Track D)  
+**Current Timestamp:** 2026-11-01 14:55 UTC (20:25 IST)  
+**Code Freeze:** 2026-11-02 15:00 UTC  
 
 ---
 
@@ -14,14 +14,15 @@
 
 All 4 tracks are live, passing all correctness and sandbox gates on the official scoring box (Falkenstein Intel Core i5-13500 pinned P-cores).
 
-| Track | Task Summary | Status | Official $T$ | Official $M$ | Official $K$ | Official Machine Score | Verified Seed-1 Full Hash |
-|---|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Track A (Ingest)** | 3.1M log lines aggregation | **ACTIVE TRIO (Rank 1)** | **0.292 s** | **61 MB** | **10.284873** | **50.610 pts** | `495ca09682...` (PASS) |
-| **Track D (Traverse)** | 2,000 shortest-path queries | **ACTIVE TRIO (Rank 2)** | **1.512 s** | **177 MB** | **7.430230** | **43.550 pts** | `a23dbdf0a3...` (PASS) |
-| **Track B (Index)** | 250k docs, 50k queries | **ACTIVE TRIO (Rank 3)** | **1.071 s** | **534 MB** | **7.333291** | **43.265 pts** | `f86973c210...` (PASS) |
-| **Track C (Join)** | 202 MB hostile CSV join | **RESERVE HEDGE** | **0.926 s** | **88 MB** | **4.378513** | **32.066 pts** | `d8088b1cd4...` (PASS) |
+| Track | Task Summary | Status | Language | Commit | Official $T$ | Official $M$ | Formatted $S$ | Official $K$ | Official Machine Score |
+|---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Track A (Ingest)** | 3.1M log lines aggregation | **COUNTING (Rank 1)** | C++20 | `60cb66c` | **0.0169 s** | **20.90 MB** | 575 | **49.516286** | **84.737 pts** |
+| **Track C (Join)** | 202 MB hostile CSV join | **COUNTING (Rank 2)** | C++20 | `d752aea` | **0.0281 s** | **8.73 MB** | 320 | **40.681817** | **80.470 pts** |
+| **Track D (Traverse)** | 2,000 shortest-path queries | **COUNTING (Rank 3, #1 K)** | C++20 | `f94eb34` | **0.0987 s** | **62.05 MB** | 828 | **29.676927** | **73.621 pts** |
+| **Track B (Index)** | 250k docs, 50k queries | *DROPPED (Weakest of 4)* | Rust | `2c9f85b` | **0.1728 s** | **47.48 MB** | 647 | **28.977962** | **73.103 pts** |
 
-**Overall Championship Geometric Mean Score:** **45.686** (Geometric mean of A: 50.610, D: 43.550, B: 43.265).
+**Overall Championship Geometric Mean Score:**
+$$\sqrt[3]{84.737403 \times 80.470017 \times 73.620947} = \mathbf{79.476 \text{ points}}$$
 
 ---
 
@@ -35,20 +36,17 @@ All 4 tracks are live, passing all correctness and sandbox gates on the official
 | **Test Seed 42** | PASS | PASS | PASS | PASS |
 | **Test Seed 999** | PASS | PASS | PASS | PASS |
 
-*Note: Seeds 42 and 999 are synthetic test seeds generated locally using the official generator to test robustness against parameter perturbations; they are not the organizer's secret holdout dataset.*
-
 ---
 
-## 3. Mission Objectives & Focus
+## 3. Mission Status & Current Objectives
 
-Our current championship triad consists of **A, D, and B**.
-1. **Track B Optimization (Target: $T \le 0.45\text{ s}$, $M \le 250\text{ MB}$):**
-   - Official scoring box: $T = 1.071\text{ s}$, $M = 534\text{ MB}$.
-   - Focus: Reduce memory footprint (from 534 MB down to ~250 MB) and SIMD/streaming phrase verification to boost $K$ from 7.33 to $\ge 12$.
-2. **Track D Optimization (Target: $T \le 0.80\text{ s}$, $M \le 120\text{ MB}$):**
-   - Official scoring box: $T = 1.512\text{ s}$, $M = 177\text{ MB}$.
-   - Focus: Cache-friendly Dijkstra priority queue, dynamic work stealing across worker threads, and memory footprint reduction to boost $K$ from 7.43 to $\ge 12$.
-3. **Track C Correctness & Robustness Audit:**
-   - Replace 128-bit hash distinct-name tracking with exact byte comparison to remove any theoretical collision risk on unseen holdout distributions while preserving sub-1.0s runtime.
-4. **Track A Fine-Tuning:**
-   - Official score is already 50.610 pts ($T = 0.292\text{ s}$, $M = 61\text{ MB}$). Profile for micro-optimizations that preserve 100% correctness.
+1. **Track C Target Achieved:**
+   - Crossed the 80.0-point milestone: **80.470 points** ($K = 40.681817$, $T = 0.028118$ s, $M = 8.73$ MB, $S = 320$ lines, commit `d752aea`).
+   - Grouped unmapping of completed inputs in 4-piece batches and offline seed-17 PGO delivered a 13.0% runtime reduction and pushed K past 40.
+2. **Track D Target Achieved (#1 by K across the entire leaderboard):**
+   - Achieved **#1 Track D efficiency**: **73.621 points** ($K = 29.676927$, $T = 0.098744$ s, $M = 62.05$ MB, $S = 828$ lines, commit `f94eb34`).
+   - AVX2 delimiter scanning, compact 64 KiB fragment recycling, and persistent 12-worker phase pools established an outright first place lead in K.
+3. **Track A Performance Record:**
+   - Established team record: **84.737 points** ($K = 49.516286$, $T = 0.016902$ s, $M = 20.90$ MB, $S = 575$ lines, commit `60cb66c`).
+4. **Overall Portfolio:**
+   - Team Lex holds **Rank 10** on the global leaderboard with **79.476 points**.

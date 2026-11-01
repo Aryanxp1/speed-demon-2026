@@ -101,6 +101,7 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | 0ee3487 | run-0ee3487c8434 | 0.0269 | 19.6 | 43.01 | 81.68 | Step 10: single scratch sizing, 64-byte AVX2 |
 | ebcf5b8 | run-ebcf5b81097e | 0.0260 | 18.8 | 43.96 | 82.16 | Step 11: non-zeroed scratch, bit-length width |
 | d8cd3fe | run-99025cc8bb53 | 0.0258 | 19.2 | 44.26 | 82.30 | Team Lex: Step 11 lock-free arena + _exit(0) |
+| 60cb66c | run-6e5a4c297a13 | 0.0169 | 20.9 | 49.52 | 84.74 | Step 12: streaming design, AVX2 multi-rank percentile selection |
 
 
 ## November 1: user-supplied sd-ta architecture adaptation
@@ -108,3 +109,8 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 Activated the user-supplied streaming design in main.cpp: bounded block lookahead, four interleaved streams, private exact endpoint lookup mirrors, AVX2 multi-rank percentile selection, bitonic leaves, and exact rerun for late records. Disabled transparent huge pages and capped worker overrides/defaults to 1..12 for the scoring host. Fixed compiler warnings. This is an adaptation of the supplied snapshot, not an independently invented implementation.
 
 21 alternating WSL full-input runs: original median 17.922 ms, adapted 14.886 ms (16.9% faster). Separate tmpfs-output comparison: 18.121 versus 15.244 ms (15.9% faster). Local launch-inclusive timings, not official scoring. All timed hashes checked. Passed all five available dataset comparisons against the Python reference, additional synthetic and disorder checks, and ASan/UBSan on group-size and endpoint-length cases. Static release build passes -Wall -Wextra -Werror. Detailed evidence and limitations: CANDIDATE.md. Docker validation, official cgroup memory, canonical S and official K remain unmeasured for this adaptation. No official 84+ claim.
+
+
+### Confirmed 84+ official result
+
+Official board `run-6e5a4c297a13`, implementation commit `60cb66c`: **84.737403 points**, **K=49.516286**, T=0.016902 s, M=20,901,888 bytes (20.90 MB), S=575, D=1. All check/build/correctness/timeout/sandbox gates passed. This establishes the new Team Lex record on Track A and anchors the championship triad.

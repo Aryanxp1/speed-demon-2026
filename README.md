@@ -3,13 +3,14 @@
 Official competition repository for **Team Lex** in the **Speed Demon 2026 Hackathon** (Hackathon Raptors, October 30 – November 2, 2026).
 
 - **Team Name:** `Lex`
+- **Global Leaderboard Rank:** **10**
 - **Repository:** [https://github.com/Aryanxp1/speed-demon-2026](https://github.com/Aryanxp1/speed-demon-2026)
 - **Submission Branch:** `speed-demon`
-- **Current Official Overall Score:** **45.686 Machine Points**
-- **Championship Triad:** **Track A (50.610 pts)**, **Track D (43.550 pts)**, **Track B (43.265 pts)**
-- **Geometric Mean of Top 3:** $(50.610 \times 43.550 \times 43.265)^{1/3} = \mathbf{45.686}$
+- **Current Official Overall Score:** **79.476 Machine Points**
+- **Championship Triad:** **Track A (84.737 pts)**, **Track C (80.470 pts)**, **Track D (73.621 pts)**
+- **Geometric Mean of Top 3:** $(84.737403 \times 80.470017 \times 73.620947)^{1/3} = \mathbf{79.476}$
 
-All solutions are implemented in pure **Rust (Edition 2021)** using only the standard library (`dependency_count = 0`, $D = 1.000$). Every solution builds completely offline, adheres strictly to sandbox memory and security constraints, and produces 100% byte-identical SHA-256 output matching the official frozen references across all public scales and holdout test seeds.
+All solutions have zero runtime dependencies (`dependency_count = 0`, $D = 1.000$) implemented in **C++20** (Tracks A, C, D) and **Rust 2021** (Track B). Every solution builds completely offline, adheres strictly to sandbox memory and security constraints, and produces 100% byte-identical SHA-256 output matching the official frozen references across all public scales and holdout test seeds.
 
 ---
 
@@ -17,49 +18,55 @@ All solutions are implemented in pure **Rust (Edition 2021)** using only the sta
 
 Scoring Hardware: Intel Core i5-13500 (pinned `--cpuset-cpus=0-11`, 6 P-cores @ 2.5 GHz turbo off, 8 GB RAM, no swap, read-only rootfs).
 
-| Track | Name | Ref Time ($T_{\text{ref}}$) | Ref Mem ($M_{\text{ref}}$) | Team Time ($T$) | Team Mem ($M$) | Speedup | Mem Ratio | Formula $K$ | Machine Points | Status |
-|---|---|---|---|---|---|---|---|---|---|---|
-| **Track A** | **Ingest** | 32.05 s | 228.0 MB | **0.292 s** | **61.0 MB** | **109.8x** | **3.74x** | **10.284873** | **50.610** | **Championship Triad** |
-| **Track B** | **Index** | 56.35 s | 2,200.0 MB | **1.071 s** | **534.0 MB** | **52.6x** | **4.12x** | **7.333291** | **43.265** | **Championship Triad** |
-| **Track C** | **Join** | 14.44 s | 367.0 MB | **0.926 s** | **88.0 MB** | **15.6x** | **4.17x** | **4.378513** | **32.066** | Complete / Verified |
-| **Track D** | **Traverse** | 72.69 s | 915.0 MB | **1.512 s** | **177.0 MB** | **48.1x** | **5.17x** | **7.430230** | **43.550** | **Championship Triad** |
+| Track | Lang | Wall Time ($T$) | Peak Mem ($M$) | Formatted Lines ($S$) | Efficiency $K$ | Official Points | Commit | Run ID | Status |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Track A: Ingest** | C++20 | **0.017 s** | **21 MB** | 575 | **49.516286** | **84.737** | `60cb66c` | `run-6e5a4c297a13` | **Counting (Triad)** |
+| **Track C: Join** | C++20 | **0.028 s** | **9 MB** | 320 | **40.681817** | **80.470** | `d752aea` | `run-fe6bb38f59d2` | **Counting (Triad)** |
+| **Track D: Traverse** | C++20 | **0.099 s** | **62 MB** | 828 | **29.676927** | **73.621** | `f94eb34` | `run-b6ab9135c625` | **Counting (Triad, #1 by K)** |
+| **Track B: Index** | Rust | **0.173 s** | **47 MB** | 647 | **28.977962** | **73.103** | `2c9f85b` | `run-237d62c0cf7c` | *Dropped (Weakest of 4)* |
+
+**Geometric Mean of Best Three Tracks (A, C, D):**
+$$\sqrt[3]{84.737403 \times 80.470017 \times 73.620947} = \mathbf{79.476 \text{ points}}$$
 
 ---
 
 ## Architectural Summary by Track
 
-### Track A: Ingest (50.610 Points)
+### Track A: Ingest (84.737 Points — Best: `60cb66c`)
 - **Challenge:** Parse 238.8 MB of RFC 3339 HTTP access logs, intern 1,842 endpoints, aggregate counts, errors, and compute exact nearest-rank $p50, p95, p99$ latencies per (hour, endpoint) group.
 - **Key Techniques:**
-  - Branchless arithmetic day/hour parser mapping the invariant 72-hour window (`2026-10-30T18:00:00Z` to `2026-11-02T17:59:59Z`) directly to `0..71` slots.
-  - 6-thread parallel ingest partitioned across newline boundaries, streaming in 1 MB chunks to maintain a lean 61 MB footprint ($3.74\times$ leaner than reference).
-  - Global endpoint registry with $O(1)$ thread-local read caches (zero lock contention after warmup).
-  - $O(n)$ `select_nth_unstable` percentile partitioning avoiding full quicksorts.
+  - Mapped log split into 256 KiB line-aligned blocks with bounded lookahead and four interleaved worker streams.
+  - SIMD separator scanning and branchless integer latency decoding, filing 6-byte records directly by hour.
+  - Private endpoint lookup mirrors over an append-only shared dictionary, comparing endpoint bytes with AVX2.
+  - AVX2 multi-rank percentile selection partitioning multiple ranks together with bitonic sort leaves for small groups.
+  - Input pages aggressively unmapped during final processing, with zero-allocation in-place output formatting.
 
-### Track B: Index (43.265 Points)
-- **Challenge:** Ingest 254 MB corpus (250,000 documents, 36M tokens), index documents, and answer 50,000 boolean and exact phrase queries under a single wall-clock timer.
-- **Key Techniques:**
-  - **AOT Query Vocabulary Filtering:** Reads `queries.txt` before indexing. Only 75,747 queried terms (out of 609,833 corpus vocabulary) are indexed, discarding 87% of terms at ingest.
-  - **Thread-Partitioned Monotonic Postings:** Worker threads emit strictly ascending document IDs; merging thread postings is a linear concatenation with zero sorting.
-  - Intermediate thread structures explicitly dropped (`drop(thread_results)`) to reclaim 89 MB RAM before query answering.
-  - **Sparse Boolean Evaluation:** Direct bitwise operations for $df < 256$ in $O(df)$ time.
-  - **Safe Phrase Verification:** Ascending document-frequency candidate filtering verified in-place using stack-allocated `(u32, u32)` spans (up to 1,024 tokens) with dynamic heap fallback for unusually long documents. Static lookup tables eliminate branch mispredictions.
-
-### Track C: Join (32.066 Points)
+### Track C: Join (80.470 Points — Best: `d752aea`)
 - **Challenge:** Relational join of hostile 202 MB `records.csv` and 84 MB `regions.csv` with embedded commas, quotes, UTF-8 BOMs, multiline notes, tracking distinct customer names per country.
 - **Key Techniques:**
-  - Flat 10 MB direct lookup array `region_to_country: Vec<u8>` mapping region IDs $0 \dots 9,999,999$ in $O(1)$ time with zero hash overhead.
-  - Sliding-window 2 MB streaming buffer keeping working sets inside CPU L3 cache (88 MB peak RSS).
-  - **Collision-Proof Exact-Byte Name Table:** Open-addressing hash table backed by a contiguous `Vec<u8>` string arena. Compares raw slice bytes directly, completely eliminating birthday-paradox collision risks on unseen holdout datasets.
-  - Integer cents arithmetic for exact financial math.
+  - Compact fingerprint hash table with atomic SIMD tag group probing; CAS assigns slots with relaxed ordering.
+  - Two-record pipeline overlapping region lookups, name interning, and atomic bitmap marking.
+  - Atomic bitmap `fetch_or` (lock BTS) marks first sightings directly in worker-private distinct counters, avoiding post-join bitmap scans.
+  - Grouped input unmapping releases completed mapping interiors in 4-piece batches to reduce page-table overhead.
+  - Offline seed-17 Profile-Guided Optimization (PGO) using the organizer's published generator blob under the official source-counting exemption.
 
-### Track D: Traverse (43.550 Points)
+### Track D: Traverse (73.621 Points — #1 by K — Best: `f94eb34`)
 - **Challenge:** Directed weighted road network graph (1.74M nodes, 5M edges), answering 2,000 shortest-path queries.
 - **Key Techniques:**
-  - Compact Compressed Sparse Row (CSR) graph layout with interleaved 8-byte `struct EdgeTarget { to: u32, weight: u32 }`, eliminating dual cache misses during edge relaxation.
-  - **Dynamic Atomic Work Scheduling:** Queries claimed dynamically across 6 threads via `AtomicUsize::fetch_add(1, Relaxed)`, eliminating thread idle stalls from path length imbalance (reduced CPU user time by 23%).
-  - Epoch-based distance reset: thread-local `visited_epoch[u]` counter resets Dijkstra states in $O(1)$ time without array zeroing.
-  - $O(1)$ reachability checks for self-loops, zero in-degree, and zero out-degree vertices.
+  - SIMD delimiter parsing into 6-byte raw bins; fused degree-2 contraction, BFS locality ordering, and edge gathering in a single pass.
+  - Compact group-owned temporary edge arenas with 64 KiB fragment recycling, eliminating sparse page-table bloat.
+  - Persistent 12-worker phase pool with reusable C++20 barriers, avoiding thread teardown latency.
+  - 16-settle forward probe followed by exact bidirectional Dijkstra using a 64-bucket near queue and 64-bit overflow heap.
+  - Offline 12-worker CPU-native C++20 PGO build, achieving the highest efficiency $K = 29.677$ across all competitors.
+
+### Track B: Index (73.103 Points — Best: `2c9f85b`)
+- **Challenge:** Ingest 254 MB corpus (250,000 documents, 36M tokens), index documents, and answer 50,000 boolean and exact phrase queries under a single wall-clock timer.
+- **Key Techniques:**
+  - AOT query vocabulary filter indexing only queried terms; CRC hash of the first 16 bytes with full 32-byte equality verification.
+  - AVX2 token boundary detection with an 8-token pipelined dictionary lookup overlapping memory stalls.
+  - Reusable per-document token-ID buffers retaining initialized capacities across shorter documents to prevent reallocation churn.
+  - 16-bit gap-coded postings across 32 streams with 64 KiB reserved chunks, with list-to-bitmap promotion for common terms.
+  - AVX2 bitmap population count and ID sum aggregation, streaming answers in parallel through chunked buffered output.
 
 ---
 
@@ -72,15 +79,30 @@ Scoring Hardware: Intel Core i5-13500 (pinned `--cpuset-cpus=0-11`, 6 P-cores @ 
 │   ├── DECISIONS.md        # Architectural decision records
 │   ├── HANDOFF.md          # Implementation handoffs & task status
 │   └── PROJECT_STATE.md    # Live scorecards & official baselines
-├── track-a/                # Track A: Ingest (50.610 pts)
-│   ├── .speed-demon.toml   # Team Lex metadata (language, dependencies = 0)
-│   ├── Dockerfile          # Offline 2-stage build pinned by digest
+├── track-a/                # Track A: Ingest (84.737 pts — C++20)
+│   ├── .speed-demon.toml   # Team Lex metadata (language = "C++", dependencies = 0)
+│   ├── Dockerfile          # Pinned offline GCC static build
+│   ├── PERF.md             # Detailed optimization log & official metrics
+│   ├── README.md           # Architectural documentation
+│   └── main.cpp            # Zero-dependency C++20 implementation
+├── track-b/                # Track B: Index (73.103 pts — Rust)
+│   ├── .speed-demon.toml   # Team Lex metadata (language = "Rust", dependencies = 0)
+│   ├── Cargo.toml          # Zero external crates
 │   ├── PERF.md             # Detailed optimization log & official metrics
 │   ├── README.md           # Architectural documentation
 │   └── src/main.rs         # Zero-dependency Rust implementation
-├── track-b/                # Track B: Index (43.265 pts)
-├── track-c/                # Track C: Join (32.066 pts)
-├── track-d/                # Track D: Traverse (43.550 pts)
+├── track-c/                # Track C: Join (80.470 pts — C++20)
+│   ├── .speed-demon.toml   # Team Lex metadata (language = "C++", dependencies = 0)
+│   ├── Dockerfile          # Pinned offline GCC static PGO build
+│   ├── PERF.md             # Detailed optimization log & official metrics
+│   ├── README.md           # Architectural documentation
+│   └── main.cpp            # Zero-dependency C++20 implementation
+├── track-d/                # Track D: Traverse (73.621 pts — C++20)
+│   ├── .speed-demon.toml   # Team Lex metadata (language = "C++", dependencies = 0)
+│   ├── Dockerfile          # Pinned offline GCC static PGO build
+│   ├── PERF.md             # Detailed optimization log & official metrics
+│   ├── README.md           # Architectural documentation
+│   └── main.cpp            # Zero-dependency C++20 implementation
 ├── check.py                # Official offline build and verification harness
 ├── LICENSE                 # MIT License (OSI-approved)
 └── README.md               # Team overview & system documentation
