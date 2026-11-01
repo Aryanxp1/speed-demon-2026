@@ -12,6 +12,7 @@
 #include <queue>
 #include <string>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -850,6 +851,8 @@ struct Worker {
 };
 
 int main() {
+  // Avoid committing whole huge pages for partially occupied graph buffers.
+  prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
   const char *env_data = getenv("SD_DATA");
   const char *env_out = getenv("SD_OUT");
   std::string data = env_data ? env_data : "/data",
