@@ -317,9 +317,8 @@ struct Grower {
   Region &reg;
   std::vector<Walk> walks;
 
-  // Claims race without locked instructions: a vertex claimed twice leaves a
-  // copy that no edge reaches, as every head resolves through one map entry.
-  // The private bitmap answers most checks, as a region mostly meets itself.
+  // A shared atomic bit gives exactly one region ownership of each vertex.
+  // The read filter avoids a locked operation for already discovered vertices.
   void claim(u32 z) {
     u64 bit = u64(1) << (z & 63), *word = &claimed[z >> 6];
     if (__atomic_load_n(word, __ATOMIC_RELAXED) & bit)
@@ -422,8 +421,8 @@ Graph *contract(Graph *raw, const Bits &bypass, unsigned threads,
   });
   u32 wbits = raw->wbits, mask = raw->mask;
   delete raw;
-  // Raw id -> region << lbits | position. A vertex claimed twice is named by
-  // the entry that lands last, the same for every head.
+  // Assign contiguous final IDs before encoding the raw-to-final map.
+  // Unique discovery ownership makes map-entry writes non-overlapping.
   std::vector<u32> base(threads + 1, 0), edges(threads + 1, 0);
   for (unsigned t = 0; t < threads; ++t) {
     base[t + 1] = base[t] + regions[t].len;
