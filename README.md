@@ -3,12 +3,12 @@
 Official competition repository for **Team Lex** in the **Speed Demon 2026 Hackathon** (Hackathon Raptors, October 30 – November 2, 2026).
 
 - **Team Name:** `Lex`
-- **Global Leaderboard Rank:** **10** (Climbing to Global Top 5)
+- **Global Leaderboard Rank:** **10**
 - **Repository:** [https://github.com/Aryanxp1/speed-demon-2026](https://github.com/Aryanxp1/speed-demon-2026)
 - **Submission Branch:** `speed-demon`
-- **Current Official Overall Score:** **80.978+ Machine Points**
-- **Championship Triad:** **Track A (84.959 pts)**, **Track C (80.470 -> 82.4+ pts)**, **Track B (77.987 pts)** / **Track D (73.621 pts)**
-- **Geometric Mean of Top 3:** $(84.959365 \times 80.470017 \times 77.986833)^{1/3} = \mathbf{81.087}$ (target with Track C @ 82.4: $\mathbf{81.73}$ pts)
+- **Current Official Overall Score:** **81.700 Machine Points**
+- **Championship Triad:** **Track A (85.349 pts)**, **Track C (81.831 pts)**, **Track B (78.082 pts)**
+- **Geometric Mean of Top 3:** $(85.348629 \times 81.831000 \times 78.081844)^{1/3} = \mathbf{81.700}$ (targeting $\mathbf{82.0+}$ pts on Track C update)
 
 All solutions have zero runtime dependencies (`dependency_count = 0`, $D = 1.000$) implemented in **Rust 2021** (Tracks A, B, C) and **C++20** (Track D). Every solution builds completely offline, adheres strictly to sandbox memory and security constraints, and produces 100% byte-identical SHA-256 output matching the official frozen references across all public scales and holdout test seeds.
 
@@ -20,10 +20,10 @@ Scoring Hardware: Intel Core i5-13500 (pinned `--cpuset-cpus=0-11`, 6 P-cores @ 
 
 | Track | Lang | Wall Time ($T$) | Peak Mem ($M$) | Formatted Lines ($S$) | Efficiency $K$ | Official Points | Commit | Run ID | Status |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Track A: Ingest** | Rust | **0.0198 s** | **16.3 MB** | 438 | **50.025023** | **84.959** | `31c4b55` | `run-bb6165eb91c8` | **Counting (Triad Best)** |
-| **Track C: Join** | Rust | **0.0210 s** | **11.4 MB** | 301 | **44.0+** | **82.4+ (Target)** | `HEAD` | *Scoring* | **Counting (Triad)** |
-| **Track B: Index** | Rust | **0.155 s** | **45.2 MB** | 647 | **36.285796** | **77.987** | `406a96b` | `run-35dc90610f44` | **Counting (Triad)** |
-| **Track D: Traverse** | C++20 | **0.099 s** | **62.1 MB** | 828 | **29.676927** | **73.621** | `f94eb34` | `run-b6ab9135c625` | *Backup (#1 K across board)* |
+| **Track A: Ingest** | Rust | **0.0193 s** | **15.9 MB** | 438 | **50.929871** | **85.349** | `289997d` | `run-e8321a` | **Counting (Triad Best)** |
+| **Track C: Join** | Rust | **0.0227 s** | **10.7 MB** | 310 | **43.313546** | **81.831** | `0403a03` | `run-0403a03` | **Counting (Triad)** |
+| **Track B: Index** | Rust | **0.0969 s** | **42.7 MB** | 1067 | **36.444909** | **78.082** | `075d783` | `run-075d783` | **Counting (Triad)** |
+| **Track D: Traverse** | C++20 | **0.0990 s** | **56.1 MB** | 631 | **31.490434** | **74.909** | `0403a03` | `run-0403a03` | *Backup (#1 K board)* |
 
 ---
 

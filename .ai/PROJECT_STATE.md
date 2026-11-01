@@ -4,8 +4,8 @@
 **Global Rank:** **10** (Pushing towards Top 5)  
 **Repository:** [Aryanxp1/speed-demon-2026](https://github.com/Aryanxp1/speed-demon-2026)  
 **Submission Branch:** `speed-demon`  
-**Current Overall Machine Score:** **81.087** (Triad: Track A, Track C, Track B)  
-**Current Timestamp:** 2026-11-01 22:05 UTC (03:35 IST)  
+**Current Overall Machine Score:** **81.700** (Triad: Track A, Track C, Track B)  
+**Current Timestamp:** 2026-11-01 22:23 UTC (03:53 IST)  
 **Code Freeze:** 2026-11-02 15:00 UTC  
 
 ---
@@ -16,14 +16,14 @@ All 4 tracks are live, passing all correctness and sandbox gates on the official
 
 | Track | Task Summary | Status | Language | Commit | Official $T$ | Official $M$ | Formatted $S$ | Official $K$ | Official Machine Score |
 |---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Track A (Ingest)** | 3.1M log lines aggregation | **COUNTING (Rank 1)** | Rust | `31c4b55` | **0.0198 s** | **16.31 MB** | 438 | **50.025023** | **84.959 pts** |
-| **Track C (Join)** | 202 MB hostile CSV join | **COUNTING (Rank 2)** | Rust | `HEAD` | **0.0210 s** | **11.40 MB** | 301 | **44.0+** | **82.4+ pts (Target)** |
-| **Track B (Index)** | 250k docs, 50k queries | **COUNTING (Rank 3)** | Rust | `406a96b` | **0.1550 s** | **45.20 MB** | 647 | **36.285796** | **77.987 pts** |
-| **Track D (Traverse)** | 2,000 shortest-path queries | *BACKUP (#1 K board)* | C++20 | `f94eb34` | **0.0987 s** | **62.05 MB** | 828 | **29.676927** | **73.621 pts** |
+| **Track A (Ingest)** | 3.1M log lines aggregation | **COUNTING (Rank 1)** | Rust | `289997d` | **0.0193 s** | **15.93 MB** | 438 | **50.929871** | **85.349 pts** |
+| **Track C (Join)** | 202 MB hostile CSV join | **COUNTING (Rank 2)** | Rust | `0403a03` | **0.0227 s** | **10.70 MB** | 310 | **43.313546** | **81.831 pts (Target 82+)** |
+| **Track B (Index)** | 250k docs, 50k queries | **COUNTING (Rank 3)** | Rust | `075d783` | **0.0969 s** | **42.73 MB** | 1067 | **36.444909** | **78.082 pts** |
+| **Track D (Traverse)** | 2,000 shortest-path queries | *BACKUP (#1 K board)* | C++20 | `0403a03` | **0.0990 s** | **56.15 MB** | 631 | **31.490434** | **74.909 pts** |
 
 **Overall Championship Geometric Mean Score:**
-$$\sqrt[3]{84.959365 \times 80.470017 \times 77.986833} = \mathbf{81.087 \text{ points}}$$
-*(With Track C scoring $\ge 82.4$: $\mathbf{81.73 \text{ points}}$)*
+$$\sqrt[3]{85.348629 \times 81.831000 \times 78.081844} = \mathbf{81.700 \text{ points}}$$
+*(Target with Track C $\ge 82.0$: $\mathbf{81.76+ \text{ points}}$)*
 
 ---
 
