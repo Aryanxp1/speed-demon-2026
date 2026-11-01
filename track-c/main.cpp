@@ -323,5 +323,5 @@ int main(int argc, char **argv) {
   }
   int fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   (void)!write(fd, buf, o - buf), close(fd);
-  _exit(0);
+  std::exit(0);
 }

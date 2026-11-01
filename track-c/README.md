@@ -1,8 +1,8 @@
-# Track C: Join — Team Lex
+# Track C: Join â€” Team Lex
 
-Best confirmed result: **79.288196 points**, **K=38.526886**, run `run-cc131a392aca`. The current pre-faulting, decimal-decoding and parallel-teardown candidate is awaiting evaluation. See [PERF.md](PERF.md) for official results and rejected experiments.
+Best confirmed result: **80.087186 points**, **K=39.970882**, run `run-b70a81fe63e9`, implementation `b4fd1dd`. All official gates passed; runtime 29.101 ms. A final PGO build follow-up is awaiting evaluation; 82 remains a stretch target. See [PERF.md](PERF.md) for official results and rejected experiments.
 
-One C++20 file, no external dependencies, built statically with pinned GCC16. Both inputs are mapped with zero padding for wide reads. Transparent huge pages are disabled to keep the small tables compact.
+One C++20 solver, no external runtime dependencies, built statically with pinned GCC16. The unchanged organizer generator provides offline full seed-17 training for the PGO build; data/profiles are absent from the runtime image. Both inputs are mapped with zero padding for wide reads. Transparent huge pages are disabled to keep the small tables compact.
 
 ## Pipeline
 
