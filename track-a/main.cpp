@@ -337,6 +337,8 @@ struct Job {
   bool writing = false;
   std::atomic<size_t> zapped{0}; // 4 MiB steps of the mapping released
   std::vector<Rec *> runbufs;    // free buffers, guarded by mu
+  std::vector<std::vector<int32_t>> latbufs;
+  std::vector<std::unique_ptr<char[]>> outbufs;
 
   Job(const char *b, size_t n, uint32_t l, int f, uint32_t t)
       : base(b), size(n), lag(l), nblocks((n + kBlock - 1) / kBlock),
@@ -473,7 +475,7 @@ struct Job {
       live[seen] = id;
       seen += n != 0;
     }
-    std::vector<int32_t> lat;
+    std::vector<int32_t> lat = take(latbufs);
     lat.reserve(1 << 17);
     lat.resize(total + 16);
     for (const auto &[rec, n] : mine)
@@ -481,7 +483,9 @@ struct Job {
         lat[pos[rec[i].tag % kIds]++] = rec[i].lat ^ 0x80000000;
 
     static thread_local std::vector<int32_t> scratch;
-    std::unique_ptr<char[]> text(new char[kPartCap + 256]);
+    std::unique_ptr<char[]> text = take(outbufs);
+    if (!text)
+      text.reset(new char[kPartCap + 256]);
     char *out = text.get(), label[22];
     std::snprintf(label, sizeof label, "%sT%02u:00:00Z ",
                   kDays[(hour + 18) / 24], (hour + 18) % 24);
@@ -510,6 +514,8 @@ struct Job {
     const size_t length = out - text.get();
     {
       std::lock_guard<std::mutex> lock(mu);
+      if (latbufs.size() < 4)
+        latbufs.push_back(std::move(lat));
       for (const auto &[rec, n] : mine)
         runbufs.push_back(rec);
     }
@@ -538,6 +544,11 @@ struct Job {
       sync_file_range(fd, end[written], part.second, SYNC_FILE_RANGE_WRITE);
       if (written >= kKeep)
         posix_fadvise(fd, 0, end[written - kKeep + 1], POSIX_FADV_DONTNEED);
+      {
+        std::lock_guard<std::mutex> pool_lock(mu);
+        if (outbufs.size() < 4)
+          outbufs.push_back(std::move(part.first));
+      }
       lock.lock();
     }
     writing = false;
