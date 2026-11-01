@@ -237,3 +237,20 @@ Optimized, AddressSanitizer and ThreadSanitizer builds each pass stored tiny/sam
 
 
 Official follow-up result: run-37188b01e6f5, implementation 12f80a8, all gates pass. T=0.099082 s, M=61,968,384 bytes, S=828, D=1, K=29.634094, 73.589583 points. This does not beat the retained best K=29.676927. The gap is small and scoring variance is observable (the identical winning image at documentation-only 17df5fd measured K=28.400279), so this is not proof that one barrier is inherently slower. No official gain was established; source is restored byte-for-byte to f94eb34. The verified experimental candidate remains in commit 12f80a8 for future comparisons. Docker and organizer generator remain untouched.
+
+
+## 2026-11-02: Reverse scratch reuse and query prefetch candidate
+
+Baseline source/build match f94eb34. Latest complete board read: leader SweetDreamsHalloween K=30.393310 / 74.138900, HighVelocity K=30.040244 / 73.885173, Lex K=29.676927 / 73.620947. Only Track D is modified by this work.
+
+Reverse construction consumes degree[v] when opening the row, then resets that cell and reuses it as the placement cursor. Slice ownership and the existing producer/consumer synchronization are unchanged; no worker writes another slice's counts. This removes the placed array and its separate memset. Query lookahead stays four vertices, with locality 3 rather than 1 for graph and label prefetches. Distances remain fully 64-bit and the exact near/far queue and contraction semantics are preserved. Docker, generator bytes and twelve-worker seed-17 PGO training are unchanged.
+
+39 randomized interleaved output-checked full seed-1 PGO runs per variant: baseline median 77.596 ms, scratch reuse 77.465, L1 prefetch 77.132, L2 prefetch 77.416, selected reuse+L1 76.247. Selected candidate wins 30/39 paired comparisons; median paired time ratio 0.9824. Local WSL timings are not official T/K. Sampled anonymous peak remains approximately 58,000 KiB: scratch reuse does not reduce the earlier construction peak.
+
+Rejected experiments: parallel MADV_DONTNEED of consumed graph input pages had an initial apparent 6% gain but did not reproduce (confirmation baseline 80.670 versus discard 80.897 ms); inner reverse barrier and combinations were inconsistent. A three-slot raw-row specialization was slower (84.708 vs baseline 78.887 ms), as were a forward-probe specialization (81.052) and their combination (86.347). Conditional relaxation/queue/meeting updates lost to existing branch-free code (92.281 vs baseline 86.228 ms); conditional probe combination 91.274. These are excluded.
+
+Fresh phase instrumentation on the retained architecture, five local optimized runs: parsing/bins roughly 11-12 ms, raw rows 7 ms, growth 15 ms, ID map 3 ms, forward assembly 7-9 ms, reverse 9 ms, queries 23-26 ms. Approximately 1.20M contracted vertices, 4.04M edges, and 52k-76k cross-slice inbox edges. Values vary with scheduling and instrumentation; they are diagnostic, not board axes. Peak occurs during growth, explaining the unchanged overall memory from reverse scratch reuse.
+
+Optimized PGO and ASan/UBSan builds pass stored tiny/sample/full and 70 independent differential fixtures at 1/4/12 workers; both also pass the shuffled 70,004-vertex cross-group cycle, zero/max-u32 edge weights, exact 8,589,934,590 distance, empty and single-query cases. ThreadSanitizer verification is pending. Official candidate T/M/S/K/points/run ID pending.
+
+ThreadSanitizer completion: stored tiny/sample/full, all 70 independent differential fixtures, cross-group cycle, empty/single-query and exact u64 cases pass at 1/4/12 workers with halt_on_error. No sanitizer findings.

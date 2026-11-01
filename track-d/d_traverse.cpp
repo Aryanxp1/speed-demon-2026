@@ -585,7 +585,7 @@ static void add_reverse(Graph &g, unsigned threads) {
   };
   std::vector<std::vector<std::vector<Remote>>> box(
       threads, std::vector<std::vector<Remote>>(threads));
-  Array<u32> degree(n), placed(n);
+  Array<u32> degree(n);
   std::vector<Escapes> escapes(threads);
   std::atomic<unsigned> arrived{0};
   std::vector<u32> cuts(threads + 1);
@@ -594,7 +594,6 @@ static void add_reverse(Graph &g, unsigned threads) {
   parallel(threads, [&](unsigned t) {
     u32 lo = cuts[t], hi = cuts[t + 1];
     memset(&degree[lo], 0, size_t(hi - lo) * 4);
-    memset(&placed[lo], 0, size_t(hi - lo) * 4);
     for (u32 u = lo; u < hi; ++u)
       fwd.each(u, [&](u32 e, size_t i) {
         u32 v = fwd.head(e);
@@ -611,10 +610,13 @@ static void add_reverse(Graph &g, unsigned threads) {
       for (const Remote &r : box[s][t])
         ++degree[r.head];
     Rows::Cursor cursor;
-    for (u32 v = lo; v < hi; ++v)
+    // Each slice has one writer; consumed degrees become placement cursors.
+    for (u32 v = lo; v < hi; ++v) {
       rev.open(v, degree[v], cursor);
+      degree[v] = 0;
+    }
     auto add = [&](u32 v, u32 u, u64 w) {
-      rev.put(rev.at(v, placed[v]++), u, w, escapes[t]);
+      rev.put(rev.at(v, degree[v]++), u, w, escapes[t]);
     };
     for (u32 u = lo; u < hi; ++u)
       fwd.each(u, [&](u32 e, size_t i) {
@@ -822,8 +824,8 @@ struct Side {
     for (u32 k = 0; k < bk.size; ++k) {
       if (k + LOOK < bk.size) {
         u32 ahead = bk.data[k + LOOK] & mask;
-        __builtin_prefetch(&g.slot[size_t(ahead) * 4], 0, 1);
-        __builtin_prefetch(dist.at(ahead), 0, 1);
+        __builtin_prefetch(&g.slot[size_t(ahead) * 4], 0, 3);
+        __builtin_prefetch(dist.at(ahead), 0, 3);
       }
       u32 u = bk.data[k] & mask;
       u64 d = base | bk.data[k] >> queue.node_bits;

@@ -1,8 +1,10 @@
-# Team Lex: Track D integration
+# Team Lex: Track D
 
-Official result: **#1 Track D by K**, **K=29.676927**, **73.620947 points**, implementation `f94eb34`, run `run-b6ab9135c625`. All gates passed; 0.098744 s and 62,050,304 measured bytes. Verified against the live board after the run on November 1, 2026.
+Retained official best: **73.620947 points**, **K=29.676927**, T=0.098744 s, M=62,050,304 bytes, S=828 (`f94eb34`, `run-b6ab9135c625`). This was first by K when measured; the latest board read puts Lex third behind K=30.393310 and K=30.040244.
 
-The retained version adds compact temporary-fragment reclamation, persistent C++20 workers, AVX2 delimiter scanning and a shorter exact forward probe. PGO training uses twelve workers. Searches retain full 64-bit distance labels. See PERF.md for the verified result and rejected experiments.
+Current candidate reuses the reverse-graph degree array as placement cursors after each row opens, removing a separate scratch allocation and clearing pass. Query prefetches bring the next four vertices' rows and distance labels into L1. Full 64-bit labels, exact bucket/overflow queues, contraction rules and scoped worker-pool synchronization are unchanged.
+
+39 randomized interleaved PGO full-data comparisons: baseline median 77.596 ms; candidate 76.247 ms. Candidate won 30/39 paired comparisons, median paired ratio 0.9824. These are local WSL timings, not a scoring-box gain. Official candidate evaluation pending. See PERF.md for verification and rejected experiments.
 
 This submission adapts the user-provided `C:/Users/aryan/Downloads/ar/aryan/track-d` C++ solver, replacing our previous Rust implementation. Team metadata is Lex with zero external runtime dependencies. See [PERF.md](PERF.md) for our independent tests and official results; the historical upstream measurements below are source-project evidence, not Lex leaderboard results.
 
@@ -12,11 +14,11 @@ Exact directed shortest paths on a road-like graph, built for the end-to-end clo
 
 Pipeline, all phases parallel across all hardware threads:
 
-1. **Parse.** `graph.txt` is mmapped and cut at line boundaries per thread. Each 64-byte block yields a separator bitmask (SSE2); every number is decoded from the 8 bytes ending at its separator, so fields parse independently of one another. Edges go to 6-byte bin entries keyed by the tail's id bucket; weights of 65535 or more keep a marker and live in a side table.
+1. **Parse.** `graph.txt` is mmapped and cut at line boundaries per thread. Each 64-byte block yields a separator bitmask (AVX2); every number is decoded from the 8 bytes ending at its separator, so fields parse independently of one another. Edges go to 6-byte bin entries keyed by the tail's id bucket; weights of 65535 or more keep a marker and live in a side table.
 2. **Raw rows.** Each bucket becomes 4-slot rows in cache: a vertex with at most four out-edges is one 16-byte row, longer rows keep three edges and a spill code that locates a counted list. Out-degree <= 2 non-endpoint vertices are marked bypassable.
 3. **Fused contraction, ordering and gathering.** Workers grow BFS regions concurrently from unclaimed seeds in their raw-id slices. Expanding a vertex follows each out-edge through bypassable vertices (one way on, never back) to the first survivor, so degree-2 contraction, locality ordering and edge gathering are a single pass. Walks of a batch advance one hop per round so their misses overlap. Claims use plain stores: a vertex claimed twice yields a copy with no forward in-edges, which can never lie on a shortest path, because every head is resolved through one map entry after growth.
 4. **Search rows.** Regions are concatenated into forward rows; the reverse rows are built by id-slice owners without atomics, with cross-slice edges passed through inboxes. Weights that do not fit the packed field go to a sorted escape table.
-5. **Queries** run on independent workers in order of source id: an exact 256-vertex forward probe, then bidirectional Dijkstra balancing settled counts and stopping when the two queue fronts sum to the best meeting. The queue is a ring of width-128 buckets (overflow heap for large jumps), drained FIFO with lookahead prefetch. Relaxations are branch-free: a label store, an unconditional queue write counted only on improvement, and a meeting update that is valid either way because `d + w + other(v)` is always a real path length.
+5. **Queries** run on independent workers in order of source id: an exact 16-vertex forward probe, then bidirectional Dijkstra balancing settled counts and stopping when the two queue fronts sum to the best meeting. The queue is a ring of width-128 buckets (overflow heap for large jumps), drained FIFO with lookahead prefetch. Relaxations are branch-free: a label store, an unconditional queue write counted only on improvement, and a meeting update that is valid either way because `d + w + other(v)` is always a real path length.
 
 Exactness covers zero weights, parallel and duplicate edges, self-loops, isolated and unreachable vertices, and 64-bit sums. No third-party runtime dependencies. `SD_THREADS` sets the worker count.
 
