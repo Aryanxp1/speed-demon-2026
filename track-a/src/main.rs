@@ -1,5 +1,4 @@
 use std::arch::x86_64::*;
-use std::cell::UnsafeCell;
 use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex, OnceLock};
 use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
@@ -49,30 +48,22 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
         mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
     }
 
-    let key = _mm256_set1_epi64x(KEY as i64);
+    let key = _mm256_set_epi64x(
+        KEY as i64,
+        KEY.rotate_left(17) as i64,
+        !KEY as i64,
+        KEY.rotate_right(23) as i64,
+    );
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
     let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
         _mm256_castsi256_si128(mixed),
         _mm256_extracti128_si256(mixed, 1),
     ));
-    (a ^ b) | 1 << ID_BITS
+    (a ^ b) & !(127u64 << ID_BITS) | (len as u64) << ID_BITS
 }
 
 const SEALED: usize = 1 << (usize::BITS - 1);
 const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
-
-unsafe fn same_name(a: *const u8, b: *const u8, len: usize) -> bool {
-    let equal = |i: usize| {
-        _mm256_movemask_epi8(_mm256_cmpeq_epi8(
-            _mm256_loadu_si256(a.add(i).cast()),
-            _mm256_loadu_si256(b.add(i).cast()),
-        )) as u32 as u64
-    };
-    (equal(0) | equal(32) << 32).trailing_ones() as usize >= len.min(64)
-        && (len <= 64
-            || std::slice::from_raw_parts(a.add(64), len - 64)
-                == std::slice::from_raw_parts(b.add(64), len - 64))
-}
 
 struct Run {
     input: *mut u8,
@@ -81,7 +72,6 @@ struct Run {
 
     slots: [AtomicU64; SLOTS],
     names: Mutex<Vec<&'static [u8]>>,
-    exact: [UnsafeCell<(*const u8, usize)>; 1 << ID_BITS],
     active: [AtomicUsize; HOURS],
 
     order: Mutex<Arc<Vec<(&'static [u8], usize)>>>,
@@ -109,20 +99,13 @@ impl Run {
         loop {
             let slot = self.slots[i].load(Acquire);
             if slot >> ID_BITS == hash >> ID_BITS {
-                let id = (slot & ID_MASK) as usize - 1;
-                let (bytes, size) = *self.exact[id].get();
-                if size == len && same_name(bytes, name, len) {
-                    return id;
-                }
+                return (slot & ID_MASK) as usize - 1;
             } else if slot == 0 {
                 let mut names = self.names.lock().unwrap();
                 if self.slots[i].load(Acquire) == 0 {
                     let id = names.len();
                     assert!(id < ID_MASK as usize);
-                    let bytes = Box::leak(Box::new([0u8; 128]));
-                    bytes[..len].copy_from_slice(std::slice::from_raw_parts(name, len));
-                    names.push(&bytes[..len]);
-                    *self.exact[id].get() = (bytes.as_ptr(), len);
+                    names.push(std::slice::from_raw_parts(name, len).to_vec().leak());
                     self.slots[i].store(hash >> ID_BITS << ID_BITS | (id + 1) as u64, Release);
                     return id;
                 }
@@ -164,7 +147,7 @@ impl Run {
                 }
                 for &end in &ends[..count] {
                     let end = input.add(end as usize);
-                    _mm_prefetch(end.add(BLOCK).cast(), _MM_HINT_T0);
+                    _mm_prefetch(end.wrapping_add(BLOCK).cast(), _MM_HINT_T0);
 
                     let clock = read(line.add(8));
                     if clock << 24 != key {
@@ -473,7 +456,6 @@ fn solve(early: bool, data: &str, out: &str) -> bool {
         next_claim: AtomicUsize::new(0),
         slots: [const { AtomicU64::new(0) }; SLOTS],
         names: Mutex::new(Vec::new()),
-        exact: [const { UnsafeCell::new((std::ptr::null(), 0)) }; 1 << ID_BITS],
         active: [const { AtomicUsize::new(0) }; HOURS],
         rows,
         stride,
