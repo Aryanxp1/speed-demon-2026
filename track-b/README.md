@@ -1,22 +1,11 @@
-# Track B: Index
+# Track B: Index - Team Lex
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/b-index.md).
+This version adapts the user-supplied C++20 engine in `speed_demon_trackb_exp/tb2/track-b`. The previously active submission was Rust. Incoming official best was **73.103392 points**, K=28.977962; the new C++ adaptation is awaiting evaluation toward 75+. See [PERF.md](PERF.md).
 
-## Approach
+The engine indexes only query terms, with exact short keys and full byte checks for CRC-key candidates. A corpus sample chooses hot bitmap rows, sparse per-block sets, phrase anchors and safe Boolean guards; sampling changes the amount of work, never the answers. Workers claim document ranges, evaluate Boolean operators strictly left to right and verify phrases against token-ID tapes. Per-query totals and the smallest ten IDs are merged exactly.
 
-One Rust source file, with no external crates. The current implementation adapts the Track B snapshot supplied by the user from `C:/Users/aryan/OneDrive/Videos/aryann/aryan`; its diagnostic second answer pass has been removed.
+Dictionary prefetching is bounded to sixteen tokens ahead. The calling thread participates in every parallel phase. SIMD tokenization is ASCII-only; unknown and overlength tokens retain their positions. The program supports `--data`, `--out`, `SD_DATA` and `SD_OUT`, defaulting to `/data` and `/out`. It uses at most twelve available workers.
 
-1. **Queries first.** Only queried terms are indexed. A CRC hash of the first 16 lowercased bytes selects a slot; all 32 bytes are compared to establish equality, including hash collisions. Dictionary sizing leaves an empty slot even for tiny query files.
-2. **Sample and plan.** Twelve workers sample their line-aligned corpus partitions. Common Boolean terms become bitmaps; each phrase uses its rarest term as an anchor. Terms are renumbered by role and frequency.
-3. **Buffer document tokens.** AVX2 identifies token boundaries and an eight-token lookup pipeline overlaps dictionary misses. Each document becomes a reusable token-ID buffer. Long or unqueried tokens retain a sentinel position, so phrases cannot bridge them. Per-document bookkeeping deduplicates list terms, gathers bitmap bits, and verifies phrase anchors against exact token-ID slices.
-4. **Compact postings.** List postings use gap-coded 16-bit units in 32 streams with 64 KiB reserved chunks, then scatter into contiguous per-term segments. Planning state is released before scanning; dictionaries, phrase-anchor metadata and scan counts are released before final posting allocation.
-5. **Reuse workers.** One persistent pool serves sampling, scanning, scattering and answers. Completion barriers keep scoped jobs alive until every worker finishes; completed jobs are cleared. Panics abort before borrowed job data can unwind.
-6. **Answer queries.** Boolean operators run strictly left to right. Large list operations switch to bitmaps; AVX2 computes bitmap counts and ID sums. Bitmap rows are padded to whole vectors. Answers are built in parallel chunks and written through a buffered writer, avoiding a second full output copy.
+No external dependencies. Pinned GCC15 builds with native optimization and LTO; the pinned Debian runtime contains the executable. No PGO data, stored answers or input-specific lookup tables are used.
 
-## Dependencies
-
-None. The Rust standard library, `std::arch` intrinsics, and `mmap` and `mallopt` declared by hand.
-
-## Validation and measurements
-
-Official best: **73.103392 points**, run `run-237d62c0cf7c`, implementation `2c9f85b`; all gates passed. See [PERF.md](PERF.md) for experiments and official board results. Local comparisons validate exact bytes against the Python reference; local launch-inclusive timings and sampled anonymous RSS are distinct from the board's execution time and cgroup memory measurements.
+The core passed optimized, ASan/UBSan and TSan verification on 23 datasets at 1, 4 and 12 workers, including an actual CRC collision checked against independent reference results. The full published output hash remains unchanged. License attribution is retained in [LICENSE](LICENSE).
