@@ -1,10 +1,10 @@
 # Team Lex: Track D
 
-Retained official best: **73.620947 points**, **K=29.676927**, T=0.098744 s, M=62,050,304 bytes, S=828 (`f94eb34`, `run-b6ab9135c625`). This was first by K when measured; the latest board read puts Lex third behind K=30.393310 and K=30.040244.
+Official best: **73.774168 points**, **K=29.887072**, T=0.097266 s, M=62,144,512 bytes, S=829. All gates passed: `run-d1a841f662c3`, scored commit `216d284` (Track D implementation `51ceb9b`). Previous best was 73.620947 / K=29.676927 at `f94eb34`.
 
-Current candidate reuses the reverse-graph degree array as placement cursors after each row opens, removing a separate scratch allocation and clearing pass. Query prefetches bring the next four vertices' rows and distance labels into L1. Full 64-bit labels, exact bucket/overflow queues, contraction rules and scoped worker-pool synchronization are unchanged.
+The retained version reuses reverse-graph degree counts as placement cursors once each row opens, removing a scratch allocation and clearing pass. Query prefetches bring the next four vertices' graph rows and distance labels into L1. Full 64-bit distances, exact near/far queues, contraction rules and persistent worker synchronization remain intact.
 
-39 randomized interleaved PGO full-data comparisons: baseline median 77.596 ms; candidate 76.247 ms. Candidate won 30/39 paired comparisons, median paired ratio 0.9824. These are local WSL timings, not a scoring-box gain. Official candidate evaluation pending. See PERF.md for verification and rejected experiments.
+39 randomized interleaved local PGO full-data comparisons: baseline median 77.596 ms; selected version 76.247 ms, winning 30/39 paired comparisons. Optimized, ASan/UBSan and ThreadSanitizer builds pass stored tiny/sample/full, 70 independent differential fixtures, a shuffled 70,004-vertex cross-group cycle, empty/single-query and large-u64 cases at 1/4/12 workers. See PERF.md for evidence and rejected experiments.
 
 This submission adapts the user-provided `C:/Users/aryan/Downloads/ar/aryan/track-d` C++ solver, replacing our previous Rust implementation. Team metadata is Lex with zero external runtime dependencies. See [PERF.md](PERF.md) for our independent tests and official results; the historical upstream measurements below are source-project evidence, not Lex leaderboard results.
 
