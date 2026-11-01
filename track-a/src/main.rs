@@ -14,7 +14,7 @@ const CLAIM: usize = 1 << 20;
 const BLOCK: usize = 1 << 16;
 const MIN_LINE: usize = 40;
 const HOURS: usize = 72;
-const CHUNK: usize = 256;
+const CHUNK: usize = 384;
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
@@ -258,7 +258,7 @@ impl Run {
 
         let spare = rows.add(claimed.max(SPARE_AT).next_multiple_of(1024));
 
-        let (mut starts, mut errors) = (vec![0u32; 1 << ID_BITS], vec![0u32; 1 << ID_BITS]);
+        let (mut starts, mut errors) = ([0u32; 1 << ID_BITS], [0u32; 1 << ID_BITS]);
         let mut long = Vec::new();
 
         let (mut sizes, mut count) = ([[0u32; DIGITS]; 2], 0);
@@ -326,10 +326,16 @@ impl Run {
             copy_nonoverlapping(label.as_ptr(), w, 21);
             copy_nonoverlapping(name.as_ptr(), w.add(21), name.len());
             w = w.add(21 + name.len());
-            for number in [n, at_rank(50), at_rank(95), at_rank(99), bad] {
+            for number in [n, at_rank(50), at_rank(95), at_rank(99)] {
                 w = put_number(w, number);
             }
-            w = put_number(w, (bad as u64 * 1_000_000 / n as u64) as u32);
+            if bad == 0 {
+                copy_nonoverlapping(b" 0 0".as_ptr(), w, 4);
+                w = w.add(4);
+            } else {
+                w = put_number(w, bad);
+                w = put_number(w, (bad as u64 * 1_000_000 / n as u64) as u32);
+            }
             *w = b'\n';
             w = w.add(1);
         }
