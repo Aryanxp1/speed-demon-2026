@@ -1,21 +1,19 @@
-# Track D: Traverse
+# Team Lex: Track D integration
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/d-traverse.md).
+This submission adapts the user-provided `C:/Users/aryan/Downloads/ar/aryan/track-d` C++ solver, replacing our previous Rust implementation. Team metadata is Lex with zero external runtime dependencies. See [PERF.md](PERF.md) for our independent tests and official results; the historical upstream measurements below are source-project evidence, not Lex leaderboard results.
 
-## Approach
+# Traverse
 
-One Rust file, `src/main.rs`, with no crates (the C++ version it replaced is in the git history up to commit ee086ce). Plain Dijkstra with early exit is the right algorithm for these queries (Dijkstra rank at most 131,071, median 512), run from both ends, so the work went into a cheap build and cheap settled nodes.
+Exact directed shortest paths on a road-like graph, built for the end-to-end clock: parse, preprocess, answer, write. Construction dominates the timed run, so the design minimises passes over the 5M edges and keeps every per-vertex visit to one cache miss.
 
-1. **Parse once.** `graph.txt` is memory-mapped and cut into one line-aligned range per thread. Each thread files every edge under the part of the node range its tail falls in (about 27 parts of 65,536 nodes), as sequential appends. An edge is one 32-bit word, the head in the low bits and the weight above it; a weight too large for its field is stored as all ones with its value on a side list.
-2. **Build each part on its own.** A thread takes a part, counts its nodes' out-degrees and places its edges, all inside a 256 KB counter array. This replaced two passes of random atomic adds over the whole graph.
-3. **Renumber for locality.** Node ids are a random relabelling, so each thread cuts the road network into compact blobs of 512 nodes grown by BFS (nodes claimed by compare-exchange), and the graph is copied into that numbering, then reversed in place.
-4. **Bidirectional Dijkstra.** Each query grows the side with the smaller queue, records the best length where the sides meet and stops once the two smallest queued keys reach it. 4-ary heaps; distances in 4 KB pages handed out on first touch. A target with no in-edge is -1 at once, read off the reverse graph.
+Pipeline, all phases parallel across all hardware threads:
 
-## Dependencies
+1. **Parse.** `graph.txt` is mmapped and cut at line boundaries per thread. Each 64-byte block yields a separator bitmask (SSE2); every number is decoded from the 8 bytes ending at its separator, so fields parse independently of one another. Edges go to 6-byte bin entries keyed by the tail's id bucket; weights of 65535 or more keep a marker and live in a side table.
+2. **Raw rows.** Each bucket becomes 4-slot rows in cache: a vertex with at most four out-edges is one 16-byte row, longer rows keep three edges and a spill code that locates a counted list. Out-degree <= 2 non-endpoint vertices are marked bypassable.
+3. **Fused contraction, ordering and gathering.** Workers grow BFS regions concurrently from unclaimed seeds in their raw-id slices. Expanding a vertex follows each out-edge through bypassable vertices (one way on, never back) to the first survivor, so degree-2 contraction, locality ordering and edge gathering are a single pass. Walks of a batch advance one hop per round so their misses overlap. Claims use plain stores: a vertex claimed twice yields a copy with no forward in-edges, which can never lie on a shortest path, because every head is resolved through one map entry after growth.
+4. **Search rows.** Regions are concatenated into forward rows; the reverse rows are built by id-slice owners without atomics, with cross-slice edges passed through inboxes. Weights that do not fit the packed field go to a sorted escape table.
+5. **Queries** run on independent workers in order of source id: an exact 256-vertex forward probe, then bidirectional Dijkstra balancing settled counts and stopping when the two queue fronts sum to the best meeting. The queue is a ring of width-128 buckets (overflow heap for large jumps), drained FIFO with lookahead prefetch. Relaxations are branch-free: a label store, an unconditional queue write counted only on improvement, and a meeting update that is valid either way because `d + w + other(v)` is always a real path length.
 
-None. Standard library and POSIX `mmap` only.
+Exactness covers zero weights, parallel and duplicate edges, self-loops, isolated and unreachable vertices, and 64-bit sums. No third-party runtime dependencies. `SD_THREADS` sets the worker count.
 
-## With another 24 hours
-
-- The second pass (random atomic writes into the CSR arrays) is now the largest part of the build; partitioning edges by tail before placing them would make those writes local.
-- Bidirectional search would roughly halve the settled nodes but needs the reverse graph (about 47 MB more); on this scoring formula that is close to break-even.
+The pinned offline Docker build performs profile-guided optimisation on a seed-17 full-scale graph generated by the unchanged organizer generator; training data and profiles are absent from the runtime image.
