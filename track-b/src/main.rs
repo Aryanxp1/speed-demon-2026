@@ -181,6 +181,7 @@ struct Run {
     words_per_bitmap: usize,
     buckets: *mut Bucket,
     bucket_count: usize,
+    bucket_shift: u32,
     max_terms: usize,
     phase_claims: usize,
     terms: *mut Term,
@@ -275,7 +276,7 @@ unsafe fn hash_of(token: *const u8, len: usize) -> u64 {
 
 #[inline(always)]
 unsafe fn action_in(run: &Run, hash: u64) -> u32 {
-    let bucket = run.buckets.add(bucket_of(hash, run.bucket_count));
+    let bucket = run.buckets.add(bucket_of(hash, run.bucket_shift));
     let wanted = _mm256_set1_epi32(hash as i32);
     let same = _mm256_cmpeq_epi32(_mm256_load_si256(bucket.cast()), wanted);
     let found = _mm256_movemask_ps(_mm256_castsi256_ps(same)) as u32 | 1 << BUCKET_SLOTS;
@@ -288,8 +289,8 @@ unsafe fn action_in(run: &Run, hash: u64) -> u32 {
 }
 
 #[inline(always)]
-fn bucket_of(hash: u64, count: usize) -> usize {
-    (hash >> (64 - count.ilog2())) as usize
+fn bucket_of(hash: u64, shift: u32) -> usize {
+    (hash >> shift) as usize
 }
 
 #[cold]
@@ -300,7 +301,7 @@ unsafe fn long_hash(token: *const u8, len: usize) -> u64 {
 impl Run {
     #[cold]
     unsafe fn action_past(&self, hash: u64) -> u32 {
-        let mut index = bucket_of(hash, self.bucket_count);
+        let mut index = bucket_of(hash, self.bucket_shift);
         loop {
             let bucket = &*self.buckets.add(index);
             match bucket.tags[..BUCKET_SLOTS]
@@ -433,7 +434,7 @@ impl Run {
             for line in 0..line_count {
                 let to = b.lines[line] as usize;
                 while token < to {
-                    let ahead = bucket_of(*hashes.add(token + AHEAD), self.bucket_count);
+                    let ahead = bucket_of(*hashes.add(token + AHEAD), self.bucket_shift);
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
                     let action = action_in(self, *hashes.add(token));
 
@@ -1014,7 +1015,7 @@ fn put_number(out: &mut Vec<u8>, mut value: u64) {
 }
 
 unsafe fn intern(run: &Run, ids: &mut std::ops::Range<u32>, hash: u64) -> u32 {
-    let mut index = bucket_of(hash, run.bucket_count);
+    let mut index = bucket_of(hash, run.bucket_shift);
     loop {
         let bucket = run.buckets.add(index);
         for slot in 0..BUCKET_SLOTS {
@@ -1116,6 +1117,7 @@ fn main() {
             words_per_bitmap,
             buckets: reserve(bucket_count, true),
             bucket_count,
+            bucket_shift: 64 - bucket_count.ilog2(),
             max_terms,
             phase_claims,
             terms: reserve(max_terms, true),

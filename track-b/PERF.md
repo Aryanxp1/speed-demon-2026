@@ -373,4 +373,8 @@ Nine randomized interleaved full-data rounds, CPUs 0..11, with every output hash
 
 The actual packaged offline Cargo release build passes, produces a stripped static executable, passes all 25 datasets at 1/4/12 workers, and preserves the full hash through environment-only invocation. The final source also passes all 25 AddressSanitizer checks. Formatting, whitespace and pinned Dockerfile policy checks pass. Only Track B source and its documentation change.
 
-thortb integration official result: pending.
+thortb integration `35d1959`, `run-1dded520c152`: all official gates passed. T=0.099460 s, M=43,016,192 bytes, S=1065, D=1, K=35.989819, **77.808983 points**, a new team best. This improves the incoming best by 3.313503 points and K by 5.093297. It does not yet reproduce the supplied source's reported 78.57 points.
+
+Follow-up: compute the bucket shift once when choosing the table size, then use that stored shift in query interning, prefetching, probing and overflow lookup. This removes repeated integer-log calculations from the token path and keeps the same table size, buckets, hashes and output. Nine-round randomized comparisons measured the evaluated implementation at 91.350 ms versus 82.149 ms with the stored shift; a separate two-way nine-round comparison measured 91.710 versus 86.713 ms. Every timed full output hash checked. Mask-based and fixed-table specializations were compared but not retained; the stored shift keeps dynamic sizing without another lookup branch. The actual offline Cargo package passes all 25 datasets at 1/4/12 workers, the full environment-only hash, and all 25 AddressSanitizer datasets. Formatting and whitespace checks pass.
+
+Stored-shift official result: pending.
