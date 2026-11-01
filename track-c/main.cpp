@@ -1,20 +1,10 @@
-#include <algorithm>
-#include <array>
-#include <atomic>
-#include <barrier>
-#include <charconv>
-#include <cstdint>
-#include <cstdlib>
-#include <cstring>
+#include <bits/stdc++.h>
 #include <fcntl.h>
 #include <immintrin.h>
-#include <numeric>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
-#include <thread>
 #include <unistd.h>
-#include <vector>
 
 using u8 = uint8_t;
 using u32 = uint32_t;
@@ -30,7 +20,9 @@ constexpr u64 M1 = 0x0101010101010101ull, M8 = 0x8080808080808080ull;
 
 inline void pop_share(void *p, size_t n, int t, int nt) {
   size_t pg = (n + 4095) >> 12, f = pg * t / nt, to = pg * (t + 1) / nt;
-  to > f ? (void)madvise((char *)p + (f << 12), (to - f) << 12, 19) : (void)0;
+  to > f ? (void)madvise((char *)p + (f << 12), (to - f) << 12,
+                         MADV_POPULATE_WRITE)
+         : (void)0;
 }
 const char *map_file(const char *path, size_t &size) {
   int fd = open(path, O_RDONLY);
@@ -41,13 +33,20 @@ const char *map_file(const char *path, size_t &size) {
   return close(fd), p;
 }
 
+inline u64 decimal8(u64 v) {
+  __m128i pairs =
+      _mm_maddubs_epi16(_mm_cvtsi64_si128(v), _mm_set1_epi16(0x010A));
+  __m128i quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+  return u32(_mm_cvtsi128_si32(
+      _mm_madd_epi16(_mm_packs_epi32(quads, _mm_setzero_si128()),
+                     _mm_set1_epi32(0x00012710))));
+}
+
 inline u64 money(const char *s, const char *e) {
   u64 w = load8(e - 8);
   u64 v = (w << 8 & 0xFFFFFFFFFF00 | w & 0xFFFF000000000000) &
           0x0F0F0F0F0F0F0F0F & ~0ull << 8 * (9 - (e - s));
-  v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
-  v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
-  return (v * 10000 + (v >> 32)) & 0xFFFFFFFF;
+  return decimal8(v);
 }
 
 inline std::pair<const char *, u64> parse_int_comma(const char *p) {
@@ -55,9 +54,7 @@ inline std::pair<const char *, u64> parse_int_comma(const char *p) {
   u64 mask = (x - M1) & ~x & M8;
   u32 len = mask ? __builtin_ctzll(mask) >> 3 : 8;
   u64 v = (raw << ((8 - len) << 3)) & 0x0F0F0F0F0F0F0F0Full;
-  v = (v * 10 + (v >> 8)) & 0x00FF00FF00FF00FF;
-  v = (v * 100 + (v >> 16)) & 0x0000FFFF0000FFFF;
-  return {p + len, (v * 10000 + (v >> 32)) & 0xFFFFFFFF};
+  return {p + len, decimal8(v)};
 }
 
 inline const char *find_quote(const char *p) {
@@ -95,10 +92,8 @@ struct NameTable {
         _mm_and_si128(_mm_loadu_si128((const __m128i *)s),
                       _mm_loadu_si128((const __m128i *)((const char *)K + 16 -
                                                         std::min(len, 16u))));
-    __uint128_t prod =
-        __uint128_t(u64(_mm_cvtsi128_si64(h128)) ^ 0xa0761d6478bd642full) *
-        (u64(_mm_extract_epi64(h128, 1)) ^ 0xe7037ed1a0b428dbull ^ len);
-    u64 h = u64(prod) ^ u64(prod >> 64);
+    u64 h = (u64(_mm_cvtsi128_si64(h128)) * 0x9E3779B97F4A7C15ull ^ len) +
+            u64(_mm_extract_epi64(h128, 1)) * 0xBF58476D1CE4E5B9ull;
     if (__builtin_expect(len > 16, 0)) {
       u64 tail = 0;
       memcpy(&tail, s + 16, std::min(len - 16, 8u));
@@ -109,40 +104,34 @@ struct NameTable {
         h = (h ^ tail) * 0x94D049BB133111EBull;
       }
     }
-    return h + (h == 0);
+    h = (h ^ h >> 31) * 0xD6E8FEB86659FD93ull;
+    return (h ^ h >> 32) + (h == 0);
   }
   void prefetch(u64 k) const {
     _mm_prefetch((const char *)(&slots_[k >> (64 - BITS)]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&tags_[(k >> (64 - BITS)) / 8]), _MM_HINT_T0);
   }
   __attribute__((always_inline)) inline u32 id(u64 k) {
-    u8 tag = u8(k) + (u8(k) == 0);
-    __m128i tgt = _mm_set1_epi8(tag);
-    for (u32 i = (k >> (64 - BITS)) & ~15u;; i = (i + 16) & (SLOTS - 1)) {
-      __m128i v =
-          _mm_set_epi64x(tags_[(i >> 3) + 1].load(std::memory_order_acquire),
-                         tags_[i >> 3].load(std::memory_order_acquire));
-      u32 hit = _mm_movemask_epi8(_mm_cmpeq_epi8(v, tgt));
-      for (; hit; hit &= hit - 1) {
-        u32 j = i + __builtin_ctz(hit);
-        if (slots_[j].load(std::memory_order_relaxed) == k)
-          return j;
-      }
-      for (u32 f = _mm_movemask_epi8(_mm_cmpeq_epi8(v, _mm_setzero_si128())); f;
+    __m256i tgt = _mm256_set1_epi64x(k);
+    for (u32 i = (k >> (64 - BITS)) & ~3u;; i = (i + 4) & (SLOTS - 1)) {
+      __m256i v =
+          _mm256_set_epi64x(slots_[i + 3].load(std::memory_order_relaxed),
+                            slots_[i + 2].load(std::memory_order_relaxed),
+                            slots_[i + 1].load(std::memory_order_relaxed),
+                            slots_[i].load(std::memory_order_relaxed));
+      u32 hit = mask64(_mm256_cmpeq_epi64(v, tgt));
+      if (__builtin_expect(hit != 0, 1))
+        return i + __builtin_ctz(hit);
+      for (u32 f = mask64(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())); f;
            f &= f - 1) {
         u32 j = i + __builtin_ctz(f);
-        u64 prev = 0;
-        if (slots_[j].compare_exchange_strong(prev, k,
+        u64 s = 0;
+        if (slots_[j].compare_exchange_strong(s, k,
                                               std::memory_order_relaxed) ||
-            prev == k) {
-          tags_[j >> 3].fetch_or(u64(tag) << ((j & 7) * 8),
-                                 std::memory_order_release);
+            s == k)
           return j;
-        }
       }
     }
   }
-  std::atomic<u64> *tags_ = zeroed(std::atomic<u64>, SLOTS / 8);
   std::atomic<u64> *slots_ = zeroed(std::atomic<u64>, SLOTS);
 };
 
@@ -163,7 +152,7 @@ static constexpr u32 WORDS = NameTable::SLOTS / 64;
 void parse_records(const char *p, const char *end, const char *file_end,
                    const u8 *country_of, size_t regions, NameTable &names,
                    std::atomic<u64> *seen_bits, Totals *totals) {
-  constexpr u64 LAG = 4;
+  constexpr u64 LAG = 2;
   u64 p_name[LAG];
   u32 p_reg[LAG], p_id[LAG], p_nb[LAG], p_tb[LAG], m_c[LAG], m_id[LAG];
   i64 p_cents[LAG];
@@ -171,27 +160,28 @@ void parse_records(const char *p, const char *end, const char *file_end,
 
   auto advance = [&]() __attribute__((always_inline)) {
     u32 k = n % LAG;
-    (n >= 2 * LAG && n - 2 * LAG < last)
-        ? (void)seen_bits[m_c[k] * WORDS + (m_id[k] >> 6)].fetch_or(
-              1ull << (m_id[k] & 63), std::memory_order_relaxed)
-        : (void)0;
+    if (n >= 2 * LAG && n - 2 * LAG < last) {
+      u32 c = m_c[k], id = m_id[k];
+      u64 mask = 1ull << (id & 63);
+      totals[c].distinct += !(seen_bits[c * WORDS + (id >> 6)].fetch_or(
+                                  mask, std::memory_order_relaxed) &
+                              mask);
+    }
     if (n >= LAG && n - LAG < last) {
       u32 c = country_of[p_reg[k]], id = names.id(p_name[k]);
       Totals &t = totals[c];
-      _mm256_storeu_si256(
-          (__m256i *)&t,
-          _mm256_add_epi64(_mm256_loadu_si256((const __m256i *)&t),
-                           _mm256_set_epi64x(p_tb[k], p_nb[k], p_id[k], 1)));
-      t.amount_sum += p_cents[k];
-      t.amount_min = std::min(t.amount_min, p_cents[k]);
-      t.amount_max = std::max(t.amount_max, p_cents[k]);
-      m_c[k] = c, m_id[k] = id;
-      __builtin_prefetch(&seen_bits[c * WORDS + (id >> 6)], 1);
+      ++t.count, t.id_sum += p_id[k], t.amount_sum += p_cents[k],
+          t.amount_min = std::min(t.amount_min, p_cents[k]),
+          t.amount_max = std::max(t.amount_max, p_cents[k]),
+          t.name_bytes += p_nb[k], t.note_bytes += p_tb[k], m_c[k] = c,
+          m_id[k] = id,
+          __builtin_prefetch(&seen_bits[c * WORDS + (id >> 6)], 1);
     }
   };
 
   __m128i lf_vec128 = _mm_set1_epi8('\n');
   while (p < end) {
+    _mm_prefetch(p + 2048, _MM_HINT_T0);
     if (__builtin_expect(u8(*p) == 0xEF, 0))
       p += 3;
     auto [f1, id] = parse_int_comma(p);
@@ -254,56 +244,52 @@ int main(int argc, char **argv) {
   u8 *country_of = zeroed(u8, nreg + 1);
   size_t roff = strchr(regions, '\n') - regions + 1;
   auto rcut = split(regions, roff, rsize, nt, "\n", 1);
-  // A claimed country slot stays pending until its dense ID is published.
-  std::vector<std::atomic<uint16_t>> present(1 << 15);
-  std::array<u32, 256> codes{};
-  std::atomic<u32> country_count{0};
-  auto index_for = [&](u32 code) {
-    auto &slot = present[code];
-    uint16_t id = slot.load(std::memory_order_acquire);
-    if (!id) {
-      uint16_t empty = 0;
-      if (slot.compare_exchange_strong(empty, UINT16_MAX,
-                                       std::memory_order_acq_rel)) {
-        id = country_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        codes[id] = code;
-        slot.store(id, std::memory_order_release);
-      } else
-        id = empty;
-    }
-    while (id == UINT16_MAX)
-      id = slot.load(std::memory_order_acquire);
-    return u8(id);
+  std::vector<std::atomic<u8>> present(1 << 15);
+  std::array<u8, 1 << 15> index_of{};
+  std::vector<u32> codes;
+  auto number_countries = [&]() noexcept {
+    if (codes.empty())
+      for (u32 k = 0; k < (1 << 15); ++k)
+        if (present[k].load(std::memory_order_relaxed))
+          codes.push_back(k), index_of[k] = codes.size();
   };
-  std::barrier sync(nt);
+  std::barrier sync(nt, number_countries);
   size_t start = size ? (char *)memchr(records, '\n', size) - records + 1 : 0;
-  const int pieces = 12 * nt;
+  const int pieces = 8 * nt;
   auto cut = split(records, start, size, pieces, "\r\n", 2);
   std::vector<std::array<Totals, 256>> totals(nt);
   NameTable names;
   std::atomic<u64> *seen_bits = zeroed(std::atomic<u64>, 256 * WORDS);
   std::atomic<int> claim{0};
+  std::vector<std::atomic<u8>> released(pieces / 4);
 
   auto worker = [&](int t) {
     pop_share(country_of, nreg, t, nt);
     pop_share(names.slots_, NameTable::SLOTS * 8, t, nt);
-    pop_share(names.tags_, NameTable::SLOTS, t, nt);
+    for (const char *p = regions + rcut[t]; p < regions + rcut[t + 1];)
+      present[region_line(p).second].store(1, std::memory_order_relaxed);
+    sync.arrive_and_wait();
+    pop_share(seen_bits, (codes.size() + 1) * WORDS * 8, t, nt);
     for (const char *p = regions + rcut[t]; p < regions + rcut[t + 1];) {
       auto [id, c] = region_line(p);
-      country_of[id] = index_for(c);
+      country_of[id] = index_of[c];
     }
     sync.arrive_and_wait();
-    pop_share(seen_bits,
-              (country_count.load(std::memory_order_relaxed) + 1) * WORDS * 8,
-              t, nt);
     for (int k; (k = claim++) < pieces;) {
       parse_records(records + cut[k], records + cut[k + 1], records + size,
                     country_of, nreg, names, seen_bits, totals[t].data());
+      // The last completed piece releases only the group interior; keep edge
+      // pages mapped for wide loads by neighbouring live parsers.
+      unsigned group = k / 4;
+      u8 bit = 1u << (k % 4);
+      if ((released[group].fetch_or(bit, std::memory_order_acq_rel) | bit) ==
+          ((1u << 4) - 1)) {
+        size_t first = (cut[group * 4] + 4096) & ~size_t(4095);
+        size_t last = (cut[(group + 1) * 4] - 1) & ~size_t(4095);
+        if (first < last)
+          munmap((void *)(records + first), last - first);
+      }
     }
-    sync.arrive_and_wait();
-    for (u32 c = t; c <= country_count.load(std::memory_order_relaxed); c += nt)
-      for (u32 w = 0; w < WORDS; ++w)
-        totals[t][c].distinct += __builtin_popcountll(seen_bits[c * WORDS + w]);
   };
 
   std::vector<std::thread> pool;
@@ -320,21 +306,17 @@ int main(int argc, char **argv) {
     o = std::to_chars(o, o + 32, u64(c) / 100).ptr;
     *o++ = '.', *o++ = '0' + u64(c) % 100 / 10, *o++ = '0' + u64(c) % 10;
   };
-  std::vector<u32> order(country_count.load(std::memory_order_relaxed));
-  std::iota(order.begin(), order.end(), 1);
-  std::sort(order.begin(), order.end(),
-            [&](u32 a, u32 b) { return codes[a] < codes[b]; });
-  order.push_back(0);
-  for (u32 c : order) {
+  for (u32 i = 1; i <= codes.size() + 1; ++i) {
+    u32 c = i % (codes.size() + 1);
     Totals sum;
     for (int t = 0; t < nt; ++t)
       sum.add(totals[t][c]);
     if (sum.count == 0)
       continue;
     c == 0 ? (void)(memcpy(o, "_UNMATCHED", 10), o += 10)
-           : (void)(*o++ = 'A' + (codes[c] >> 10),
-                    *o++ = 'A' + ((codes[c] >> 5) & 31),
-                    *o++ = 'A' + (codes[c] & 31));
+           : (void)(*o++ = 'A' + (codes[c - 1] >> 10),
+                    *o++ = 'A' + ((codes[c - 1] >> 5) & 31),
+                    *o++ = 'A' + (codes[c - 1] & 31));
     put_u(sum.count), put_u(sum.id_sum), put_m(sum.amount_sum),
         put_m(sum.amount_min), put_m(sum.amount_max), put_u(sum.distinct),
         put_u(sum.name_bytes), put_u(sum.note_bytes), *o++ = '\n';
