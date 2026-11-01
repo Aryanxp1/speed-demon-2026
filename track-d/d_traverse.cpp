@@ -319,9 +319,11 @@ Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
 // ---------------------------------------------------------------- ordering
 
 // One worker's share of the search order: vertices in discovery order, the
-// end of each one's out-edges, and those edges with their raw heads.
+// out-degree (with an exact overflow list), and edges with their raw heads.
 struct alignas(64) Region {
-  u32 *order, *ends, *out, len = 0, edges = 0;
+  u32 *order, *out, len = 0, edges = 0;
+  unsigned char *degree;
+  std::vector<u32> large_degree;
   Escapes esc; // keyed by position in out
 };
 
@@ -411,8 +413,14 @@ struct Grower {
       for (u32 h = hi + BATCH; h < std::min(reg.len, hi + 2 * BATCH); ++h)
         __builtin_prefetch(&raw.off[reg.order[h]]);
       size_t walking = 0;
-      for (u32 h = lo; h < hi; ++h)
-        expand(reg.order[h], walking), reg.ends[h] = reg.edges;
+      for (u32 h = lo; h < hi; ++h) {
+        u32 before = reg.edges;
+        expand(reg.order[h], walking);
+        u32 degree = reg.edges - before;
+        reg.degree[h] = std::min(255u, degree);
+        if (degree >= 255)
+          reg.large_degree.push_back(degree);
+      }
       while (walking) {
         size_t kept = 0;
         for (size_t i = 0; i < walking; ++i)
@@ -435,7 +443,7 @@ Graph *contract(Graph *raw, const Bits &bypass, unsigned threads,
   std::vector<Region> regions(threads);
   parallel(threads, [&](unsigned t) {
     Region &reg = regions[t];
-    reg.order = alloc<u32>(n), reg.ends = alloc<u32>(n),
+    reg.order = alloc<u32>(n), reg.degree = alloc<unsigned char>(n),
     reg.out = alloc<u32>(m);
     Grower grower{*raw, bypass, claimed, Bits(claimed.size()), reg};
     for (u32 x = cut(n, t, threads); x < cut(n, t + 1, threads); ++x)
@@ -467,15 +475,19 @@ Graph *contract(Graph *raw, const Bits &bypass, unsigned threads,
     Region &reg = regions[t];
     std::sort(reg.esc.begin(), reg.esc.end());
     auto esc = reg.esc.begin();
+    size_t wide_degree = 0;
     for (u32 i = 0, pos = 0; i < reg.len; ++i) {
       g->off[base[t] + i] = edges[t] + pos;
-      for (; pos < reg.ends[i]; ++pos) {
+      for (u32 end =
+               pos + (reg.degree[i] == 255 ? reg.large_degree[wide_degree++]
+                                           : reg.degree[i]);
+           pos < end; ++pos) {
         u32 e = reg.out[pos], w = e & mask;
         u64 weight = w == mask ? esc++->second : w;
         g->put(edges[t] + pos, locate(where[e >> wbits]), weight, escapes[t]);
       }
     }
-    release(reg.ends, n), release(reg.out, m);
+    release(reg.degree, n), release(reg.out, m);
   });
   g->off[g->n] = edges[threads];
   g->merge(escapes);
@@ -506,7 +518,7 @@ Graph *transpose(const Graph &g, unsigned threads) {
 // push always writes the entry but counts it only when `take`, so relaxations
 // need no branch.
 struct Queue {
-  static constexpr u32 B = 2048;
+  static constexpr u32 B = 64;
   struct Bucket {
     u32 *data = nullptr, size = 0, cap = 0;
   } bucket[B];
@@ -561,27 +573,29 @@ struct Queue {
 // next search, so memory follows the searches rather than the graph. Pages
 // are handed out in order: only the deepest search's pages are ever touched.
 // A blank label holds NONE: INF, or all ones when L is narrower.
+// Directory entries are element offsets; zero refers to the shared blank page.
 template <class L> struct Labels {
   static constexpr L NONE = std::min<u64>(INF, L(-1));
-  std::vector<L *> dir;
-  std::vector<u32> used;
-  L *store, blank[128];
-  explicit Labels(u32 n) : dir(n / 128 + 1, blank), store(alloc<L>(n + 128)) {
-    std::fill(blank, blank + 128, NONE);
+  std::vector<u32> dir, used;
+  L *store;
+  explicit Labels(u32 n)
+      : dir(n / 128 + 1), store(alloc<L>((dir.size() + 1) * 128)) {
+    std::fill(store, store + 128, NONE);
   }
-  L *at(u32 v) const { return dir[v / 128] + v % 128; }
+  L *at(u32 v) const { return store + dir[v / 128] + v % 128; }
   u64 get(u32 v) const { return *at(v); }
-  // Any finite distance improves a blank label, so writes go to real pages.
   L *slot(u32 v) {
-    if (dir[v / 128] == blank) {
-      dir[v / 128] = std::fill_n(store + used.size() * 128, 128, NONE) - 128;
+    u32 &p = dir[v / 128];
+    if (!p) {
+      p = (used.size() + 1) * 128;
+      std::fill_n(store + p, 128, NONE);
       used.push_back(v / 128);
     }
     return at(v);
   }
   void reset() {
-    for (u32 page : used)
-      dir[page] = blank;
+    for (u32 p : used)
+      dir[p] = 0;
     used.clear();
   }
 };
@@ -650,7 +664,7 @@ template <class L> struct Worker {
     while (fs < 256) {
       u64 f = fwd.queue.lower_bound(), known = fwd.dist.get(t);
       if (known < f || f == INF)
-        return known;
+        return f == INF && known == Labels<L>::NONE ? INF : known;
       fs += fwd.drain(bwd, best);
     }
     bwd.start(t);
@@ -702,7 +716,8 @@ int main() {
     for (size_t k; (k = next++) < queries;) {
       u32 i = by_source[k], s = ends[2 * i], t = ends[2 * i + 1];
       u64 d = narrow.solve(s, t);
-      if (narrow.fwd.wide || narrow.bwd.wide || d >= Labels<u32>::NONE) {
+      if (narrow.fwd.wide || narrow.bwd.wide ||
+          (d >= Labels<u32>::NONE && d < INF)) {
         if (!wide)
           wide = new Worker<u64>{Side<u64>(*fwd), Side<u64>(*rev)};
         d = wide->solve(s, t);

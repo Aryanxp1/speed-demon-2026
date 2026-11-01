@@ -1,9 +1,9 @@
 # Team Lex: Track D
 
-Retained source is restored byte-for-byte to the first-place CSR implementation `f3c7439`. Its latest best is **74.589385 points / K=31.030423**, T=0.099307 s, M=59,797,504 bytes, S=634 (`d67777d`, `run-dd36ed5a58fd`; source unchanged from f3c7439).
+Current candidate compacts construction out-degrees into bytes with an exact overflow list, stores search-label page offsets in 32 bits, and uses a smaller near-distance bucket ring. The CSR engine, persistent phase pool, AVX2 parser, exact distant heap and conservative u64 retry remain. Exhausted narrow searches return unreachable directly when no overflow occurred.
 
-The packed-map challenger 4dabb25 passed every gate but regressed on the scoring machine: 72.965705 / K=28.794803, T=0.117368 s. It is not retained. Further experiments remain outside the submission until validated.
+Previous official best: **74.595852 points / K=31.039666**, T=0.100483 s, M=59,170,816 bytes, S=617 (`406a96b`, `run-24e9596420e9`, packed-map challenger). The persistent-pool baseline reached 74.589385 / K=31.030423 (`d67777d`). The new compact candidate is awaiting evaluation; local results do not establish its official score.
 
-The retained engine combines CSR adjacency, six-byte parse bins, degree-two contraction/BFS ordering, an exact bidirectional bucket search and conservative u32-to-u64 retries. Lex's persistent worker pool, AVX2 scanner and checked mappings remain. The pinned native twelve-worker seed-17 PGO build and organizer generator bytes are unchanged. See PERF.md for verification and experiment history.
+In 41 interleaved rounds on each of two full datasets, the candidate's median paired wall-time ratio was 0.9820 / 0.9803 versus the baseline. Sampled local anonymous peak memory was 53,336 KiB versus 56,100 KiB. These are local proxies, not official resource measurements. See PERF.md for validation and earlier experiments.
 
-Environment: SD_DATA, SD_OUT and SD_THREADS; output defaults to /out/distances.txt. Zero external dependencies.
+The pinned native twelve-worker seed-17 PGO build and organizer generator bytes are unchanged. Zero external runtime dependencies. Environment: SD_DATA, SD_OUT and SD_THREADS; default output /out/distances.txt.
