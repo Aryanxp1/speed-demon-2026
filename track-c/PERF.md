@@ -66,3 +66,10 @@ Official evaluation pending. The requested approximately 80 points has not yet b
 `run-1a9beab954da`, implementation `2c9f85b`: all gates passed; T=0.031880 s, M=10,342,400 bytes, S=328, D=1, K=36.798488, **78.291499 points**. Previous best remains 78.469422 at 0.033112 s / 9,134,080 bytes / 323 lines. The wider probe is removed: its runtime gain did not compensate for the official memory/source costs.
 
 Retained follow-up uses the original four-slot probing and the four-record pipeline. Removed forced loop unrolling from the Docker build; ordinary O3 retains the compiler's normal profitability choices. A randomized 41-run comparison checked every output: original median 24.470 ms, original without forced unrolling 23.804 ms, four-record pipeline with forced unrolling 23.955 ms, four-record pipeline without forced unrolling 23.061 ms. O2 and LTO did not beat it. No change to memory layout or hash representation. The preceding candidate passed AddressSanitizer on full input, repeated stored-reference tests, and fresh tiny seeds 7/81/311/2026. Further official evaluation pending; approximately 80 points is still not confirmed.
+
+
+### Confirmed pipeline result; remove unused linked sections
+
+Official `run-1c661988b78a`, implementation `a05d3f3`: T=0.032187 s, M=9,396,224 bytes, S=323, D=1, K=37.418225, **78.654159 points**, all gates passed. New best, but the requested approximately 80 has not been reached.
+
+Packaging follow-up enables function/data sections and linker garbage collection, and omits compiler-generated unwind tables in this already exception-disabled binary. Source, parsing and output are unchanged. Local binary shrinks to 1,066,752 bytes. Twenty-one randomized memory-sampled runs: unchanged build 23.542 ms / 6,332 KiB anonymous peak median; stripped-section build 23.013 ms / 6,324 KiB. Every full output matched. These local samples do not establish any official memory reduction; board evaluation is necessary.
