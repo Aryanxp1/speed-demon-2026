@@ -525,7 +525,7 @@ fn main() {
     let text = map(&format!("{data_dir}/docs.txt"));
     let mut cut: Vec<usize> = (0..=THREADS).map(|t| text.len() * t / THREADS).collect();
     for c in &mut cut[1..THREADS] {
-        while *c < text.len() && text[*c - 1] != b'\n' {
+        while *c > 0 && *c < text.len() && text[*c - 1] != b'\n' {
             *c += 1;
         }
     }
@@ -631,8 +631,9 @@ fn main() {
             // after which captured values would be loaded again for every token.
             let (nkeep, a0, nbits, lists, off) = (nkeep, a0, nbits, lists, doc - first);
             let (last, pending) = (&mut last[..=nkeep], &mut pending[..=nbits]);
-            kept.resize(toks.len(), 0);
-            anchors.resize(toks.len(), 0);
+            // Retain initialized slots across shorter documents instead of zeroing them again.
+            kept.resize(kept.len().max(toks.len()), 0);
+            anchors.resize(anchors.len().max(toks.len()), 0);
             let (mut n, mut na) = (0, 0);
             for (at, &id) in toks.iter().enumerate() {
                 let i = (id as usize).min(nkeep);

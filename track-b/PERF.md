@@ -251,3 +251,12 @@ Local comparisons against the official 71.266-point implementation: repeated ran
 Validation: byte-exact stored tiny/sample/full and seeds 42/999; six fresh Python-oracle datasets (2,200 documents and 605 queries each); one-query and 36-short-term dictionaries; empty corpus and queries; token lengths 33/63/64/65/127/128/129/4097 at all 64 alignments; a 100 KB document; 80 distinct 32-byte terms sharing their first 16 bytes; and a 40,000-document Boolean/phrase set exercising list-to-bitmap conversions and bitmap tails. AddressSanitizer passed token-boundary, same-prefix-collision and bitmap-conversion datasets. Separate unwind-mode pool tests abort promptly on caller and worker panic rather than retaining a dangling scoped job or hanging. Docker is unavailable locally; official container evaluation remains pending.
 
 Activated source: offline Cargo dev check and release build pass with warnings denied. Full output SHA-256: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`. Only Track B source and documentation changed.
+
+
+### Official adaptation result and document-buffer follow-up
+
+Board `run-0164d9eccf00`, commit `3abcaab`: all gates pass; T=0.176894 s, M=48,070,656 bytes, S=647, D=1, K=28.571112, **72.796357 points**. Previous best `run-00f428b9a83a` (same prior code at `60cb66c`): 71.327156 points, 0.198953 s, 47,734,784 bytes, 693 lines. The supplied architecture is retained, but 73 is not yet confirmed.
+
+Follow-up: the kept-term and phrase-anchor working arrays now retain their initialized length across shorter documents. Previously each `resize(toks.len())` shrank them and then zero-filled them again on the next longer document. Only their live prefixes are consumed, so retaining old initialized tail slots changes no results. Also guarded the line-partition look-behind when a corpus is shorter than twelve bytes.
+
+A 17-run randomized comparison favored retained working arrays (141.020 ms versus 143.406 ms); a subsequent 19-run memory-sampled comparison: 134.640 versus 137.673 ms, median anonymous peaks 42,360 versus 42,384 KiB, maxima 42,552 versus 42,760 KiB. Timed outputs matched exactly. Rejected larger/smaller lookup rings, skipping unkept IDs in the document handler, altered bitmap thresholds, output preallocation, smaller posting chunks, and formatting alternatives; none established a better complete trade-off. Larger chunks and a shorter catch-unwind pool wrapper were also left out. No dependency or build-policy changes.
