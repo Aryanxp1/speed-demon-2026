@@ -145,4 +145,14 @@ Six-worker/larger-block `c0aab6e`, `run-439a6aa7c42b`: 82.597220 points, K=44.86
 
 The exact submitted candidate passes 16 differential datasets at 1/4/12 workers and ASan+UBSan on the same datasets at 1/12 workers. The additional dense fixture contains 26,000 shortest legal lines, crossing the larger block boundary and checking record-buffer capacity. The actual default path, without `SD_THREADS`, also passes the full seed-1 hash in release and sanitizer builds. A final 41-round comparison at six workers measured original blocks 15.487 ms versus 14.492 ms with the new blocks; every timed output hash was checked. Local canonical C++ count remains 568 lines (the previous official total was 575 including the Dockerfile). The candidate changes only block size, bounded lookahead, and the default worker cap; it retains the best evaluated source algorithm and original pinned build.
 
-Twelve-worker/larger-block official result: pending.
+Twelve-worker/larger-block `c66d3a0`, `run-2b6f8ee016e7`: 83.826604 points, K=47.482336, T=0.017431 s, M=23,867,392 bytes, S=575, D=1. All gates passed. Rejected: the original 256 KiB blocks, two-block-per-worker lookahead and twelve-worker default are restored. Local gains from larger blocks did not offset their official memory cost.
+
+### Compact fallback and standard formatting
+
+Keep the original SIMD parsing, exact private dictionaries, SIMD multi-rank selection and bitonic leaves, original block settings and original pinned build. Replace the startup-only dictionary spin lock with `std::mutex`; remove an unused `Job` destructor (jobs were never deleted and `_exit` bypasses reclamation); unify the depth-limit and degenerate-partition full-sort fallback; and use standard `to_chars` for exact integer formatting. A degenerate SIMD partition now sorts the group rather than peeling duplicate pivots. This handles every uint32 value and duplicate pattern exactly, with the same worst-case correctness contract.
+
+Canonical C++ count falls from 568 to 527 lines. In 61 randomized comparisons restricted to CPUs 0..11, baseline median wall/CPU time was 22.030/138.751 ms, the simpler fallback and mutex 22.054/131.110 ms, and that change plus standard formatting 22.215/133.554 ms. Standard formatting alone was 22.911/142.222 ms and was not selected independently. Every timed full output hash checked. The combined candidate is selected for its lower canonical source cost and lower CPU work at comparable local wall time; official K remains decisive.
+
+Compact fallback/formatting official result: pending.
+
+Validation: the submitted implementation passes all 16 differential datasets at 1/4/12 workers and ASan+UBSan on those datasets at 1/12 workers. ThreadSanitizer also passes the official edge fixture, adversarial selection fixture and shuffled sample input at twelve workers with no race reports. The static build is warning-clean under `-Wall -Wextra -Werror`. Canonical LLVM formatting is applied to the source; the reduction comes from removing redundant implementations and unused code, not layout tricks. All files outside Track A remain unchanged by this work.

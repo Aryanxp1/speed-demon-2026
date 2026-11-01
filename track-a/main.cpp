@@ -22,9 +22,10 @@
 #include <vector>
 
 namespace {
-constexpr uint32_t kHours = 72, kIds = 2048, kBlock = 768 << 10, kStreams = 4;
+constexpr uint32_t kHours = 72, kIds = 2048, kBlock = 256 << 10, kStreams = 4;
 constexpr uint32_t kLag = 2, kNever = 1000, kKeep = 2;
-constexpr uint32_t kMaxLine = 178, kRunCap = kBlock / 40 + 16, kPartCap = kIds * 256;
+constexpr uint32_t kMaxLine = 178, kRunCap = kBlock / 40 + 16,
+                   kPartCap = kIds * 256;
 const char *const kDays[] = {"2026-10-30", "2026-10-31", "2026-11-01",
                              "2026-11-02"};
 
@@ -90,8 +91,8 @@ uint32_t split(const int32_t *src, int32_t *dst, uint32_t lo, uint32_t hi,
   uint32_t i = lo, l = lo, r = hi;
   for (; hi - i >= 16; i += 8) {
     const __m256i v = load(src + i);
-    const uint32_t m = _mm256_movemask_ps(
-        _mm256_castsi256_ps(_mm256_cmpgt_epi32(bound, v)));
+    const uint32_t m =
+        _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(bound, v)));
     auto lanes = [&](const uint8_t *idx) {
       return _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i *)idx));
     };
@@ -133,13 +134,16 @@ __m256i merge8(__m256i v) { // v is a bitonic sequence
 }
 void sort16(const int32_t *a, uint32_t n, int32_t *out) {
   const __m256i iota = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7),
-                big = _mm256_set1_epi32(INT32_MAX), count = _mm256_set1_epi32(n);
+                big = _mm256_set1_epi32(INT32_MAX),
+                count = _mm256_set1_epi32(n);
   __m256i x = _mm256_blendv_epi8(big, load(a), _mm256_cmpgt_epi32(count, iota)),
           y = _mm256_blendv_epi8(
               big, load(a + 8),
-              _mm256_cmpgt_epi32(count, _mm256_add_epi32(iota, _mm256_set1_epi32(8))));
+              _mm256_cmpgt_epi32(count,
+                                 _mm256_add_epi32(iota, _mm256_set1_epi32(8))));
   x = sort8(x);
-  y = _mm256_permutevar8x32_epi32(sort8(y), _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0));
+  y = _mm256_permutevar8x32_epi32(sort8(y),
+                                  _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0));
   _mm256_storeu_si256((__m256i *)out, merge8(_mm256_min_epi32(x, y)));
   _mm256_storeu_si256((__m256i *)(out + 8), merge8(_mm256_max_epi32(x, y)));
 }
@@ -156,62 +160,36 @@ void multiselect(int32_t *a, int32_t *b, uint32_t lo, uint32_t hi,
       out[i] = sorted[k[i] - lo];
     return;
   }
-  if (depth > 40) {
-    std::sort(a + lo, a + hi);
-    for (int i = 0; i < nk; ++i)
-      out[i] = a[k[i]];
-    return;
-  }
-  const int32_t x = a[lo], y = a[lo + (hi - lo) / 2], z = a[hi - 1];
-  int32_t pivot = std::max(std::min(x, y), std::min(std::max(x, y), z));
-  uint32_t cut = lo + split(a, b, lo, hi, pivot);
-  if (cut == lo) { // pivot is the minimum: peel off its duplicates
-    if (pivot == INT32_MAX) {
-      std::fill(out, out + nk, pivot);
+  if (depth <= 40) {
+    const int32_t x = a[lo], y = a[lo + (hi - lo) / 2], z = a[hi - 1];
+    int32_t pivot = std::max(std::min(x, y), std::min(std::max(x, y), z));
+    uint32_t cut = lo + split(a, b, lo, hi, pivot);
+    if (cut > lo) {
+      const int left = std::lower_bound(k, k + nk, cut) - k;
+      if (left)
+        multiselect(b, a, lo, cut, k, left, out, depth + 1);
+      if (left < nk)
+        multiselect(b, a, cut, hi, k + left, nk - left, out + left, depth + 1);
       return;
     }
-    cut = lo + split(a, b, lo, hi, pivot + 1);
-    for (int i = 0; i < nk && k[i] < cut; ++i)
-      out[i] = pivot;
-    if (cut == hi)
-      return;
-    int done = std::lower_bound(k, k + nk, cut) - k;
-    if (done < nk)
-      multiselect(b, a, cut, hi, k + done, nk - done, out + done, depth + 1);
-    return;
   }
-  const int left = std::lower_bound(k, k + nk, cut) - k;
-  if (left)
-    multiselect(b, a, lo, cut, k, left, out, depth + 1);
-  if (left < nk)
-    multiselect(b, a, cut, hi, k + left, nk - left, out + left, depth + 1);
+  std::sort(a + lo, a + hi);
+  for (int i = 0; i < nk; ++i)
+    out[i] = a[k[i]];
 }
-
-// Dictionary inserts are tiny and bursty at startup, so waiters spin instead of
-// sleeping.
-struct SpinLock {
-  std::atomic_flag held = ATOMIC_FLAG_INIT;
-  void lock() {
-    for (int i = 0; held.test_and_set(std::memory_order_acquire); ++i)
-      if (i < 64)
-        _mm_pause();
-      else
-        sched_yield();
-  }
-  void unlock() { held.clear(std::memory_order_release); }
-};
 
 // Exact endpoint dictionary. The global part is an append-only log (key image,
 // length, fingerprint) behind a lock whose size is published with a release
-// store; entries below it never change. Each worker mirrors the log in a private
-// bucket table, so the hot lookups are plain SIMD reads without sharing. Keys
-// are stored after a space and zero-padded, so n + 1 equal bytes prove equality.
+// store; entries below it never change. Each worker mirrors the log in a
+// private bucket table, so the hot lookups are plain SIMD reads without
+// sharing. Keys are stored after a space and zero-padded, so n + 1 equal bytes
+// prove equality.
 struct Names {
   alignas(64) char img[kIds][128]{};
   uint32_t len[kIds]{}, hash[kIds]{};
   std::atomic<uint32_t> size{0};
   std::vector<uint16_t> sorted; // ids in byte order of their names (under mu)
-  SpinLock mu;
+  std::mutex mu;
 
   bool same(uint32_t id, const char *ep, uint32_t n) const {
     auto eq = [&](int i) {
@@ -251,7 +229,7 @@ struct Local { // one worker's private open-addressing view of the dictionary
     sync(names);
     if (const int id = lookup(names, ep, n, h); id >= 0)
       return id;
-    std::lock_guard<SpinLock> lock(names.mu);
+    std::lock_guard<std::mutex> lock(names.mu);
     sync(names); // another worker may have published it meanwhile
     if (const int id = lookup(names, ep, n, h); id >= 0)
       return id;
@@ -292,24 +270,9 @@ struct Stream {
   Rec **at = nullptr;
 };
 
-// The eight decimal digits of v < 10^8 as bytes 0..9, most significant first.
-uint64_t digits_of(uint32_t v) {
-  uint64_t x = v / 10000 | uint64_t{v % 10000} << 32;
-  uint64_t q = (x * 5243 >> 19) & 0x0000007f0000007f;
-  x = q | (x - q * 100) << 16;
-  q = (x * 103 >> 10) & 0x000f000f000f000f;
-  return q | (x - q * 10) << 8;
-}
-// Appends a space and v; 16 bytes of slack must follow.
-__attribute__((always_inline)) inline char *put(char *out, uint32_t v) {
+inline char *put(char *out, uint32_t v) {
   *out++ = ' ';
-  if (v >= 100000000)
-    return std::to_chars(out, out + 10, v).ptr;
-  const uint64_t d = digits_of(v);
-  const uint32_t skip = __builtin_ctzll(d | uint64_t{1} << 56) / 8;
-  const uint64_t text = (d + 0x3030303030303030) >> 8 * skip;
-  std::memcpy(out, &text, 8);
-  return out + 8 - skip;
+  return std::to_chars(out, out + 10, v).ptr;
 }
 
 struct Job {
@@ -330,17 +293,13 @@ struct Job {
   uint32_t written = 0;    // hours written so far
   bool writing = false;
   std::atomic<size_t> zapped{0}; // 4 MiB steps of the mapping released
-  std::vector<Rec *> runbufs; // free buffers, guarded by mu
+  std::vector<Rec *> runbufs;    // free buffers, guarded by mu
   std::vector<std::vector<int32_t>> latbufs;
   std::vector<std::unique_ptr<char[]>> outbufs;
 
   Job(const char *b, size_t n, uint32_t l, int f, uint32_t t)
       : base(b), size(n), lag(l), nblocks((n + kBlock - 1) / kBlock),
         threads(t), fd(f), top(nblocks, -1) {}
-  ~Job() {
-    for (Rec *r : runbufs)
-      std::free(r);
-  }
 
   template <class T> T take(std::vector<T> &pool) {
     std::lock_guard<std::mutex> lock(mu);
@@ -362,9 +321,8 @@ struct Job {
   }
 
   // Parses one line of the stream; 256 readable bytes must follow it.
-  __attribute__((always_inline)) void line(Local &local, Stream &st,
-                                           Rec *(&wp)[kHours],
-                                           Rec *(&bp)[kHours]) {
+  __attribute__((always_inline)) void
+  line(Local &local, Stream &st, Rec *(&wp)[kHours], Rec *(&bp)[kHours]) {
     const char *p = st.pos;
     if (const uint64_t date = load64(p + 5); date != st.date) {
       st.date = date;
@@ -453,7 +411,7 @@ struct Job {
     {
       std::lock_guard<std::mutex> lock(mu);
       mine.swap(runs[hour]);
-      std::lock_guard<SpinLock> names_lock(names.mu);
+      std::lock_guard<std::mutex> names_lock(names.mu);
       order = names.sorted;
     }
     uint32_t count[2 * kIds] = {}, pos[kIds],
@@ -488,7 +446,8 @@ struct Job {
       const uint16_t id = live[i];
       const uint32_t errors = count[id + kIds], n = count[id] + errors;
       int32_t *const a = lat.data() + pos[id] - n;
-      const uint32_t ranks[3] = {(50 * n + 99) / 100 - 1, (95 * n + 99) / 100 - 1,
+      const uint32_t ranks[3] = {(50 * n + 99) / 100 - 1,
+                                 (95 * n + 99) / 100 - 1,
                                  (99 * n + 99) / 100 - 1};
       int32_t value[3];
       if (scratch.size() < n + 16)
@@ -552,7 +511,7 @@ struct Job {
   }
 
   // Finalizes hours once they are safe and otherwise parses blocks, but never
-  // more than one per worker past the oldest unfinished one.
+  // more than two per worker past the oldest unfinished one.
   void work() {
     const auto local = std::make_unique<Local>();
     std::unique_lock<std::mutex> lock(mu);
@@ -563,7 +522,7 @@ struct Job {
         lock.unlock();
         finalize(hour);
         lock.lock();
-      } else if (next_block < nblocks && next_block < watermark + threads) {
+      } else if (next_block < nblocks && next_block < watermark + 2 * threads) {
         const uint32_t block = next_block++;
         lock.unlock();
         parse(*local, block);
@@ -616,7 +575,8 @@ int main() {
     fail("open summary");
   cpu_set_t cpus{};
   sched_getaffinity(0, sizeof cpus, &cpus);
-  const uint32_t threads = forced ? std::clamp(std::atoi(forced), 1, 12) : std::clamp(CPU_COUNT(&cpus), 1, 12);
+  const uint32_t threads = forced ? std::clamp(std::atoi(forced), 1, 12)
+                                  : std::clamp(CPU_COUNT(&cpus), 1, 12);
   if (!(new Job(map, bytes, kLag, fd, threads))->run()) {
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET))
       fail("rewind summary");
