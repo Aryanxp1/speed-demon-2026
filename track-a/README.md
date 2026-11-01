@@ -9,3 +9,5 @@ The supplied hash merged some different repeated-prefix names in the endpoint-le
 The pinned offline Docker build links statically with AVX2/AES/VAES support. Workers are capped at twelve. Use --data and --out, or DATA_DIR/OUT_DIR; SD_DATA_DIR, SD_OUT_DIR and SD_THREADS are also supported. Defaults are /data and /out.
 
 Reference checks cover 17 datasets at 1/4/12 workers, and the same 17 pass AddressSanitizer at 1/12 workers. This includes reordered input, endpoint lengths 1..125, uint32 boundaries, and 1,677 names with single-byte variations and block permutations. These tests do not remove the fingerprint-collision limitation. The supplied source's reported 86.174 points is historical evidence, not a score claimed for this integration. Official results are recorded in PERF.md.
+
+Verified official result: **85.377705 points, K=50.998113**, run `run-232bf3c4e3bf`; all gates passed. This improves the previous team best of 84.737403 by 0.640302 points. The selected implementation seals and claims each hour with its writer guard and aborts a speculative claim on late records, retaining the complete fallback without a skip check on every record.
