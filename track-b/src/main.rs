@@ -22,8 +22,8 @@ const HEADER: usize = 1;
 const JOBS: usize = 16;
 const TALLY_IDS: usize = 10;
 const BATCH: usize = 1 << 14;
-const BUCKETS: usize = 1 << 16;
-const BUCKET_SLOTS: usize = 3;
+const BUCKETS: usize = 1 << 15;
+const BUCKET_SLOTS: usize = 7;
 const ID_BLOCK: usize = 32;
 const MAX_TERMS: usize = BUCKETS * BUCKET_SLOTS + 64 * ID_BLOCK;
 const AHEAD: usize = 20;
@@ -44,7 +44,6 @@ const MAX_WORDS: usize = 8;
 struct Bucket {
     tags: [u32; BUCKET_SLOTS + 1],
     actions: [u32; BUCKET_SLOTS + 1],
-    keys: [u64; BUCKET_SLOTS + 1],
 }
 
 struct Buffers {
@@ -74,7 +73,6 @@ struct Phrase {
     pivot: u32,
     next: u32,
     words: [u64; MAX_WORDS],
-    spans: [u32; MAX_WORDS],
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -276,48 +274,14 @@ unsafe fn hash_of(token: *const u8, len: usize) -> u64 {
 }
 
 #[inline(always)]
-unsafe fn word_equal(query: *const u8, encoded: u32, word: *const u8, len: usize) -> bool {
-    if encoded as usize & 63 != len || len == 0 || len > 32 {
-        return false;
-    }
-    let load = |p: *const u8| _mm256_or_si256(_mm256_loadu_si256(p.cast()), _mm256_set1_epi8(0x20));
-    let equal = _mm256_cmpeq_epi8(load(query.add((encoded >> 6) as usize)), load(word));
-    (_mm256_movemask_epi8(equal) as u32).trailing_ones() as usize >= len
-}
-
-#[inline(always)]
-unsafe fn inline_key(word: *const u8, len: usize) -> u64 {
-    _bzhi_u64(
-        std::ptr::read_unaligned(word.cast::<u64>()) | 0x2020_2020_2020_2020,
-        (len * 8) as u32,
-    )
-}
-
-#[inline(always)]
-unsafe fn key_equal(run: &Run, key: u64, word: *const u8, len: usize) -> bool {
-    if len <= 8 {
-        key == inline_key(word, len)
-    } else {
-        key >> 63 != 0 && word_equal(run.queries.as_ptr(), key as u32, word, len)
-    }
-}
-
-#[inline(always)]
-unsafe fn action_in(run: &Run, hash: u64, word: *const u8, len: usize) -> u32 {
-    if hash == 0 {
-        return 0;
-    }
-    let index = bucket_of(hash, run.bucket_count);
-    let bucket = &*run.buckets.add(index);
+unsafe fn action_in(run: &Run, hash: u64) -> u32 {
+    let bucket = run.buckets.add(bucket_of(hash, run.bucket_count));
     let wanted = _mm256_set1_epi32(hash as i32);
-    let wanted = _mm256_castsi256_si128(wanted);
-    let equal = _mm_cmpeq_epi32(_mm_load_si128((bucket as *const Bucket).cast()), wanted);
-    let found = _mm_movemask_ps(_mm_castsi128_ps(equal)) as u32 | 1 << BUCKET_SLOTS;
-    let slot = found.trailing_zeros() as usize;
-    let action = bucket.actions[slot];
-    let matches = key_equal(run, bucket.keys[slot], word, len);
-    if (action == OVERFLOW) | ((slot < BUCKET_SLOTS) & !matches) {
-        run.action_past(index, hash, word, len)
+    let same = _mm256_cmpeq_epi32(_mm256_load_si256(bucket.cast()), wanted);
+    let found = _mm256_movemask_ps(_mm256_castsi256_ps(same)) as u32 | 1 << BUCKET_SLOTS;
+    let action = (*bucket).actions[found.trailing_zeros() as usize];
+    if action == OVERFLOW {
+        run.action_past(hash)
     } else {
         action
     }
@@ -335,19 +299,18 @@ unsafe fn long_hash(token: *const u8, len: usize) -> u64 {
 
 impl Run {
     #[cold]
-    unsafe fn action_past(&self, mut index: usize, hash: u64, word: *const u8, len: usize) -> u32 {
+    unsafe fn action_past(&self, hash: u64) -> u32 {
+        let mut index = bucket_of(hash, self.bucket_count);
         loop {
             let bucket = &*self.buckets.add(index);
-            for slot in 0..BUCKET_SLOTS {
-                if bucket.tags[slot] == hash as u32 && key_equal(self, bucket.keys[slot], word, len)
-                {
-                    return bucket.actions[slot];
-                }
+            match bucket.tags[..BUCKET_SLOTS]
+                .iter()
+                .position(|&tag| tag == hash as u32)
+            {
+                Some(slot) => return bucket.actions[slot],
+                None if bucket.actions[BUCKET_SLOTS] == 0 => return 0,
+                None => index = (index + 1) % self.bucket_count,
             }
-            if bucket.actions[BUCKET_SLOTS] == 0 {
-                return 0;
-            }
-            index = (index + 1) % self.bucket_count;
         }
     }
 
@@ -472,13 +435,7 @@ impl Run {
                 while token < to {
                     let ahead = bucket_of(*hashes.add(token + AHEAD), self.bucket_count);
                     _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
-                    let from = *starts.add(token) as usize;
-                    let action = action_in(
-                        self,
-                        *hashes.add(token),
-                        text.add(from),
-                        *ends.add(token) as usize - from,
-                    );
+                    let action = action_in(self, *hashes.add(token));
 
                     *heavy_hits.add(heavy_count) = action;
                     heavy_count += (action >> 31) as usize;
@@ -521,16 +478,6 @@ impl Run {
                     if token >= pivot
                         && token - pivot + len <= ready
                         && b.hashes[token - pivot..token - pivot + len] == phrase.words[..len]
-                        && (0..len).all(|j| {
-                            let at = token - pivot + j;
-                            let from = b.starts[at] as usize;
-                            word_equal(
-                                self.queries.as_ptr(),
-                                phrase.spans[j],
-                                text.add(from),
-                                b.ends[at] as usize - from,
-                            )
-                        })
                     {
                         b.list_hits[list_count] =
                             (phrase.term as u64 + 1) << 32 | (hit >> 20 & ((1 << 20) - 1));
@@ -645,16 +592,7 @@ impl Run {
             let phrase = &mut *self.phrases.add(index);
 
             let terms = phrase.words[..phrase.len as usize].iter();
-            let terms = terms.enumerate().map(|(i, &hash)| {
-                let span = phrase.spans[i];
-                action_in(
-                    self,
-                    hash,
-                    self.queries.as_ptr().add((span >> 6) as usize),
-                    (span & 63) as usize,
-                ) as usize
-                    - 1
-            });
+            let terms = terms.map(|&hash| action_in(self, hash) as usize - 1);
             let (pivot, term) = (terms.enumerate())
                 .min_by_key(|&(_, term)| self.sample[term].load(Relaxed))
                 .unwrap();
@@ -824,7 +762,6 @@ impl Run {
 
             let body = &line[if phrase { 8 } else { 5 }..line.len() - phrase as usize];
             let (first, mut words, mut count) = (parsed.steps.len(), [0; MAX_WORDS], 0);
-            let mut spans = [0; MAX_WORDS];
             for word in body.split(|&c| c == b' ') {
                 match word {
                     b"AND" => op = Op::And,
@@ -832,12 +769,9 @@ impl Run {
                     b"NOT" => op = Op::Not,
                     _ => {
                         let hash = hash_of(word.as_ptr(), word.len());
-                        let offset = word.as_ptr().offset_from(self.queries.as_ptr()) as usize;
-                        let span = (offset << 6 | word.len()) as u32;
-                        let term = intern(self, &mut ids, hash, span);
+                        let term = intern(self, &mut ids, hash);
                         if phrase {
                             words[count] = hash;
-                            spans[count] = span;
                             count += 1;
                         } else {
                             (*self.terms.add(term as usize))
@@ -853,7 +787,7 @@ impl Run {
                 parsed.steps.push((Op::And, term));
 
                 let slot = &mut *self.phrases.add(self.setup[5].fetch_add(1, Relaxed));
-                (slot.term, slot.len, slot.words, slot.spans) = (term, count as u32, words, spans);
+                (slot.term, slot.len, slot.words) = (term, count as u32, words);
             }
             parsed.queries.push(first..parsed.steps.len());
         }
@@ -1079,7 +1013,7 @@ fn put_number(out: &mut Vec<u8>, mut value: u64) {
     out.push(b' ');
 }
 
-unsafe fn intern(run: &Run, ids: &mut std::ops::Range<u32>, hash: u64, span: u32) -> u32 {
+unsafe fn intern(run: &Run, ids: &mut std::ops::Range<u32>, hash: u64) -> u32 {
     let mut index = bucket_of(hash, run.bucket_count);
     loop {
         let bucket = run.buckets.add(index);
@@ -1091,14 +1025,6 @@ unsafe fn intern(run: &Run, ids: &mut std::ops::Range<u32>, hash: u64, span: u32
                 seen = match tag.compare_exchange(0, hash as u32, AcqRel, Acquire) {
                     Ok(_) => {
                         let term = new_id(run, ids);
-                        (*bucket).keys[slot] = if span & 63 <= 8 {
-                            inline_key(
-                                run.queries.as_ptr().add((span >> 6) as usize),
-                                (span & 63) as usize,
-                            )
-                        } else {
-                            1 << 63 | span as u64
-                        };
                         action.store(term + 1, Release);
                         return term;
                     }
@@ -1109,15 +1035,7 @@ unsafe fn intern(run: &Run, ids: &mut std::ops::Range<u32>, hash: u64, span: u32
                 while action.load(Acquire) == 0 {
                     std::hint::spin_loop();
                 }
-                let other = (*bucket).keys[slot];
-                if key_equal(
-                    run,
-                    other,
-                    run.queries.as_ptr().add((span >> 6) as usize),
-                    (span & 63) as usize,
-                ) {
-                    return action.load(Acquire) - 1;
-                }
+                return action.load(Acquire) - 1;
             }
         }
         AtomicU32::from_ptr(std::ptr::addr_of_mut!((*bucket).actions[BUCKET_SLOTS]))
@@ -1161,7 +1079,6 @@ fn main() {
     unsafe {
         let [text, queries] =
             ["docs.txt", "queries.txt"].map(|name| map_file(&format!("{data_dir}/{name}")));
-        assert!(queries.len() < 1 << 26);
         let occurrences = queries
             .windows(2)
             .filter(|p| p[0] == b' ' && p[1] & 32 != 0)
