@@ -231,4 +231,15 @@ The first compiler-only candidate changes release optimization from O3 to O2, re
 
 The actual O2 offline Cargo package passes all 18 reference datasets at 1/4/12 workers and the environment-only full hash. O2 AddressSanitizer passes all 18 at 1/12 workers. No algorithm, input/output, memory-ownership or dependency change accompanies this build comparison. Source and pinned build configuration remain available in Git for rollback.
 
-O2 compiler candidate official result: pending.
+O2 compiler candidate `9dc840f`, `run-d4cad2c6fda1`: all gates passed; T=0.019366 s, M=15,552,512 bytes, S=426, D=1, K=51.334919, 85.520644 points. Rejected against the O3 baseline's 85.767155 points and K=51.921007. Restore O3 for subsequent candidates.
+
+
+### Compact frozen contest interface
+
+Retain the best O3 parser, row encoding, percentiles, hour leases, fallback, hash and output writer. Remove the optional command-line/environment launch layer and data-file discovery: the executable now reads `/data/requests.log` and writes `/out/summary.txt`, the frozen contest contract. The output mount must already exist. CPU affinity determines the worker count through `available_parallelism`; no worker override is required by the contract. Replace a trivial unaligned-read wrapper with the standard-library alias and precompute the exact existing AES-key lane bits as two constants. The hash function and its previously documented probabilistic collision limitation are unchanged. No payload or implementation is moved into build metadata, and no formatting suppression is used.
+
+The canonical Rust source falls from 417 to 383 nonblank lines, a reduction of 34; the Dockerfile remains nine nonblank lines, predicting S=392 instead of 426. This is a source-cost improvement; local timing does not establish a runtime gain. Forty-one randomized interleaved runs of the actual static executables, with fixed contest paths inside an isolated root and RAM-backed output, measured baseline wall/CPU medians 14.807/124.922 ms and candidate 14.846/125.444 ms; median paired wall gain 0.453%. Every timed full-data SHA-256 checked.
+
+Validation uses an immutable copy of the final source (SHA-256 c4c95a1bd637a743bfeb9fd1f8e322a1ef43bc9ed2b0d58127c564ffafa1b52b) and the actual offline Cargo package with original pinned build flags, O3, fat LTO and zero crates. The unmodified production executable passes all 18 reference datasets at 1/4/12 CPU affinities using its literal contest paths. AddressSanitizer passes all 18 at 1/12 affinities; only fixture input/output paths are substituted in that diagnostic build. Includes reordered input, dense records, endpoint identities and all-short/decimal-boundary latencies. Full output SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. The complete non-streaming fallback and active-reader guards remain in production. Only Track A files are included in this change.
+
+Compact-interface official result: pending. The requested 86+ is not claimed before measurement.
