@@ -179,6 +179,6 @@ Adapted streaming claims, newline-first SIMD parsing, escaped four-byte rows, in
 
 Verification: 16 byte-exact reference datasets at 1/4/12 workers, all 16 under AddressSanitizer at 1/12 workers, endpoint lengths 1..125, latency boundaries, dense and reordered inputs, and forced endpoint-hash collisions. Full SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Nine randomized interleaved full-data rounds, CPUs 0..11, checked every timed hash: earlier Rust 27.488 ms, supplied Thor 15.804 ms, merged exact implementation 18.805 ms. These are local launch-inclusive timings, not official scores. Warnings-denied release builds pass. Actual offline Cargo build and official evaluation follow.
 
-Rust/Thor merge official result: pending.
+Rust/Thor merge `6165829`, `run-516d4447bd83`: all gates passed, including the pinned container build and correctness. T=0.023553 s, M=15,728,640 bytes, S=455, D=1, K=45.987662, **83.132067 points**. This is below the historical C++ best of 84.737403; the Rust merge remains active as explicitly requested. The supplied Thor source's 86.17 is not achieved by this implementation.
 
 Final packaging: the actual offline Cargo release build passes and produces a stripped static-PIE executable with the expected full hash. The selected source has no unnecessary comments. No Track C or D files are included in this change.
