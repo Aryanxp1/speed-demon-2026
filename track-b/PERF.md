@@ -314,3 +314,16 @@ Official serial-query result run-558160697e76, implementation 6efd846: all gates
 Retained official result: run-b5cf222b8139, K=30.195296, **73.996964 points**, T=0.160806 s, M=41,443,328 bytes, S=692, D=1. Every gate passed. The incoming verified best was 73.103392 points; improvement is 0.893572 points. The user's 75-point target has NOT been achieved. Retain exact dictionary equality and the verified best source instead of a slower speculative replacement.
 
 Restoration requires no new algorithm test: the code/build are identical to the evaluated 9dc2aee implementation, whose activated source passed all 23 datasets at 1/4/12 and environment-only invocation, with core optimized/ASan+UBSan/TSan verification and the deliberate CRC-collision test. Other tracks' source/builds are untouched by these commits. Experiments and raw timings remain outside the submission under /home/aryan/lex-b-75-next and the corresponding Windows Temp directory. Follow-up documentation records results only; no claim of 75+ or an unverified leaderboard rank is made.
+
+
+## 2026-11-01: Restore original Rust with selective scan improvements
+
+User requested their old Rust implementation as the base, with inspiration from `C:/Users/aryan/Downloads/trackb/trackb` (reported 75.365). Restored Rust source/manifests/build from `4a879b9`; no whole-file substitution. Retained full 32-byte dictionary equality, scoped worker lifetime, panic abort guard, and tiny-input partition guards.
+
+Adaptations: unconditional eight-slot token pipeline bootstrap; 1/64 sampling; input prefetch; carry-based token-end masking; spare pending-word OR; non-anchor phrase precheck; MADV_DONTNEED on completed interior pages while keeping the mapping valid and the boundary page resident. These reduce branches, sampling work, phrase comparisons and resident input memory.
+
+WSL native optimized full-data timing, 17 randomized interleaved rounds: old Rust median 128.526 ms, selected Rust 124.608 ms (3.05% reduction). A subsequent 13-round comparison measured 125.722 versus 120.644 ms. Local times are not scoring-box measurements. Grouped probing, batched query-key interning, explicit huge pages, alternative hashing and frozen exact short-key dictionaries failed to beat the selected version and were not retained.
+
+Verification: 23 exact-output datasets each at 1, 4 and 12 CPU affinities; all 23 with AddressSanitizer. Includes empty inputs, dense results, shared-prefix and actual CRC-collision cases. Native build passes with warnings denied. Full SHA-256 f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927. Official T/M/K/points and run ID pending this push. Historical old Rust best 73.103392; historical C++ best 73.996964. Friend's 75.365 must not be attributed to this candidate.
+
+Final restored Cargo build: release/offline/native with warnings denied passes; full output hash unchanged. One local run: 0.12 s, peak RSS 246436 KiB (includes mapped input pages; not official cgroup M). Docker daemon unavailable locally; pinned Docker recipe restored from the previous Rust submission, container build awaits board verification.
