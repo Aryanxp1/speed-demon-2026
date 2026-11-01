@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <immintrin.h>
+#include <numeric>
 #include <sched.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -108,8 +109,7 @@ struct NameTable {
         h = (h ^ tail) * 0x94D049BB133111EBull;
       }
     }
-    h = (h ^ h >> 31) * 0xD6E8FEB86659FD93ull;
-    return (h ^ h >> 32) + (h == 0);
+    return h + (h == 0);
   }
   void prefetch(u64 k) const {
     _mm_prefetch((const char *)(&slots_[k >> (64 - BITS)]), _MM_HINT_T0);
@@ -254,16 +254,28 @@ int main(int argc, char **argv) {
   u8 *country_of = zeroed(u8, nreg + 1);
   size_t roff = strchr(regions, '\n') - regions + 1;
   auto rcut = split(regions, roff, rsize, nt, "\n", 1);
-  std::vector<std::atomic<u8>> present(1 << 15);
-  std::array<u8, 1 << 15> index_of{};
-  std::vector<u32> codes;
-  auto number_countries = [&]() noexcept {
-    if (codes.empty())
-      for (u32 k = 0; k < (1 << 15); ++k)
-        if (present[k].load(std::memory_order_relaxed))
-          codes.push_back(k), index_of[k] = codes.size();
+  // A claimed country slot stays pending until its dense ID is published.
+  std::vector<std::atomic<uint16_t>> present(1 << 15);
+  std::array<u32, 256> codes{};
+  std::atomic<u32> country_count{0};
+  auto index_for = [&](u32 code) {
+    auto &slot = present[code];
+    uint16_t id = slot.load(std::memory_order_acquire);
+    if (!id) {
+      uint16_t empty = 0;
+      if (slot.compare_exchange_strong(empty, UINT16_MAX,
+                                       std::memory_order_acq_rel)) {
+        id = country_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        codes[id] = code;
+        slot.store(id, std::memory_order_release);
+      } else
+        id = empty;
+    }
+    while (id == UINT16_MAX)
+      id = slot.load(std::memory_order_acquire);
+    return u8(id);
   };
-  std::barrier sync(nt, number_countries);
+  std::barrier sync(nt);
   size_t start = size ? (char *)memchr(records, '\n', size) - records + 1 : 0;
   const int pieces = 12 * nt;
   auto cut = split(records, start, size, pieces, "\r\n", 2);
@@ -276,21 +288,20 @@ int main(int argc, char **argv) {
     pop_share(country_of, nreg, t, nt);
     pop_share(names.slots_, NameTable::SLOTS * 8, t, nt);
     pop_share(names.tags_, NameTable::SLOTS, t, nt);
-    for (const char *p = regions + rcut[t]; p < regions + rcut[t + 1];)
-      present[region_line(p).second].store(1, std::memory_order_relaxed);
-    sync.arrive_and_wait();
-    pop_share(seen_bits, (codes.size() + 1) * WORDS * 8, t, nt);
     for (const char *p = regions + rcut[t]; p < regions + rcut[t + 1];) {
       auto [id, c] = region_line(p);
-      country_of[id] = index_of[c];
+      country_of[id] = index_for(c);
     }
     sync.arrive_and_wait();
+    pop_share(seen_bits,
+              (country_count.load(std::memory_order_relaxed) + 1) * WORDS * 8,
+              t, nt);
     for (int k; (k = claim++) < pieces;) {
       parse_records(records + cut[k], records + cut[k + 1], records + size,
                     country_of, nreg, names, seen_bits, totals[t].data());
     }
     sync.arrive_and_wait();
-    for (u32 c = t; c <= codes.size(); c += nt)
+    for (u32 c = t; c <= country_count.load(std::memory_order_relaxed); c += nt)
       for (u32 w = 0; w < WORDS; ++w)
         totals[t][c].distinct += __builtin_popcountll(seen_bits[c * WORDS + w]);
   };
@@ -309,17 +320,21 @@ int main(int argc, char **argv) {
     o = std::to_chars(o, o + 32, u64(c) / 100).ptr;
     *o++ = '.', *o++ = '0' + u64(c) % 100 / 10, *o++ = '0' + u64(c) % 10;
   };
-  for (u32 i = 1; i <= codes.size() + 1; ++i) {
-    u32 c = i % (codes.size() + 1);
+  std::vector<u32> order(country_count.load(std::memory_order_relaxed));
+  std::iota(order.begin(), order.end(), 1);
+  std::sort(order.begin(), order.end(),
+            [&](u32 a, u32 b) { return codes[a] < codes[b]; });
+  order.push_back(0);
+  for (u32 c : order) {
     Totals sum;
     for (int t = 0; t < nt; ++t)
       sum.add(totals[t][c]);
     if (sum.count == 0)
       continue;
     c == 0 ? (void)(memcpy(o, "_UNMATCHED", 10), o += 10)
-           : (void)(*o++ = 'A' + (codes[c - 1] >> 10),
-                    *o++ = 'A' + ((codes[c - 1] >> 5) & 31),
-                    *o++ = 'A' + (codes[c - 1] & 31));
+           : (void)(*o++ = 'A' + (codes[c] >> 10),
+                    *o++ = 'A' + ((codes[c] >> 5) & 31),
+                    *o++ = 'A' + (codes[c] & 31));
     put_u(sum.count), put_u(sum.id_sum), put_m(sum.amount_sum),
         put_m(sum.amount_min), put_m(sum.amount_max), put_u(sum.distinct),
         put_u(sum.name_bytes), put_u(sum.note_bytes), *o++ = '\n';
