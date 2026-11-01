@@ -231,3 +231,10 @@ Each architecture below was implemented in isolated scratch files and tested aga
 - SIMD bitmap count/ID-sum and lookup-table variants: small or negligible total gains, insufficient after source-size cost. Combined per-term count/last state also failed to improve the selected challenger.
 
 The requested 75+ score has not been demonstrated. At unchanged M and S, the 70.983-point baseline would need roughly 0.143 s rather than 0.207 s to reach 75; this challenger is an intermediate measured improvement, not a claim of completion.
+
+
+### Official result: histogram and allocation challenger
+
+`run-46057b811e21`, commit `54ab550`: all gates passed; T=0.201720 s, M=46,768,128 bytes (44.60 MiB), S=693, D=1, K=26.626917, machine points **71.266044**. Previous fast-path best: 70.982890, 0.206527 s, 48,271,360 bytes, 670 lines. Kept: the measured complete-K gain is positive despite the histogram's added lines. **The 75+ target remains unmet.**
+
+Further checks during the queue wait: aligning document partitions to bitmap-word boundaries allowed plain relaxed stores instead of locked OR, but did not improve full-run time enough to retain. Compiler O2/Thin-LTO/no-LTO/static-link variants showed only small local differences; no build-policy change was made. Experimental sources and comparison scripts are preserved locally under `.data/track-b-75-sprint/`; they are not part of the submission and must not be treated as verified replacements. The active source is the exact algorithm evaluated in run-46057b811e21.
