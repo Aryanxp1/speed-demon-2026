@@ -50,3 +50,12 @@ Runs measured on the scoring box after the team was registered. M is the box's c
 | b5337cc | run-a5c9fc375dd6 | 0.0330 | 9.52 | 35.41 | 77.46 | Step 6: field-by-field parse, SIMD early hit, worker 0 on main, zero-alloc write |
 
 **What the board taught about memory.** The box backs anonymous memory with transparent huge pages, the laptop's Docker VM only on request. With them on, C measured 27 to 28 MiB on the box against 13 MB locally; turning them off for the whole process (`PR_SET_THP_DISABLE`) brought it to 12.2 MiB. Turning them off only for the sparse regions, or shrinking thread stacks, did not, so the extra comes from the dense tables being rounded to whole 2 MB pages. Huge pages also seem to make C faster (0.047 s with, 0.064 s without), but C's time on the box varies by about 20% between runs of the same code, so that is not settled. The version with them off scored the higher K and stays.
+
+
+## November 1: cache-line SIMD probing and shorter pipeline
+
+Researched grouped SIMD hashing (https://abseil.io/about/design/swisstables), parallel aggregation (https://duckdb.org/2022/03/07/aggregate-hashtable), and AES-based hashing (https://github.com/tkaitchuck/aHash). No library was added. Adapted the grouped-probing principle to the existing name table: compare eight 64-bit fingerprints in one cache line before advancing, rather than four slots in half a line. A failed claim still recognizes the winning identical fingerprint. CAS now explicitly uses relaxed ordering; slots publish only the fingerprint itself, with no associated payload. Reduced the record/mark pipeline lag from sixteen to four records.
+
+Randomized alternating, launch-inclusive WSL comparisons with affinity CPUs 0-11 and all output bytes checked: 27-run baseline median 22.072 ms versus combined candidate 20.928 ms; subsequent 41-run baseline 22.787 ms versus candidate 21.473 ms (5.8% faster). Local machine is i7-12700H/GCC 15.2; these are not board timings. Memory structures and capacities are unchanged. Rejected aligned totals, AES hashing, prechecking bitmap bits, larger/smaller work pieces, sixteen-slot probe groups, fewer workers, and direct first-bit counting with lock BTS; the BTS combination was slower than the retained challenger. Original source and experimental variants are preserved outside the submission in /home/aryan/lex-c-80.
+
+Official evaluation pending. The requested approximately 80 points has not yet been confirmed. Only Track C is changed; concurrent Track D work is excluded from staging.

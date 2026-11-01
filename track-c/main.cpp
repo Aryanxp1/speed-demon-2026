@@ -102,16 +102,21 @@ public:
   void prefetch(u64 k) const { _mm_prefetch((const char*)(&slots_[k >> (64 - BITS)]), _MM_HINT_T0); }
   __attribute__((always_inline)) inline u32 id(u64 k) {
     __m256i tgt = _mm256_set1_epi64x(k);
-    for (u32 i = (k >> (64 - BITS)) & ~3u;; i = (i + 4) & (SLOTS - 1)) {
-      __m256i v = _mm256_load_si256((const __m256i*)&slots_[i]);
-      u32 hit = mask64(_mm256_cmpeq_epi64(v, tgt));
-      if (__builtin_expect(hit != 0, 1)) return i + __builtin_ctz(hit);
-      for (u32 f = mask64(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())); f; f &= f - 1) {
+    for (u32 i = (k >> (64 - BITS)) & ~7u;; i = (i + 8) & (SLOTS - 1)) {
+      u32 hit = 0, free = 0;
+      for (u32 j = 0; j < 8; j += 4) {
+        __m256i v = _mm256_load_si256((const __m256i*)&slots_[i + j]);
+        hit |= mask64(_mm256_cmpeq_epi64(v, tgt)) << j;
+        free |= mask64(_mm256_cmpeq_epi64(v, _mm256_setzero_si256())) << j;
+      }
+      if (hit) return i + __builtin_ctz(hit);
+      for (u32 f = free; f; f &= f - 1) {
         u32 j = i + __builtin_ctz(f); u64 s = 0;
-        if (slots_[j].compare_exchange_strong(s, k) || s == k) return j;
+        if (slots_[j].compare_exchange_strong(s, k, std::memory_order_relaxed) || s == k) return j;
       }
     }
   }
+
   void populate(int t, int n) const { populate_share(slots_, SLOTS, t, n); }
 private:
   std::atomic<u64>* slots_ = zeroed<std::atomic<u64>>(SLOTS);
@@ -142,7 +147,7 @@ struct NamesSeen {
 void parse_records(const char* p, const char* end, const char* file_end,
                    const u8* country_of, size_t regions, NameTable& names,
                    NamesSeen& seen, Totals* totals) {
-  constexpr u64 LAG = 16;
+  constexpr u64 LAG = 4;
   struct Pending { u64 name; u32 region, id, name_b, note_b; i64 cents; } pending[LAG];
   struct Mark { u32 country, id; } marks[LAG];
   u64 n = 0, last = UINT64_MAX;
