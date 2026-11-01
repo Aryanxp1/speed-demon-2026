@@ -1,25 +1,13 @@
 # Team Lex: Track D
 
-Official best: **73.774168 points**, **K=29.887072**, T=0.097266 s, M=62,144,512 bytes, S=829. All gates passed: `run-d1a841f662c3`, scored commit `216d284` (Track D implementation `51ceb9b`). Previous best was 73.620947 / K=29.676927 at `f94eb34`.
+Current candidate adapts the user-provided `C:/Users/aryan/Downloads/sd-td-main (1)/td/track-d` CSR engine. It retains Lex's persistent C++20 worker pool, AVX2 delimiter scanner, global transparent-huge-page disabling and checked mappings. No external dependencies. The pinned seed-17 PGO Docker build and organizer generator bytes are unchanged.
 
-The retained version reuses reverse-graph degree counts as placement cursors once each row opens, removing a scratch allocation and clearing pass. Query prefetches bring the next four vertices' graph rows and distance labels into L1. Full 64-bit distances, exact near/far queues, contraction rules and persistent worker synchronization remain intact.
+Edges are parsed into six-byte bins and assembled into compressed adjacency arrays. Degree-two bypassing, BFS ordering and edge gathering are fused. The reverse graph uses the same bucket builder. Queries use paged 32-bit distance labels with a conservative overflow flag and exact 64-bit retry; full sums remain 64-bit. The 256-settle forward probe and bidirectional lower-bound stopping rule remain exact for zero weights, parallel edges and unreachable vertices.
 
-39 randomized interleaved local PGO full-data comparisons: baseline median 77.596 ms; selected version 76.247 ms, winning 30/39 paired comparisons. Optimized, ASan/UBSan and ThreadSanitizer builds pass stored tiny/sample/full, 70 independent differential fixtures, a shuffled 70,004-vertex cross-group cycle, empty/single-query and large-u64 cases at 1/4/12 workers. See PERF.md for evidence and rejected experiments.
+Local randomized interleaved full-data PGO comparison: previous packed-row solver 73.773 ms, adapted CSR solver 75.150 ms (29 runs each). The candidate is slightly slower locally, but has substantially fewer formatted source lines. Source size and kernel page-table costs affect K; no official gain is claimed before evaluation. A compact-fragment allocator alternative reduced page-table memory but was slower and added source, so it is excluded.
 
-This submission adapts the user-provided `C:/Users/aryan/Downloads/ar/aryan/track-d` C++ solver, replacing our previous Rust implementation. Team metadata is Lex with zero external runtime dependencies. See [PERF.md](PERF.md) for our independent tests and official results; the historical upstream measurements below are source-project evidence, not Lex leaderboard results.
+Optimized, ASan/UBSan and ThreadSanitizer builds pass public tiny/sample/full at 1/4/12 workers, 70 existing differential fixtures, 88 supplied differential cases, 60 narrow/wide boundary cases, 60 lattice/contraction stress cases, the shuffled 70,004-vertex cycle, empty/single-query cases and large exact u64 distances. Tests use the actual fixed probe of 256, not ignored environment variations.
 
-# Traverse
+Previous retained official best: **73.774168 points**, **K=29.887072**, T=0.097266 s, M=62,144,512 bytes, S=829 (`run-d1a841f662c3`, scored commit `216d284`, implementation `51ceb9b`). New official result pending. See PERF.md for provenance, verification and measurements.
 
-Exact directed shortest paths on a road-like graph, built for the end-to-end clock: parse, preprocess, answer, write. Construction dominates the timed run, so the design minimises passes over the 5M edges and keeps every per-vertex visit to one cache miss.
-
-Pipeline, all phases parallel across all hardware threads:
-
-1. **Parse.** `graph.txt` is mmapped and cut at line boundaries per thread. Each 64-byte block yields a separator bitmask (AVX2); every number is decoded from the 8 bytes ending at its separator, so fields parse independently of one another. Edges go to 6-byte bin entries keyed by the tail's id bucket; weights of 65535 or more keep a marker and live in a side table.
-2. **Raw rows.** Each bucket becomes 4-slot rows in cache: a vertex with at most four out-edges is one 16-byte row, longer rows keep three edges and a spill code that locates a counted list. Out-degree <= 2 non-endpoint vertices are marked bypassable.
-3. **Fused contraction, ordering and gathering.** Workers grow BFS regions concurrently from unclaimed seeds in their raw-id slices. Expanding a vertex follows each out-edge through bypassable vertices (one way on, never back) to the first survivor, so degree-2 contraction, locality ordering and edge gathering are a single pass. Walks of a batch advance one hop per round so their misses overlap. Claims use plain stores: a vertex claimed twice yields a copy with no forward in-edges, which can never lie on a shortest path, because every head is resolved through one map entry after growth.
-4. **Search rows.** Regions are concatenated into forward rows; the reverse rows are built by id-slice owners without atomics, with cross-slice edges passed through inboxes. Weights that do not fit the packed field go to a sorted escape table.
-5. **Queries** run on independent workers in order of source id: an exact 16-vertex forward probe, then bidirectional Dijkstra balancing settled counts and stopping when the two queue fronts sum to the best meeting. The queue is a ring of width-128 buckets (overflow heap for large jumps), drained FIFO with lookahead prefetch. Relaxations are branch-free: a label store, an unconditional queue write counted only on improvement, and a meeting update that is valid either way because `d + w + other(v)` is always a real path length.
-
-Exactness covers zero weights, parallel and duplicate edges, self-loops, isolated and unreachable vertices, and 64-bit sums. No third-party runtime dependencies. `SD_THREADS` sets the worker count.
-
-The pinned offline Docker build performs profile-guided optimisation on a seed-17 full-scale graph generated by the unchanged organizer generator; training data and profiles are absent from the runtime image.
+Defaults: up to twelve workers, `/data` input and `/out/distances.txt` output. Environment: `SD_THREADS` (clamped 1-64), `SD_DATA`, `SD_OUT`.
