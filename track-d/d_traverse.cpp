@@ -74,10 +74,7 @@ template <class F> static void parallel(unsigned threads, F &&f) {
 }
 
 static unsigned id_bits(u64 n) {
-  unsigned bits = 1;
-  while (bits < 32 && (u64(1) << bits) < n)
-    ++bits;
-  return bits;
+  return n > 1 ? 64 - __builtin_clzll(n - 1) : 1;
 }
 
 static void merge(Escapes &into, std::vector<Escapes> &parts) {
@@ -355,7 +352,7 @@ struct alignas(64) Region {
 // survivor, so contraction, ordering and gathering share one pass. Walks of a
 // batch advance one hop per round, so their cache misses overlap.
 class Grower {
-  static constexpr u32 BATCH = 32;
+  static constexpr u32 BATCH = 8;
   struct Walk {
     u32 pos, root, prev, at, steps;
     u64 weight;
@@ -498,7 +495,9 @@ static Graph build_forward(Rows &raw, const Bits &bypass, size_t m,
     for (u32 i = 0; i < regions[t].len; ++i)
       __atomic_store_n(&where[regions[t].order[i]], t << lbits | i,
                        __ATOMIC_RELAXED);
+    regions[t].order.release();
   });
+  Bits().swap(claimed);
   std::vector<u32> base(threads + 1, 0);
   size_t edges = 0;
   for (unsigned t = 0; t < threads; ++t)
@@ -574,11 +573,7 @@ static void add_reverse(Graph &g, unsigned threads) {
     for (u32 v = lo; v < hi; ++v)
       rev.open(v, degree[v], cursor);
     auto add = [&](u32 v, u32 u, u64 w) {
-      u32 k = placed[v]++;
-      rev.put(degree[v] <= 4 || k < 3
-                  ? size_t(v) * 4 + k
-                  : rev.list(rev.slot[size_t(v) * 4 + 3]) + k - 2,
-              u, w, escapes[t]);
+      rev.put(rev.at(v, placed[v]++), u, w, escapes[t]);
     };
     for (u32 u = lo; u < hi; ++u)
       fwd.each(u, [&](u32 e, size_t i) {
@@ -597,7 +592,7 @@ static void add_reverse(Graph &g, unsigned threads) {
 // belong to the page cache.
 static const char *map_file(const std::string &path, size_t &size) {
   int fd = open(path.c_str(), O_RDONLY);
-  struct stat st {};
+  struct stat st{};
   if (fd < 0 || fstat(fd, &st) != 0)
     fail(path.c_str());
   size = size_t(st.st_size);

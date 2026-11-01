@@ -8,10 +8,10 @@ WORKDIR /src
 COPY d_traverse.cpp .
 COPY --from=training /train/data /train/data
 RUN mkdir -p /tmp/pgo /tmp/train-out && \
-    g++ -O3 -std=c++17 -pthread -flto -fprofile-generate=/tmp/pgo -o /traverse d_traverse.cpp && \
+    g++ -O3 -std=c++17 -pthread -flto -march=native -fno-exceptions -fno-rtti -fomit-frame-pointer -fprofile-generate=/tmp/pgo -o /traverse d_traverse.cpp && \
     SD_DATA=/train/data SD_OUT=/tmp/train-out SD_THREADS=4 /traverse && \
     test -n "$(find /tmp/pgo -name '*.gcda' -print -quit)" && \
-    g++ -O3 -std=c++17 -pthread -flto -fprofile-use=/tmp/pgo -fprofile-correction -static -s -o /traverse d_traverse.cpp
+    g++ -O3 -std=c++17 -pthread -flto -march=native -fno-exceptions -fno-rtti -fomit-frame-pointer -fprofile-use=/tmp/pgo -fprofile-correction -static -s -o /traverse d_traverse.cpp
 
 FROM debian:13-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 COPY --from=build /traverse /traverse
