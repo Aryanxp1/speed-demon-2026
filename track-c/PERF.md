@@ -73,3 +73,8 @@ Retained follow-up uses the original four-slot probing and the four-record pipel
 Official `run-1c661988b78a`, implementation `a05d3f3`: T=0.032187 s, M=9,396,224 bytes, S=323, D=1, K=37.418225, **78.654159 points**, all gates passed. New best, but the requested approximately 80 has not been reached.
 
 Packaging follow-up enables function/data sections and linker garbage collection, and omits compiler-generated unwind tables in this already exception-disabled binary. Source, parsing and output are unchanged. Local binary shrinks to 1,066,752 bytes. Twenty-one randomized memory-sampled runs: unchanged build 23.542 ms / 6,332 KiB anonymous peak median; stripped-section build 23.013 ms / 6,324 KiB. Every full output matched. These local samples do not establish any official memory reduction; board evaluation is necessary.
+
+
+### Packaging result; retain best evaluated build
+
+`run-7b5e2234ac24`, commit `35f698f`: all gates pass; T=0.032357 s, M=9,539,584 bytes, S=323, D=1, K=37.206951, **78.531204 points**. Smaller executable did not reduce measured cgroup memory or improve score. Removed the section/unwind flags and restored the exact source/build configuration of official best `a05d3f3`, **78.654159 points**. Final retained changes relative to the starting implementation: four-record pipeline and ordinary O3 without forced loop unrolling. All other experimental changes were rejected. No A/B/D files were edited or staged in this work. The approximately 80-point target remains unmet; no local measurement is represented as an official gain.
