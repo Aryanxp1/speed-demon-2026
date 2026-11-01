@@ -616,7 +616,7 @@ int main() {
     fail("open summary");
   cpu_set_t cpus{};
   sched_getaffinity(0, sizeof cpus, &cpus);
-  const uint32_t threads = forced ? std::clamp(std::atoi(forced), 1, 12) : std::clamp(CPU_COUNT(&cpus), 1, 6);
+  const uint32_t threads = forced ? std::clamp(std::atoi(forced), 1, 12) : std::clamp(CPU_COUNT(&cpus), 1, 12);
   if (!(new Job(map, bytes, kLag, fd, threads))->run()) {
     if (ftruncate(fd, 0) || lseek(fd, 0, SEEK_SET))
       fail("rewind summary");

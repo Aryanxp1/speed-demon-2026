@@ -141,4 +141,8 @@ Larger parse blocks reduce allocation, scheduling, and lock traffic. In a subseq
 
 Other experiments: 2/8 parse streams and removing/reducing/changing input prefetches did not improve the tradeoff. Fingerprinted private tables at 4096/8192/16384 slots, a standard mutex, and tiny-group percentile shortcuts showed mixed local results and were not selected. All key equality checks remained exact. Full measurement scripts and binaries are retained in `/home/aryan/lex-a-nov2`.
 
-Six-worker/larger-block official result: pending.
+Six-worker/larger-block `c0aab6e`, `run-439a6aa7c42b`: 82.597220 points, K=44.868795, T=0.021693 s, M=18,333,696 bytes, S=575, D=1. All gates passed. Rejected: memory fell significantly but six workers lost throughput on the scoring machine. The local worker-count result did not transfer. The next candidate restores twelve default workers and isolates the larger 768 KiB blocks with one-block-per-worker lookahead; that exact setting already passed the reference and sanitizer datasets through `SD_THREADS=12`.
+
+The exact submitted candidate passes 16 differential datasets at 1/4/12 workers and ASan+UBSan on the same datasets at 1/12 workers. The additional dense fixture contains 26,000 shortest legal lines, crossing the larger block boundary and checking record-buffer capacity. The actual default path, without `SD_THREADS`, also passes the full seed-1 hash in release and sanitizer builds. A final 41-round comparison at six workers measured original blocks 15.487 ms versus 14.492 ms with the new blocks; every timed output hash was checked. Local canonical C++ count remains 568 lines (the previous official total was 575 including the Dockerfile). The candidate changes only block size, bounded lookahead, and the default worker cap; it retains the best evaluated source algorithm and original pinned build.
+
+Twelve-worker/larger-block official result: pending.
