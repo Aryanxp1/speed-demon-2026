@@ -111,12 +111,19 @@ struct Terms {
 
 impl Terms {
     fn find(&self, k: __m256i, h: usize) -> u32 {
+        // Probes are masked into the power-of-two table; nonzero slots hold
+        // valid dense IDs written by insert and remapped by renumber.
         let mask = self.slot.len() - 1;
         let mut i = h & mask;
         loop {
-            match self.slot[i] {
+            match unsafe { *self.slot.get_unchecked(i) } {
                 0 => return NONE,
-                s if s >> 32 == h as u64 >> 32 && same(self.keys[s as u32 as usize - 1], k) => {
+                s if s >> 32 == h as u64 >> 32
+                    && same(
+                        unsafe { *self.keys.get_unchecked(s as u32 as usize - 1) },
+                        k,
+                    ) =>
+                {
                     return s as u32 - 1
                 }
                 _ => i = (i + 1) & mask,
@@ -142,7 +149,12 @@ impl Terms {
         let mut i = h & mask;
         while self.slot[i] != 0 {
             let s = self.slot[i];
-            if s >> 32 == h as u64 >> 32 && same(self.keys[s as u32 as usize - 1], k) {
+            if s >> 32 == h as u64 >> 32
+                && same(
+                    unsafe { *self.keys.get_unchecked(s as u32 as usize - 1) },
+                    k,
+                )
+            {
                 return s as u32 - 1;
             }
             i = (i + 1) & mask;
@@ -425,7 +437,7 @@ fn walk(text: &[u8], first: u32, t: &Terms, mut f: impl FnMut(u32, u32, *const u
     doc - first
 }
 
-/// Scan output for a bucket of terms, in 64 KB chunks so that only the last
+/// Scan output for a bucket of terms, in 256 KiB chunks so that only the last
 /// one is ever part empty. A unit is a term's index in the bucket (i / BUCKETS)
 /// above the gap since the bucket's previous document; a thread meets its
 /// documents in order, so the gaps are small.
@@ -450,7 +462,7 @@ impl Units {
     #[inline(never)]
     fn grow(&mut self) {
         self.finish();
-        let c = Vec::<u16>::with_capacity(1 << 14);
+        let c = Vec::<u16>::with_capacity(1 << 17);
         (self.at, self.end) = (c.as_ptr() as usize, c.as_ptr() as usize + 2 * c.capacity());
         self.chunks.push(c);
     }
@@ -576,12 +588,27 @@ fn main() {
         (false, true) => 3,
         (false, false) => 4,
     };
-    let mut order: Vec<usize> = (0..nterms).collect();
-    order.sort_by_key(|&i| (class(i), std::cmp::Reverse(df[i])));
-    let [nbits, a0, lists, nkeep] = [0, 1, 2, 3].map(|c| order.partition_point(|&i| class(i) <= c));
+    // Every sampled df is at most sampled. Prefixing the class/frequency
+    // histogram gives exactly the previous stable descending-frequency order.
+    let levels = sampled + 1;
+    let index = |i: usize| class(i) * levels + sampled - df[i] as usize;
+    let mut hist = vec![0u32; 5 * levels];
+    for i in 0..nterms {
+        hist[index(i)] += 1;
+    }
+    let [nbits, a0, lists, nkeep] =
+        [0, 1, 2, 3].map(|c| hist[..(c + 1) * levels].iter().map(|&n| n as usize).sum());
+    let mut at = 0;
+    for n in &mut hist {
+        let count = *n;
+        *n = at;
+        at += count;
+    }
     let mut new = vec![0; nterms];
-    for (r, &i) in order.iter().enumerate() {
-        new[i] = r as u32;
+    for i in 0..nterms {
+        let n = &mut hist[index(i)];
+        new[i] = *n;
+        *n += 1;
     }
     terms.renumber(&new);
     ids.iter_mut().for_each(|id| *id = new[*id as usize]);
@@ -595,7 +622,7 @@ fn main() {
     // Zero pages from the kernel, written only where a bit is set.
     let bits: Vec<AtomicU64> = unsafe { std::mem::transmute(vec![0u64; nbits * words]) };
 
-    drop((df, new, order, anchor, in_bool));
+    drop((df, new, hist, anchor, in_bool));
 
     // The scan: phrase matches, bitmap bits, and list postings by bucket.
     let found = Mutex::new(vec![]); // (query, document) phrase matches
@@ -621,8 +648,6 @@ fn main() {
                     return;
                 }
                 let i = id as usize;
-                // Repeated bitmap tokens only OR the same local bit. Flush on
-                // the next bitmap block, even across blocks with no such terms.
                 if i < nbits {
                     if doc as usize / 64 != block {
                         let w = std::mem::replace(&mut block, doc as usize / 64);

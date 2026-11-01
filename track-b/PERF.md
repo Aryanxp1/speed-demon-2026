@@ -205,3 +205,29 @@ Board run `run-064a36060485`, evaluated commit `4d2cf91` (includes Track B imple
 Common bitmap terms now take a dedicated path before phrase/list bookkeeping. Repeated occurrences simply OR the same local pending bit, so no per-term last-document lookup is needed for them. Pending bitmap words are flushed when the next bitmap term enters a different 64-document block; blocks with no bitmap terms need no flush. List deduplication and exact phrase verification are unchanged.
 
 Local full-input comparisons consistently favored this change, with representative 13-run alternating medians 165.260 ms baseline versus 157.490 ms candidate; another round 169.778 versus 156.831 ms. All timed output bytes matched. Stored tiny/sample/full and seeds 42/999 plus six fresh randomized Python-reference comparisons passed. This is an intermediate candidate toward the user's 75+ target, not a claim that the target has been met.
+
+
+### Bitmap fast path: official result
+
+`run-388970966cdb`, commit `c8de26b`: T=0.206527 s, M=48,271,360 bytes, S=670, D=1, K=26.281963, **70.982890 points**, all gates passed. This is below the requested 75+ target. The preceding same-code baseline best was 70.648807; the fast path is retained.
+
+## Further 75-point sprint: larger buffers and histogram ranking
+
+The retained challenger replaces 32 KiB posting chunks with 256 KiB reserved buffers. Unwritten capacity stays virtual, while fewer allocations and releases reduce allocator/VMA overhead. Term renumbering uses a five-class frequency histogram and prefix offsets instead of comparison sorting. Iterating old IDs when assigning histogram positions preserves exactly the previous stable class/descending-frequency order. Sampled df cannot exceed the sampled document count, so the histogram has a bounded five-times-(sampled+1) size. Bounds checks in the immutable term table are removed only where probe masking and dense IDs established by insertion/renumbering prove the access is valid.
+
+Repeat full-input randomized comparisons favored this combination by 3.6-6.1% locally. In a separate 15-pair run with 0.5 ms external RSS sampling: baseline median 157.024 ms and 43,476 KiB peak anonymous RSS; challenger 148.224 ms and 41,952 KiB. Maxima 45,448 versus 42,920 KiB. These are local launch-inclusive timings and sampled anonymous memory, not official wall time/cgroup peaks. All timed outputs were checked byte-for-byte. The unchanged-output histogram was checked on all five stored datasets and six fresh randomized Python-reference sets. An AddressSanitizer build passed the randomized edge set. Activated offline Cargo release builds cleanly with warnings denied and reproduces the full published hash.
+
+### Negative results from the extended sprint
+
+Each architecture below was implemented in isolated scratch files and tested against full output before performance conclusions; none replaced the scoring code:
+
+- Continuous tokenization across document boundaries: correct after masking each worker's final window, but no speed gain. Whole-window token batching likewise failed to improve end-to-end time.
+- Small vocabulary rejection filters, SIMD grouped tags, inline short keys and a second key-prefetch stage: slower, despite reducing selected lookup costs.
+- Exact six-bit short-word keys, packed twelve-byte slots, a quotient dictionary, a frozen perfect hash, and direct short-token lookup: at best small local gains, outweighed by extra code/build work or memory. No hash-only equality was accepted.
+- Rust PGO trained on sample and full public inputs: output-correct but no material local improvement.
+- A fresh standard-library-only C++ implementation: matched the full hash on its first build, but was slower and had 685 locally formatted code lines; rejected.
+- Streaming Boolean evaluation through DNF rare-positive anchors: byte-correct but 642 ms versus 165 ms, with about 94 million query evaluations, mostly from dense OR cases. Selective hybrids at several candidate-frequency thresholds and an out-of-line evaluator remained slower than the posting index.
+- Four posting streams with extended IDs and varied chunk sizes: small time gains but higher sampled memory, offering less complete-K improvement than larger chunks at 32 streams. Six/eight/ten workers were slower than twelve. Alternative bitmap thresholds did not improve the trade-off.
+- SIMD bitmap count/ID-sum and lookup-table variants: small or negligible total gains, insufficient after source-size cost. Combined per-term count/last state also failed to improve the selected challenger.
+
+The requested 75+ score has not been demonstrated. At unchanged M and S, the 70.983-point baseline would need roughly 0.143 s rather than 0.207 s to reach 75; this challenger is an intermediate measured improvement, not a claim of completion.
