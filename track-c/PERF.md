@@ -92,8 +92,6 @@ Comprehensive architectural consolidation of Track C:
 7. Formatted line count $S$ reduced from 316 to 274 lines (-42 formatted lines, a 13.3% reduction).
 8. Verified 100% byte-for-byte exact matches on all 3 reference datasets (`track_c_full`, `track_c_sample`, `track_c_tiny`) under AddressSanitizer and UndefinedBehaviorSanitizer. Local full-dataset execution time dropped from ~138 ms down to ~100 ms (-28%).
 
-
-
 ## November 1: compact atomic tag groups (target 80, stretch 82)
 
 Starting snapshot: Antigravity's flattened register pipeline and safe dynamic worker structures (552966d) have official best 79.288196 points / K=38.526886, run-cc131a392aca at repository commit 85c8b90. T=0.032321 s, M=8,826,880 bytes, S=285, D=1. Complete board read found 97 scored Track C teams; leader NickTrapp 83.834454 points. Older root briefings and this file's earlier results predate this snapshot.
