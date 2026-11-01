@@ -1,5 +1,7 @@
 # Team Lex: Track D integration
 
+Official best: **72.612617 points**, implementation `09df66a`, run `run-fb928e7f1666`; all gates passed. Runtime 0.105865 s, measured memory 67,862,528 bytes.
+
 This submission adapts the user-provided `C:/Users/aryan/Downloads/ar/aryan/track-d` C++ solver, replacing our previous Rust implementation. Team metadata is Lex with zero external runtime dependencies. See [PERF.md](PERF.md) for our independent tests and official results; the historical upstream measurements below are source-project evidence, not Lex leaderboard results.
 
 # Traverse

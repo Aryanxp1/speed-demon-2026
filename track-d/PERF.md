@@ -16,6 +16,15 @@ First official integration result: `run-2a439d8d4f55`, commit `959a8b6`: all gat
 
 Integration correction from official evidence: `run-15921d87a024`, commit `8e6e259`, all gates pass; T=0.105029 s, M=69,357,568 bytes, S=1192, D=1, K=26.644821, 71.280640 points. Unlike the original supplied generator bytes (S=792, C++ only), the locally normalized LF copy is counted as Python by the scoring host. The local organizer checkout's byte representation therefore does not match the host's published-copy exemption. Restored the exact original supplied generator bytes to recover the demonstrated S=792 treatment; the earlier assertion that LF normalization would improve recognition was wrong. The generator's semantics and training data are unchanged. Keep process-wide huge-page disabling for its pending evaluation.
 
+
+## Confirmed 72+ Lex result
+
+Official `run-fb928e7f1666`, implementation `09df66ac6905ceeaab758d73423d747767b5697a`, completed 2026-11-01 07:30:00 UTC: **72.612617 points**, T=0.105865 s, M=67,862,528 bytes, S=794, D=1, K=28.330376. All check/build/correctness/timeout/sandbox gates passed. This meets the user's 72-point Track D target, improving the previous Rust best of 68.584197 by 4.028420 points. The build took 31.810 s with organizer training-stage cache available; earlier cold PGO builds took 133-162 s.
+
+Final code is the supplied solver plus process-wide huge-page disabling; original pinned PGO build remains. The training generator is byte-identical to the organizer's Git blob (SHA-256 `bbf37741159004149c5896265a98ae00b90e90a05ad48c2912ecf8bdce126d65`). The organizer working-tree file had LF normalization, which caused the mistaken intermediate generator edit; direct Git-blob comparison confirms the restored file. The official final S=794/C++-only result confirms published-copy recognition. Do not repeat that working-tree-byte comparison without checking Git blob bytes.
+
+Additional checks: full seed-17 output agrees with the prior Rust solver; fewer construction workers were slower locally and were not retained; CPU-native compilation showed only a small gain and was not retained. A/B/C were not changed. No required work remains for the requested 72+ adaptation.
+
 ---
 
 Imported source-project history follows unchanged:
@@ -138,7 +147,7 @@ Previous champion history follows.
 - **Official sample seeds 1 and 2, tiny seed 2:** output byte-for-byte matches the organizer's Python reference. The official worked example matches SHA-256 `2e9871bba1d5013144ceff48d806a28da0e3f203b29118a89d98d8f654c3f6a0`.
 - **Docker:** allowlisted digest-pinned GCC 15 build + Debian 13 runtime, static binary; network-disabled/read-only Docker executions match native reference on sample and full seed 1. [Successful full qualification](https://github.com/insightlabs38-pixel/sd-td/actions/runs/41085036796).
 - **Independent tests:** 83 differential fixtures across one-/two-pass parsing and 1/4 workers, plus a separate 500-seed stress sweep; ASan/UBSan pass. A 176,410-node independent synthetic graph matches the Python oracle (SHA-256 `7ecd1c595ca370bcdf8d0526efcb88a597897be6c42a7ed13174dc64c7367fb2`).
-- **Local full-size synthetic, not organizer data:** forward binary heap ~6.7 s / 210 MB; bidirectional binary ~4.1ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ4.5 s / 264 MB; bidirectional radix ~3.6ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã…â€œ4.3 s / 264 MB across varying host contention. Radix won repeated matched comparisons; 16-bit stamps and alternative direction policies were not promoted.
+- **Local full-size synthetic, not organizer data:** forward binary heap ~6.7 s / 210 MB; bidirectional binary ~4.1ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“4.5 s / 264 MB; bidirectional radix ~3.6ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“4.3 s / 264 MB across varying host contention. Radix won repeated matched comparisons; 16-bit stamps and alternative direction policies were not promoted.
 - **Official scored board:** no Track D PERF run ID yet; the integrator owns official submission and scored performance verification.
 
 - **Promoted in-place radix redistribution:** official full seed-1 matched A/B benchmark on the same GitHub-hosted runner: baseline wall seconds 1.53/1.55/1.50/1.53/1.54 (median 1.53); promoted 1.46/1.38/1.42/1.34/1.45 (median 1.42), **7.2% lower median wall time**, with exact output hash every run. Peak RSS approximately 263,716 KiB baseline vs 265,504 KiB promoted (+0.7%); CPU user median 4.30 s vs 3.94 s. All 83 differential cases and official tiny/sample/full gates, native and Docker full outputs passed in [successful matched CI](https://github.com/insightlabs38-pixel/sd-td/actions/runs/41093289804). Not official scoring-box data.
