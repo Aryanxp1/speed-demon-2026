@@ -1,5 +1,7 @@
 # Track A candidate — November 1, 2026
 
+Historical validation of the November 1 baseline. The November 2 optimization and its official evaluation are recorded in [PERF.md](PERF.md); the current percentile implementation and offline profile-guided build are described in [README.md](README.md).
+
 Status: activated in `main.cpp` after the user confirmed that Antigravity is assigned only to Track C. The static build was repeated after activation and the full seed-1 output hash matched. Earlier concurrent restoration was observed, but its cause is unknown.
 
 Based on the user-supplied `C:/Users/aryan/Downloads/sd-ta-main/sd-ta-main/track-a/main.cpp`. Uses bounded streaming runs with an exact rerun on late records, private endpoint dictionary mirrors, four interleaved parse streams, AVX2 multi-rank selection, bitonic leaves, and integer formatting. Adaptations: disable transparent huge pages for the scoring environment; clamp workers to 1..12; fix inline and unused-parameter warnings. No dependencies added. Existing Dockerfile can compile the candidate when activated.

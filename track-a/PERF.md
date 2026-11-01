@@ -114,3 +114,19 @@ Activated the user-supplied streaming design in main.cpp: bounded block lookahea
 ### Confirmed 84+ official result
 
 Official board `run-6e5a4c297a13`, implementation commit `60cb66c`: **84.737403 points**, **K=49.516286**, T=0.016902 s, M=20,901,888 bytes (20.90 MB), S=575, D=1. All check/build/correctness/timeout/sandbox gates passed. This establishes the new Team Lex record on Track A and anchors the championship triad.
+
+## November 2: compact exact selection and offline PGO
+
+The live feed was checked before editing: the standing best was still `run-6e5a4c297a13`, 84.737403 points, K=49.516286. The unchanged implementation most recently measured 0.017858 s, 21,368,832 bytes, K=47.960274 in `run-990231a8d90f`, illustrating run variation. The original source and Dockerfile are preserved at parent commit `b3be66d` and in the local experiment directory `/home/aryan/lex-a-nov2`.
+
+Replace the custom AVX2 partition/multi-selection/bitonic subsystem with one sort for groups up to 24 requests and three exact `nth_element` selections, largest rank first, for larger groups. Inclusive prefix bounds handle repeated ranks. This removes the percentile scratch buffer and permits unsigned latencies without sign-bit conversions. Copy only the endpoint's actual bytes when formatting. Remove ineffective output writeback/cache-advice calls for the scoring box's tmpfs. Parsing, exact dictionary comparisons, bounded streaming, and the fallback for arbitrarily late records are retained.
+
+The build uses offline PGO trained on independently generated sample seeds 37 and 82. The Python stage and GCC 16 stage both use organizer-allowlisted pinned digests. `a_ingest_generator.py` is the organizer Git blob, SHA-256 `d82b43b8f617016808f85cbe9be86af1fee8466296a0848ab8e6908ee3c4b0b4`, copied without line-ending conversion; it qualifies for the harness's published-source exemption. Normal process exit flushes training counters. The final runtime has only the static C++ binary and no added dependencies.
+
+Experiments used randomized interleaved full seed-1 runs on local WSL (i7-12700H), 12 workers, tmpfs output, and checked the full output SHA-256 on every timed run. Local host load produced considerable variation, so these numbers are evidence for candidate selection, not official gains. A 51-round comparison measured baseline 24.146 ms, compact signed selection without PGO 24.606 ms, baseline PGO 22.843 ms, compact signed selection with PGO 24.255 ms, and a smaller SIMD variant with PGO 23.802 ms. The compact algorithm trades nearly unchanged local runtime for substantially fewer counted lines; official K decides acceptance.
+
+Rejected or not selected: LTO and unconditional loop unrolling, removing final input-page advice, replacing only the bitonic leaves, raw scatter-buffer allocation, early record-pool return, scalar branchless selection, and small-group thresholds 8/16/32/48/64. None established a better combined time/source tradeoff than the selected candidate. Triple `nth_element` without a small-group sort was slower in a 61-round comparison (27.018 versus 25.248 ms).
+
+Correctness: 15 datasets, including full/sample/tiny seed 1, sample seed 42, tiny seed 999, independent sample seeds 37/82, the worked example, official edge fixtures, every endpoint length 1..125, decimal and uint32 boundaries, duplicate/adversarial selection patterns, empty input, and reversed/shuffled/sorted sample input. Byte comparisons passed at 1/4/12 workers. ASan+UBSan passed these same datasets at 1/12 workers. The published full seed-1 output hash is `495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3`; the old handoff's different full hash is incorrect. Static compilation passes `-Wall -Wextra -Werror`. Dockerfile policy passes locally; the Docker daemon is unavailable, so the actual pinned container build and official axes are pending board evaluation.
+
+Official candidate result: pending.
