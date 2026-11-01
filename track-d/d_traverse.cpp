@@ -657,7 +657,7 @@ static Graph read_graph(const std::string &path, std::vector<Query> &queries,
 // binary heap. push writes unconditionally and counts the entry only when
 // `take`, so relaxations need no branch.
 struct Queue {
-  static constexpr unsigned B = 2048, SHIFT_MAX = 7;
+  static constexpr unsigned B = 128, SHIFT_MAX = 7;
   struct Bucket {
     u32 *data = nullptr;
     u32 size = 0, cap = 0;
