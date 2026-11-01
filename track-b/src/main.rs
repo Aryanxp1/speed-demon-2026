@@ -1,4 +1,4 @@
-//! Continues Team Lex Rust implementation 4a879b9; selective scan improvements.
+//! Team Lex Rust engine: exact inline-prefix dictionary and selective scan improvements.
 //! Speed Demon 2026, Track B (Index), in Rust with no dependencies.
 //!
 //! 1. The queries are read first, and only their terms are looked for.
@@ -13,13 +13,13 @@
 //!    bitmap term starts the query or is OR-ed in.
 use std::arch::x86_64::*;
 use std::borrow::Cow;
-use std::fmt::Write;
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Barrier, Mutex, Once, OnceLock};
 
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn mallopt(param: i32, value: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
@@ -31,6 +31,7 @@ const NONE: u32 = u32::MAX;
 const BUCKETS: usize = 32; // scan output streams per thread; term i goes to bucket i % BUCKETS
 const GAP: u32 = 15; // a unit's 4-bit doc gap; GAP means the whole gap follows in the next unit
 const LAG: usize = 8;
+type Token = (__m128i, usize, usize, usize);
 const DOC_BITS: u32 = 15; // a thread's share holds under 2^15 documents
 
 /// The file, mapped over a spare zero page so loads of 32 bytes past any of
@@ -123,67 +124,161 @@ unsafe fn key(p: *const u8, len: usize) -> __m256i {
     _mm256_and_si256(v, _mm256_loadu_si256(KEEP.as_ptr().add(32 - len).cast()))
 }
 
-/// From the key's first 16 bytes only: longer tokens are rare, and the key
-/// comparison tells apart any that collide.
-fn hash(k: __m256i) -> usize {
-    let w: [u64; 4] = unsafe { std::mem::transmute(k) };
-    let c = unsafe { _mm_crc32_u64(_mm_crc32_u64(0, w[0]), w[1]) };
-    c.wrapping_mul(0x9E3779B97F4A7C15) as usize
+/// Twelve inline bytes avoid a separate key fetch for short words.
+/// Longer words retain full 32-byte equality checks.
+unsafe fn prefix(p: *const u8, len: usize) -> __m128i {
+    static MASK: [u8; 32] = [
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    _mm_and_si128(
+        _mm_or_si128(_mm_loadu_si128(p.cast()), _mm_set1_epi8(0x20)),
+        _mm_loadu_si128(MASK.as_ptr().add(16 - len.min(12)).cast()),
+    )
+}
+fn prefix_hash(k: __m128i) -> usize {
+    let words: [u64; 2] = unsafe { std::mem::transmute(k) };
+    unsafe { _mm_crc32_u64(words[1], words[0]) }.wrapping_mul(0x9e3779b97f4a7c15) as usize
 }
 
 fn same(a: __m256i, b: __m256i) -> bool {
     unsafe { _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b)) == -1 }
 }
 
-/// Query terms to dense ids: open addressing, each slot the top 32 hash bits
-/// above id + 1 (0 if free), so a mismatch rarely loads a key. A token that
-/// is no term gets the id one past the last term, so callers need no branch.
-struct Terms {
-    slot: Vec<u64>,
-    keys: Vec<__m256i>,
+/// Exact short words and IDs share a 16-byte entry. Long entries hold an
+/// eight-byte prefix and a full-key index. Two entries are probed with AVX2;
+/// collisions always continue until full equality or the first empty slot.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct Entry {
+    prefix: [u8; 12],
+    id: u32,
 }
-
-impl Terms {
-    fn find(&self, k: __m256i, h: usize) -> u32 {
-        let mask = self.slot.len() - 1;
-        let key = |s: u64| unsafe { *self.keys.get_unchecked(s as u32 as usize - 1) };
-        let mut i = h & mask;
-        loop {
-            // i is masked, and a slot holds 0 or the id + 1 of a stored key.
-            let s = unsafe { *self.slot.get_unchecked(i) };
-            if s == 0 || s >> 32 == h as u64 >> 32 && same(key(s), k) {
-                return (s as u32).wrapping_sub(1).min(self.keys.len() as u32);
+struct Entries(*mut Entry, usize);
+unsafe impl Send for Entries {}
+unsafe impl Sync for Entries {}
+impl Entries {
+    fn new(len: usize) -> Self {
+        let bytes = (len * 16 + 4095) & !4095;
+        let align = 2 << 20;
+        unsafe {
+            prctl(41, 0u64, 0u64, 0u64, 0u64);
+            let raw = mmap(std::ptr::null_mut(), bytes + align, 3, 0x22, -1, 0);
+            assert!(raw as isize != -1);
+            let address = (raw as usize + align - 1) & !(align - 1);
+            let before = address - raw as usize;
+            if before > 0 {
+                munmap(raw, before);
             }
-            i = (i + 1) & mask;
+            munmap((address + bytes) as *mut u8, align - before);
+            let ptr = address as *mut Entry;
+            madvise(ptr.cast(), bytes, 14);
+            madvise(ptr.cast(), bytes, 23);
+            prctl(41, 1u64, 0u64, 0u64, 0u64);
+            Self(ptr, len)
         }
     }
-
-    /// Term i becomes new[i].
-    fn renumber(&mut self, new: &[u32]) {
-        let mut keys = self.keys.clone();
-        for (&n, &k) in new.iter().zip(&self.keys) {
-            keys[n as usize] = k;
+}
+impl std::ops::Deref for Entries {
+    type Target = [Entry];
+    fn deref(&self) -> &[Entry] {
+        unsafe { std::slice::from_raw_parts(self.0, self.1) }
+    }
+}
+impl std::ops::DerefMut for Entries {
+    fn deref_mut(&mut self) -> &mut [Entry] {
+        unsafe { std::slice::from_raw_parts_mut(self.0, self.1) }
+    }
+}
+impl Drop for Entries {
+    fn drop(&mut self) {
+        unsafe {
+            munmap(self.0.cast(), self.1 * 16);
         }
-        self.keys = keys;
-        for s in self.slot.iter_mut().filter(|s| **s != 0) {
-            *s = *s >> 32 << 32 | (new[*s as u32 as usize - 1] + 1) as u64;
+    }
+}
+
+struct Terms {
+    entries: Entries,
+    long: Vec<__m256i>,
+    n: usize,
+}
+impl Terms {
+    fn find(&self, t: Token) -> u32 {
+        let len = t.3;
+        if len > 32 {
+            return self.n as u32;
+        }
+        let at = self.locate(t);
+        ((self.entries[at].id & 0x7fffffff).wrapping_sub(1)).min(self.n as u32)
+    }
+    fn locate(&self, t: Token) -> usize {
+        let (k, h, p, len) = t;
+        let mut i = h & (self.entries.len() - 2);
+        unsafe {
+            let wanted = _mm256_broadcastsi128_si256(k);
+            loop {
+                let v = _mm256_load_si256(self.entries.as_ptr().add(i).cast());
+                let m =
+                    _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, wanted))) as u32;
+                let longmask = (_mm256_movemask_ps(_mm256_castsi256_ps(v)) as u32) >> 3;
+                let mut candidates = ((m & (m >> 1) & ((m >> 2) | longmask)) | (m >> 3)) & 0x11;
+                while candidates != 0 {
+                    let at = i + (candidates.trailing_zeros() / 4) as usize;
+                    let e = self.entries.get_unchecked(at);
+                    if e.id == 0 {
+                        return at;
+                    }
+                    if if len <= 12 {
+                        e.id >> 31 == 0
+                    } else {
+                        e.id >> 31 != 0
+                            && same(
+                                *self
+                                    .long
+                                    .get_unchecked(u32::from_le_bytes(
+                                        e.prefix[8..12].try_into().unwrap(),
+                                    ) as usize),
+                                key(p as *const u8, len),
+                            )
+                    } {
+                        return at;
+                    }
+                    candidates &= candidates - 1;
+                }
+                i = (i + 2) & (self.entries.len() - 1);
+            }
+        }
+    }
+    fn renumber(&mut self, new: &[u32]) {
+        for e in self.entries.iter_mut().filter(|e| e.id != 0) {
+            e.id = (e.id & 0x80000000) | (new[(e.id & 0x7fffffff) as usize - 1] + 1);
         }
     }
 
     fn insert(&mut self, term: &[u8]) -> u32 {
-        let k = unsafe { key(term.as_ptr(), term.len()) };
-        let (h, mask) = (hash(k), self.slot.len() - 1);
-        let mut i = h & mask;
-        while self.slot[i] != 0 {
-            let s = self.slot[i];
-            if s >> 32 == h as u64 >> 32 && same(self.keys[s as u32 as usize - 1], k) {
-                return s as u32 - 1;
-            }
-            i = (i + 1) & mask;
+        assert!(!term.is_empty() && term.len() <= 32);
+        let k = unsafe { prefix(term.as_ptr(), term.len()) };
+        let h = prefix_hash(k);
+        let at = self.locate((k, h, term.as_ptr() as usize, term.len()));
+        let old = self.entries[at].id;
+        if old != 0 {
+            return (old & 0x7fffffff) - 1;
         }
-        self.keys.push(k);
-        self.slot[i] = (h as u64 >> 32) << 32 | self.keys.len() as u64;
-        self.keys.len() as u32 - 1
+        let mut bytes: [u8; 16] = unsafe { std::mem::transmute(k) };
+        let flag = if term.len() > 12 {
+            bytes[8..12].copy_from_slice(&(self.long.len() as u32).to_le_bytes());
+            self.long.push(unsafe { key(term.as_ptr(), term.len()) });
+            1 << 31
+        } else {
+            0
+        };
+        self.entries[at] = Entry {
+            prefix: bytes[..12].try_into().unwrap(),
+            id: flag | (self.n as u32 + 1),
+        };
+        self.n += 1;
+        self.n as u32 - 1
     }
 }
 
@@ -209,14 +304,14 @@ unsafe fn classes(p: *const u8) -> (u64, u64) {
 /// window. Each token's slot is prefetched and the token looked up LAG tokens
 /// later, so the misses overlap.
 unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u16) -> *const u8 {
-    let mut ring = [(_mm256_setzero_si256(), 0); LAG];
+    let mut ring = [(_mm_setzero_si128(), 0usize, 0usize, 33usize); LAG];
     let (mut n, mut out) = (0usize, ids.len());
     loop {
         // A window adds at most 32 ids, and the document's end LAG more.
         (ids.set_len(out), ids.reserve(32 + LAG));
         let buf = ids.as_mut_ptr();
-        let mut look = |r: &(__m256i, usize)| {
-            let id = t.find(r.0, r.1);
+        let mut look = |r: &Token| {
+            let id = t.find(*r);
             _mm_prefetch::<_MM_HINT_T0>(pre.wrapping_add(id as usize).cast()); // its state, for the caller
             (*buf.add(out), out) = (id, out + 1);
         };
@@ -239,14 +334,12 @@ unsafe fn tokens(mut p: *const u8, t: &Terms, ids: &mut Vec<u32>, pre: *const u1
                 len = next;
             }
             m &= e;
-            let k = match len {
-                ..=32 => key(p.add(s as usize), len as usize),
-                _ => _mm256_setzero_si256(), // no term, but it still parts its neighbours
-            };
-            let h = hash(k);
-            _mm_prefetch::<_MM_HINT_T0>(t.slot.as_ptr().add(h & (t.slot.len() - 1)).cast());
+            let ptr = p.add(s as usize) as usize;
+            let k = prefix(ptr as *const u8, len as usize);
+            let h = prefix_hash(k);
+            _mm_prefetch::<_MM_HINT_T0>(t.entries.as_ptr().add(h & (t.entries.len() - 2)).cast());
             look(&ring[n % LAG]);
-            (ring[n % LAG], n) = ((k, h), n + 1);
+            (ring[n % LAG], n) = ((k, h, ptr, len as usize), n + 1);
         }
         if nl != 0 {
             (n..n + LAG).for_each(|i| look(&ring[i % LAG]));
@@ -373,31 +466,43 @@ unsafe fn bit_sums(b: &[u64]) -> (u64, u64) {
     (total(6), sum)
 }
 
-/// "count sum id1 ... id10" for a set of documents.
+/// Append a decimal integer without allocating a temporary string.
+fn num(out: &mut String, space: bool, mut v: u64) {
+    let (mut buf, mut i) = ([b' '; 21], 21);
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[i - space as usize..]) });
+}
+
 fn line(out: &mut String, docs: &Docs) {
-    let (count, sum);
-    let mut first = Vec::with_capacity(10);
     match docs {
         Docs::List(v) => {
-            (count, sum) = (v.len() as u64, v.iter().map(|&d| d as u64).sum());
-            first.extend(v.iter().take(10));
+            let sum: u64 = v.iter().map(|&d| d as u64).sum();
+            (num(out, false, v.len() as u64), num(out, true, sum));
+            v.iter().take(10).for_each(|&d| num(out, true, d as u64));
         }
         Docs::Bits(b) => {
-            (count, sum) = unsafe { bit_sums(b) };
-            for (w, &x) in b.iter().enumerate().filter(|(_, &x)| x != 0) {
+            let (count, sum) = unsafe { bit_sums(b) };
+            (num(out, false, count), num(out, true, sum));
+            let mut rem = 10;
+            for (w, &x) in b.iter().enumerate() {
                 let mut m = x;
-                while m != 0 && first.len() < 10 {
-                    first.push(w as u32 * 64 + m.trailing_zeros());
-                    m &= m - 1;
+                while m != 0 && rem > 0 {
+                    num(out, true, w as u64 * 64 + m.trailing_zeros() as u64);
+                    (m, rem) = (m & (m - 1), rem - 1);
                 }
-                if first.len() == 10 {
+                if rem == 0 {
                     break;
                 }
             }
         }
     }
-    write!(out, "{count} {sum}").unwrap();
-    first.iter().for_each(|d| write!(out, " {d}").unwrap());
     out.push('\n');
 }
 
@@ -497,11 +602,12 @@ fn main() {
         .windows(2)
         .filter(|p| p[0] == b' ' && p[1] & 32 != 0)
         .count();
-    let slots = vec![0; (term_count + 1).max(8).next_power_of_two()];
-    let keys = Vec::with_capacity(qtext.len() / 16);
-    let mut terms = Terms { slot: slots, keys };
-    // Queries, flat: query q's terms are ids[span.1..span.2], and for BOOL
-    // ops[i] joins ids[i] and ids[i + 1].
+    let entries = Entries::new((term_count + 1).max(8).next_power_of_two());
+    let mut terms = Terms {
+        entries,
+        long: Vec::new(),
+        n: 0,
+    };
     let (mut spans, mut ids, mut ops) = (vec![], vec![], vec![]);
     for q in qtext.split(|&b| b == b'\n').filter(|q| !q.is_empty()) {
         let (phrase, from) = (q[0] == b'P', ids.len() as u32);
@@ -514,7 +620,7 @@ fn main() {
         }
         spans.push((phrase, from, ids.len() as u32));
     }
-    let nterms = terms.keys.len();
+    let nterms = terms.n;
     assert!(nterms <= BUCKETS << 12, "too many terms"); // a unit's index has 12 bits
     let mut in_bool = vec![false; nterms];
     for &(_, from, to) in spans.iter().filter(|s| !s.0) {
@@ -669,7 +775,6 @@ fn main() {
             }
         });
         flush(&mut pending, block);
-        // Keep the boundary pages; the immutable file mapping stays valid.
         // Drop finished interior file pages; preserve the shared first page and VMA.
         let start = (share.as_ptr() as usize + 4096) & !4095;
         let end = (share.as_ptr() as usize + share.len()) & !4095;
