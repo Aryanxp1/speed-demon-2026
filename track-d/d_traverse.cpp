@@ -1,12 +1,14 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <emmintrin.h>
 #include <fcntl.h>
+#include <functional>
+#include <immintrin.h>
 #include <memory>
 #include <numeric>
 #include <queue>
@@ -52,13 +54,38 @@ template <class T> struct Array : std::unique_ptr<T, MappingDelete> {
   T &operator[](size_t i) const { return this->get()[i]; }
 };
 
+struct PhasePool {
+  unsigned capacity;
+  std::barrier<> start, done;
+  std::function<void(unsigned)> job;
+  std::vector<std::thread> workers;
+  explicit PhasePool(unsigned n) : capacity(n), start(n), done(n) {
+    for (unsigned t = 1; t < n; ++t)
+      workers.emplace_back([this, t] {
+        for (;;) {
+          start.arrive_and_wait();
+          job(t);
+          done.arrive_and_wait();
+        }
+      });
+  }
+};
+// Main-thread phase executor; workers live until process exit. No scoped job
+// remains published after the completion barrier.
+static PhasePool *pool = nullptr;
 template <class F> static void parallel(unsigned threads, F &&f) {
-  std::vector<std::thread> pool;
-  for (unsigned i = 1; i < threads; ++i)
-    pool.emplace_back(f, i);
-  f(0);
-  for (auto &t : pool)
-    t.join();
+  if (!pool)
+    pool = new PhasePool(threads);
+  if (threads > pool->capacity)
+    std::abort();
+  pool->job = [&](unsigned t) {
+    if (t < threads)
+      f(t);
+  };
+  pool->start.arrive_and_wait();
+  pool->job(0);
+  pool->done.arrive_and_wait();
+  pool->job = {};
 }
 
 static unsigned id_bits(u64 n) {
@@ -81,13 +108,12 @@ static u32 cut(size_t n, unsigned t, unsigned threads) {
 // Bit i is set when p[i] is a separator (space or LF), the only bytes below
 // '0'.
 static u64 separators(const char *p) {
-  u64 m = 0;
-  for (int k = 0; k < 4; ++k) {
-    __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + 16 * k));
-    u64 bits = u32(_mm_movemask_epi8(_mm_cmplt_epi8(x, _mm_set1_epi8('0'))));
-    m |= bits << (16 * k);
-  }
-  return m;
+  auto half = [](const char *q) {
+    auto x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q));
+    return u32(
+        _mm256_movemask_epi8(_mm256_cmpgt_epi8(_mm256_set1_epi8('0'), x)));
+  };
+  return half(p) | (u64(half(p + 32)) << 32);
 }
 
 // Value of the digits [a, b). Short numbers are read as the 8 bytes ending at
@@ -824,7 +850,7 @@ struct Side {
 // Exact forward probe, then bidirectional Dijkstra balancing settled vertices;
 // stops once f + b >= best.
 struct Worker {
-  static constexpr size_t PROBE = 256;
+  static constexpr size_t PROBE = 16;
   Side fwd, bwd;
   explicit Worker(const Graph &g) : fwd(*g.fwd), bwd(*g.rev) {}
   int64_t solve(u32 s, u32 t) {
