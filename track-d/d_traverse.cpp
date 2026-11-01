@@ -40,15 +40,13 @@ struct MappingDelete {
 template <class T> struct Array : std::unique_ptr<T, MappingDelete> {
   using Base = std::unique_ptr<T, MappingDelete>;
   Array() = default;
-  explicit Array(size_t n, bool sparse = false)
+  explicit Array(size_t n)
       : Base(static_cast<T *>(mmap(nullptr, n * sizeof(T) + 64,
                                    PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)),
              MappingDelete{n * sizeof(T) + 64}) {
     if (this->get() == MAP_FAILED)
       fail("mmap");
-    if (sparse)
-      madvise(this->get(), n * sizeof(T) + 64, MADV_NOHUGEPAGE);
   }
   void release() { this->reset(); }
   T &operator[](size_t i) const { return this->get()[i]; }
@@ -164,9 +162,11 @@ using Run = std::pair<const Entry *, u32>;
 static constexpr size_t BIN_GROUP = 16;
 class alignas(64) Binner { // aligned for the same reason as Region
   static constexpr u32 CHUNK = 256;
-  size_t stride_;
+  static constexpr size_t BLOCK = 65536;
   Array<unsigned char> pool_;
-  std::vector<size_t> used_;
+  size_t used_ = 0;
+  std::vector<std::pair<Entry *, Entry *>> available_;
+  std::vector<std::vector<unsigned char *>> blocks_;
   std::vector<Entry *> fill_, limit_;
   std::vector<std::vector<Run>> runs_;
   std::vector<std::pair<const Entry *, u32>> heavy_;
@@ -179,20 +179,29 @@ class alignas(64) Binner { // aligned for the same reason as Region
 
 public:
   Binner(unsigned shift, unsigned bits, size_t buckets, size_t edges)
-      : stride_(((edges + (BIN_GROUP + 1) * CHUNK) * sizeof(Entry) + 4095) &
-                ~size_t(4095)),
-        pool_(stride_ * ((buckets + BIN_GROUP - 1) / BIN_GROUP), true),
-        used_((buckets + BIN_GROUP - 1) / BIN_GROUP), fill_(buckets),
-        limit_(buckets), runs_(buckets), shift_(shift), bits_(bits) {}
+      : pool_((((edges + (buckets + 1) * CHUNK) * sizeof(Entry)) /
+                   (BLOCK - CHUNK * sizeof(Entry)) +
+               (buckets + BIN_GROUP - 1) / BIN_GROUP + 1) *
+              BLOCK),
+        available_((buckets + BIN_GROUP - 1) / BIN_GROUP),
+        blocks_(available_.size()), fill_(buckets), limit_(buckets),
+        runs_(buckets), shift_(shift), bits_(bits) {}
   void add(u32 u, u32 v, u32 w) {
     size_t b = u >> shift_;
     if (fill_[b] == limit_[b]) {
       close(b);
       size_t g = b / BIN_GROUP;
-      fill_[b] =
-          reinterpret_cast<Entry *>(pool_.get() + g * stride_) + used_[g];
-      limit_[b] = fill_[b] + CHUNK;
-      used_[g] += CHUNK;
+      auto &[at, end] = available_[g];
+      if (at == end || size_t(end - at) < CHUNK) {
+        auto *p = pool_.get() + used_;
+        used_ += BLOCK;
+        blocks_[g].push_back(p);
+        at = reinterpret_cast<Entry *>(p);
+        end = at + BLOCK / sizeof(Entry);
+      }
+      fill_[b] = at;
+      limit_[b] = at + CHUNK;
+      at += CHUNK;
     }
     if (w >= 0xFFFF)
       heavy_.push_back({fill_[b], w});
@@ -214,9 +223,8 @@ public:
         ->second;
   }
   void reclaim(size_t g) {
-    if (used_[g])
-      madvise(pool_.get() + g * stride_,
-              (used_[g] * sizeof(Entry) + 4095) & ~size_t(4095), MADV_DONTNEED);
+    for (auto *p : blocks_[g])
+      madvise(p, BLOCK, MADV_DONTNEED);
   }
   template <class F> void each(size_t b, F &&f) const {
     for (const Run &r : runs_[b])
@@ -241,8 +249,7 @@ struct Rows {
   struct Cursor {
     size_t at = 0, end = 0;
   };
-  Rows(u32 count, size_t extra, bool sparse = false)
-      : slot(size_t(count) * 4 + extra, sparse), n(count) {
+  Rows(u32 count, size_t extra) : slot(size_t(count) * 4 + extra), n(count) {
     wbits = 32 - id_bits(u64(n) + 2);
     while (wbits > 1 && (u64(n + 1) << wbits) + extra >= EMPTY)
       --wbits; // spill codes stay below EMPTY
@@ -485,9 +492,9 @@ static Graph build_forward(Rows &raw, const Bits &bypass, size_t m,
   std::vector<Region> regions(threads);
   parallel(threads, [&](unsigned t) {
     Region &reg = regions[t];
-    reg.order = Array<u32>(n, true);
-    reg.ends = Array<u32>(n, true);
-    reg.out = Array<u32>(m, true);
+    reg.order = Array<u32>(n);
+    reg.ends = Array<u32>(n);
+    reg.out = Array<u32>(m);
     Grower grower(raw, bypass, claimed, reg);
     // Seeds are the unclaimed survivors of this worker's raw-id slice, so idle
     // workers start new regions.
@@ -641,8 +648,8 @@ static Graph read_graph(const std::string &path, std::vector<Query> &queries,
   Bits terminal((size_t(n) + 63) / 64), bypass(terminal.size());
   for (const Query &q : queries)
     set(terminal, q.from), set(terminal, q.to);
-  Rows raw(n, m + 1024 * threads,
-           true); // huge pages here would raise the peak, which this phase sets
+  Rows raw(n, m + 1024 * threads); // huge pages here would raise the peak,
+                                   // which this phase sets
   {
     std::vector<Binner> bins;
     for (unsigned t = 0; t < threads; ++t)
@@ -665,7 +672,7 @@ static Graph read_graph(const std::string &path, std::vector<Query> &queries,
 // binary heap. push writes unconditionally and counts the entry only when
 // `take`, so relaxations need no branch.
 struct Queue {
-  static constexpr unsigned B = 128, SHIFT_MAX = 7;
+  static constexpr unsigned B = 64, SHIFT_MAX = 7;
   struct Bucket {
     u32 *data = nullptr;
     u32 size = 0, cap = 0;
@@ -742,7 +749,7 @@ class Distances {
 
 public:
   explicit Distances(u32 n)
-      : dir_((n >> SHIFT) + 1), store_(dir_.size() * SIZE, true) {
+      : dir_((n >> SHIFT) + 1), store_(dir_.size() * SIZE) {
     blank_.fill(INF);
     std::fill(dir_.begin(), dir_.end(), blank_.data());
   }

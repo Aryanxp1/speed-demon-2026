@@ -9,7 +9,7 @@ COPY d_traverse.cpp .
 COPY --from=training /train/data /train/data
 RUN mkdir -p /tmp/pgo /tmp/train-out && \
     g++ -O3 -std=c++17 -pthread -flto -march=native -fno-exceptions -fno-rtti -fomit-frame-pointer -fprofile-generate=/tmp/pgo -o /traverse d_traverse.cpp && \
-    SD_DATA=/train/data SD_OUT=/tmp/train-out SD_THREADS=4 /traverse && \
+    SD_DATA=/train/data SD_OUT=/tmp/train-out SD_THREADS=12 /traverse && \
     test -n "$(find /tmp/pgo -name '*.gcda' -print -quit)" && \
     g++ -O3 -std=c++17 -pthread -flto -march=native -fno-exceptions -fno-rtti -fomit-frame-pointer -fprofile-use=/tmp/pgo -fprofile-correction -static -s -o /traverse d_traverse.cpp
 
