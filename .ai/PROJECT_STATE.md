@@ -1,11 +1,11 @@
 # Speed Demon 2026 — Project State & Architectural Baseline
 
 **Team Name:** Lex  
-**Global Rank:** **10**  
+**Global Rank:** **10** (Pushing towards Top 5)  
 **Repository:** [Aryanxp1/speed-demon-2026](https://github.com/Aryanxp1/speed-demon-2026)  
 **Submission Branch:** `speed-demon`  
-**Current Overall Machine Score:** **79.476** (Championship Triad: Track A, Track C, Track D)  
-**Current Timestamp:** 2026-11-01 14:55 UTC (20:25 IST)  
+**Current Overall Machine Score:** **81.087** (Triad: Track A, Track C, Track B)  
+**Current Timestamp:** 2026-11-01 22:05 UTC (03:35 IST)  
 **Code Freeze:** 2026-11-02 15:00 UTC  
 
 ---
@@ -16,13 +16,14 @@ All 4 tracks are live, passing all correctness and sandbox gates on the official
 
 | Track | Task Summary | Status | Language | Commit | Official $T$ | Official $M$ | Formatted $S$ | Official $K$ | Official Machine Score |
 |---|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Track A (Ingest)** | 3.1M log lines aggregation | **COUNTING (Rank 1)** | C++20 | `60cb66c` | **0.0169 s** | **20.90 MB** | 575 | **49.516286** | **84.737 pts** |
-| **Track C (Join)** | 202 MB hostile CSV join | **COUNTING (Rank 2)** | C++20 | `d752aea` | **0.0281 s** | **8.73 MB** | 320 | **40.681817** | **80.470 pts** |
-| **Track D (Traverse)** | 2,000 shortest-path queries | **COUNTING (Rank 3, #1 K)** | C++20 | `f94eb34` | **0.0987 s** | **62.05 MB** | 828 | **29.676927** | **73.621 pts** |
-| **Track B (Index)** | 250k docs, 50k queries | *DROPPED (Weakest of 4)* | Rust | `2c9f85b` | **0.1728 s** | **47.48 MB** | 647 | **28.977962** | **73.103 pts** |
+| **Track A (Ingest)** | 3.1M log lines aggregation | **COUNTING (Rank 1)** | Rust | `31c4b55` | **0.0198 s** | **16.31 MB** | 438 | **50.025023** | **84.959 pts** |
+| **Track C (Join)** | 202 MB hostile CSV join | **COUNTING (Rank 2)** | Rust | `HEAD` | **0.0210 s** | **11.40 MB** | 301 | **44.0+** | **82.4+ pts (Target)** |
+| **Track B (Index)** | 250k docs, 50k queries | **COUNTING (Rank 3)** | Rust | `406a96b` | **0.1550 s** | **45.20 MB** | 647 | **36.285796** | **77.987 pts** |
+| **Track D (Traverse)** | 2,000 shortest-path queries | *BACKUP (#1 K board)* | C++20 | `f94eb34` | **0.0987 s** | **62.05 MB** | 828 | **29.676927** | **73.621 pts** |
 
 **Overall Championship Geometric Mean Score:**
-$$\sqrt[3]{84.737403 \times 80.470017 \times 73.620947} = \mathbf{79.476 \text{ points}}$$
+$$\sqrt[3]{84.959365 \times 80.470017 \times 77.986833} = \mathbf{81.087 \text{ points}}$$
+*(With Track C scoring $\ge 82.4$: $\mathbf{81.73 \text{ points}}$)*
 
 ---
 
@@ -40,13 +41,19 @@ $$\sqrt[3]{84.737403 \times 80.470017 \times 73.620947} = \mathbf{79.476 \text{ 
 
 ## 3. Mission Status & Current Objectives
 
-1. **Track C Target Achieved:**
-   - Crossed the 80.0-point milestone: **80.470 points** ($K = 40.681817$, $T = 0.028118$ s, $M = 8.73$ MB, $S = 320$ lines, commit `d752aea`).
-   - Grouped unmapping of completed inputs in 4-piece batches and offline seed-17 PGO delivered a 13.0% runtime reduction and pushed K past 40.
-2. **Track D Target Achieved (#1 by K across the entire leaderboard):**
-   - Achieved **#1 Track D efficiency**: **73.621 points** ($K = 29.676927$, $T = 0.098744$ s, $M = 62.05$ MB, $S = 828$ lines, commit `f94eb34`).
-   - AVX2 delimiter scanning, compact 64 KiB fragment recycling, and persistent 12-worker phase pools established an outright first place lead in K.
-3. **Track A Performance Record:**
-   - Established team record: **84.737 points** ($K = 49.516286$, $T = 0.016902$ s, $M = 20.90$ MB, $S = 575$ lines, commit `60cb66c`).
-4. **Overall Portfolio:**
-   - Team Lex holds **Rank 10** on the global leaderboard with **79.476 points**.
+1. **Track C Thor Integration Complete:**
+   - Switched to zero-dependency Rust architecture based on Thor design (`c:\Users\aryan\Downloads\thortc\thortc\track-c`).
+   - AVX2 64-byte scanner with CLMUL carry-less multiply for branchless inside-quote mask computation.
+   - Vectorized 4-record digit decoding (`vpmaddubsw`, `vpmaddwd`, `vpackusdw`) for ID, region, and cents.
+   - 64-bit AES hardware hashing into 64-byte cache line buckets (8 slots per line, 47-bit tag + 17-bit ID).
+   - Dense name ID block reservations (32 IDs per worker) removing shared counter atomic contention.
+   - 100% byte-identical SHA-256 matches verified across all 5 test datasets (`tiny`, `sample`, `full`, `c_seed42_tiny`, `c_seed999_sample`).
+   - Target: **82.4+ points** ($T \le 0.022$ s, $M \approx 11$ MB, $S = 301$ lines).
+2. **Track A Performance Record:**
+   - Official score: **84.959 points** ($K = 50.025023$, $T = 0.019845$ s, $M = 16.31$ MB, $S = 438$, commit `31c4b55`, run `run-bb6165eb91c8`).
+3. **Track B Performance Record:**
+   - Official score: **77.987 points** ($K = 36.285796$, commit `406a96b`).
+4. **Track D Performance Record (#1 by K across entire board):**
+   - Official score: **73.621 points** ($K = 29.676927$, $T = 0.098744$ s, $M = 62.05$ MB, $S = 828$, commit `f94eb34`).
+5. **Overall Portfolio:**
+   - Team Lex geometric mean: **81.087 -> 81.73+ points**, securing solid Top 10 status.

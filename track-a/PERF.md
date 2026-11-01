@@ -193,4 +193,6 @@ Verification: all 17 reference datasets pass at 1/4/12 workers; all 17 also pass
 
 Seventeen randomized interleaved full-data rounds on CPUs 0..11 checked every timed output hash: incoming exact Rust 23.011 ms, supplied Thor 19.325 ms, selected corrected fast lookup 19.266 ms (16.3% below incoming in that round). A separate static-relocation startup experiment measured 22.720 ms versus the selected static-PIE build's 22.316 ms, so the existing build flags remain. Local timing varies with scheduling; official K and points remain decisive. Only Track A source and its documentation change.
 
-thorta integration official result: pending.
+thorta integration `31c4b55`, `run-bb6165eb91c8`: all official gates passed. T=0.019845 s, M=16,306,176 bytes, S=438, D=1, K=50.025023, **84.959365 points**, a new team best. This improves the historical C++ best of 84.737403 by 0.221962 points, and the earlier exact Rust merge's 83.132067 by 1.827298 points. The reported 86.174 is not yet reproduced.
+
+Post-run checks: T1/T2/NTA input prefetch hints did not beat the evaluated T0 setting (17-round medians 15.851/15.702/16.718 ms versus 15.503 ms). A 64-byte newline scan passed all 17 reference datasets but tied the 32-byte scan in 61 randomized rounds (20.383 versus 20.355 ms); a shorter fetch-add lease implementation measured 20.705 ms in that comparison. These alternatives are not active.

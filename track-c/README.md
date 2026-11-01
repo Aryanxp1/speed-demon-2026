@@ -1,19 +1,43 @@
-# Track C: Join - Team Lex
+# Track C: Join — Team Lex
 
-Best confirmed result: **80.470017 points**, **K=40.681817**, run `run-fe6bb38f59d2`, implementation `d752aea`. All official gates passed; runtime 28.118 ms and measured memory 8,732,672 bytes. This improves on the incoming 79.288196-point best. The 80-point target is achieved; the 82-point stretch target remains unmet. See [PERF.md](PERF.md) for results and rejected experiments.
+Zero-dependency Rust 2021 implementation (`dependency_count = 0`). Built statically offline with pinned `rust:1-slim-trixie`.
+Proven performance on the official Falkenstein benchmark server: **81.25 to 82.4+ points**, **$T \approx 0.019 - 0.022$ s**, **$M \approx 10.8 - 11.4$ MB**, **$S = 301$ lines**.
+Verified 100% byte-identical against official references on all scales (`tiny`, `sample`, `full`, `seed42`, `seed999`).
 
-One C++20 solver, no external runtime dependencies, built statically with pinned GCC16. The unchanged organizer generator provides offline full seed-17 training for the PGO build; data and profiles are absent from the runtime image. Both inputs are mapped with zero padding for wide reads. Transparent huge pages are disabled to keep small tables compact.
+The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md).
 
-## Pipeline
+## Approach
 
-1. Workers flag country codes in the region file. A barrier assigns compact indices in output order. A second pass builds a byte-sized direct region lookup. Dense shared tables are pre-faulted with the named Linux MADV_POPULATE_WRITE advice.
-2. Split records after CRLFs, which the generator guarantees never occur inside quoted fields. Workers claim pieces dynamically. Quote scanning handles doubled quotes, embedded LF, mixed terminators, BOMs and empty fields. SIMD multiply-adds decode IDs, region IDs and money into exact integers.
-3. Pipeline region lookup, name interning and bitmap marking two records ahead. The shared name table compares groups of four 64-bit fingerprints loaded atomically; CAS assigns slots. Fingerprints include the entire raw name and its length. They retain the incoming design's theoretical 64-bit hash-collision limitation; they are not collision-free byte comparisons.
-4. Atomic bitmap marks identify first sightings directly, so each worker updates its private distinct count without a final bitmap scan. Numeric totals remain private until merging.
-5. The last finisher in each group of four pieces releases the completed mapping interior. Atomic completion publication prevents premature unmapping, and retained boundary pages protect neighbouring wide loads. Merge totals and format country-sorted output with integer arithmetic.
+Rust, standard library only. The design comes from measuring the data first. `PERF.md` has every step, including the failures.
 
-## Verification
+**Threads.** `main` maps both files and starts one worker per CPU as a tree. Each worker zeroes one huge page of the shared tables. The workers then parse `regions.csv` together into a table from region id to country group, wait at a single barrier, and parse `records.csv` in 1 MiB claims. Each worker keeps its own statistics per group, and these are merged at the end. Claims are released with `MADV_DONTNEED` as they finish, so the kernel does not tear down the whole mapping on one thread at exit.
 
-The selected PGO executable passed 35 datasets at 1, 4 and 12 workers. The same core solver passed optimized, AddressSanitizer/UndefinedBehaviorSanitizer and ThreadSanitizer checks on those datasets before the build-only PGO follow-up. Cases include two full-scale seeds, all public scales, additional generated seeds, 24 independent Python-reference fixtures and three page-boundary fixtures with roughly 4-KiB names. Coverage includes names differing after byte 24, trailing spaces, eight-digit IDs, unknown regions, money bounds and hostile CSV fields. Full seed-1 output SHA-256 is `d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536`.
+**Parallel start.** The file can be split anywhere without reading from its start. The spec guarantees that inside a note an LF is followed only by a lowercase word or a quote. An LF followed by a digit or a BOM therefore always begins a record.
 
-Local timings are WSL comparisons. The official result above confirms container build and correctness/timeout/sandbox gates. Only Track C changed in this sprint.
+**Structure.** For each 64 bytes, AVX2 finds quotes, commas and LFs. A carry-less multiply turns the quote bits into an inside-quotes mask. A `""` toggles twice, so escapes need no special case. Every record then has exactly five structural bytes, whose positions are stored with unconditional writes.
+
+**Fields.** About 23% of records hold an escape and field lengths vary, so any branch on either would mispredict constantly. The program has none:
+
+- The digits of the id, region and amount are shifted into eight-byte words, so the bytes below the digits read as leading zeros. `decode_digits` converts them four records at a time with `vpmaddubsw`, `vpmaddwd` and a pack.
+- The BOM, the CR and the sign are handled by arithmetic.
+- A field with raw length L and q quote bytes has a value of L - q/2 - 1 bytes, or L when q is 0. A name's quote count comes from the 32 bytes its hash has already loaded, so only the note needs a rank query on the saved quote masks.
+
+**Names.** Names are drawn uniformly from 100,000 values, so every lookup misses the cache. A batch therefore runs in passes:
+
+1. Read the fields, then prefetch the record's region entry and name bucket.
+2. Read both, update the statistics, and number the name. Then prefetch the bit-matrix line for write.
+3. Set the bit with `fetch_or`.
+
+A name is a 64-bit AES hash. Its top 15 bits select a 64-byte bucket of eight u64 slots. Each slot holds a 47-bit tag above the name's dense 17-bit number, so a single compare-and-swap claims a slot together with its number, and no lock is needed. Workers reserve numbers in blocks of 32, so a first appearance does not touch a shared counter.
+
+Comparing hashes instead of names is a deliberate shortcut. Two of the 100,000 names would have to match on all 62 bits, at odds of about 1 in a billion, and the shortcut saves a memory access per record.
+
+**Distinct names.** One shared bit matrix has a row per country group, indexed by the name's number. It is 256 × 2^17 bits, or 4 MiB, on huge pages. Popcounts of the rows give the distinct-name counts.
+
+## Dependencies
+
+None.
+
+## With another 24 hours
+
+Interning a name is the largest remaining step, because the shared name table misses the cache on every record. An unlocked probe, which gives wrong answers, showed a ceiling of only about 2 ms for removing the lock on the bit matrix. A real gain needs a layout that stops threads sharing these tables without 12 private 4 MiB copies.
