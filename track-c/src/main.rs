@@ -28,6 +28,17 @@ unsafe fn equal_mask(chunk: __m256i, byte: u8) -> u64 {
     _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(byte as i8))) as u32 as u64
 }
 
+unsafe fn pair_mask(low: __m256i, high: __m256i, byte: u8) -> u64 {
+    equal_mask(low, byte) | equal_mask(high, byte) << 32
+}
+
+unsafe fn delim_mask(low: __m256i, high: __m256i) -> u64 {
+    let (c, n) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8));
+    let dl = _mm256_or_si256(_mm256_cmpeq_epi8(low, c), _mm256_cmpeq_epi8(low, n));
+    let dh = _mm256_or_si256(_mm256_cmpeq_epi8(high, c), _mm256_cmpeq_epi8(high, n));
+    _mm256_movemask_epi8(dl) as u32 as u64 | (_mm256_movemask_epi8(dh) as u32 as u64) << 32
+}
+
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
     let s = 64 - 8 * len;
     (read_unaligned(end.sub(8).cast::<u64>()) ^ 0x3030_3030_3030_3030) >> s << s
@@ -54,12 +65,14 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
     }
     let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
     let quotes = equal_mask(bytes, b'"').count_ones() as usize;
-    let key = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
-    let low = _mm256_castsi256_si128(bytes);
-    let high = _mm256_extracti128_si256::<1>(bytes);
-    let mixed = _mm_aesenc_si128(_mm_xor_si128(low, key), high);
-    let mixed = _mm_aesenc_si128(_mm_aesenc_si128(mixed, key), key);
-    (_mm_cvtsi128_si64(mixed) as u64 | 1, quotes)
+    let k = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
+    let (lo, hi) = (
+        _mm256_castsi256_si128(bytes),
+        _mm256_extracti128_si256::<1>(bytes),
+    );
+    let m = _mm_aesenc_si128(_mm_xor_si128(lo, k), hi);
+    let m = _mm_aesenc_si128(_mm_aesenc_si128(m, k), k);
+    (_mm_cvtsi128_si64(m) as u64 | 1, quotes)
 }
 
 fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
@@ -68,13 +81,13 @@ fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
 
 impl Run {
     unsafe fn intern(&self, hash: u64, spare: &mut Range<usize>) -> usize {
-        let index = (hash >> 49) as usize;
-        let tag = hash & (1 << 47) - 1 | 1;
+        let (index, tag) = ((hash >> 49) as usize, hash & (1 << 47) - 1 | 1);
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
         let [low, high] = [0, 1].map(|half| {
-            let p = bucket.as_ptr().cast::<__m256i>().add(half);
-            let slots = _mm256_srli_epi64::<17>(_mm256_load_si256(p));
+            let slots = _mm256_srli_epi64::<17>(_mm256_load_si256(
+                bucket.as_ptr().cast::<__m256i>().add(half),
+            ));
             _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
         });
         match low | high << 4 {
@@ -156,12 +169,11 @@ impl Run {
                 for _ in 0..32 {
                     let low = load(input.add(at));
                     let high = load(input.add(at + 32));
-                    let mask = |byte| equal_mask(low, byte) | equal_mask(high, byte) << 32;
-                    let (quote, comma, newline) = (mask(b'"'), mask(b','), mask(b'\n'));
+                    let quote = pair_mask(low, high, b'"');
                     let quoted = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quote as i64), ones, 0);
                     let inside_now = _mm_cvtsi128_si64(quoted) as u64 ^ inside;
                     inside = ((inside_now as i64) >> 63) as u64;
-                    let mut bits = (comma | newline) & !inside_now;
+                    let mut bits = delim_mask(low, high) & !inside_now;
                     quotes[(at - origin) / 64 % 1024] = (quote, quote_total);
                     quote_total += quote.count_ones();
                     let found = bits.count_ones() as usize;
@@ -270,10 +282,15 @@ unsafe fn zeroed<T>() -> &'static T {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
+    let d = (
+        "/data/regions.csv",
+        "/data/records.csv",
+        "/out/aggregates.txt",
+    );
     let (reg, rec, out) = if a.len() > 3 {
         (a[1].as_str(), a[2].as_str(), a[3].as_str())
     } else {
-        ("/data/regions.csv", "/data/records.csv", "/out/aggregates.txt")
+        d
     };
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
@@ -286,13 +303,13 @@ fn main() {
     let mut out_str = String::new();
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
-        let row = &run.2 .1[group * 2048..][..2048];
-        let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-        let [sum, min, max] =
-            [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
-        let (nb, tb) = (lengths as u32, lengths >> 32);
         if count > 0 {
-            out_str += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {nb} {tb}\n");
+            let row = &run.2 .1[group * 2048..][..2048];
+            let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
+            let [s, mn, mx] =
+                [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
+            let (n, t) = (lengths as u32, lengths >> 32);
+            out_str += &format!("{key} {count} {id_sum} {s} {mn} {mx} {distinct} {n} {t}\n");
         }
     }
     std::fs::write(out, out_str).unwrap();
