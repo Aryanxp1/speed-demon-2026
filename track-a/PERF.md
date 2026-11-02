@@ -347,4 +347,17 @@ Increase BLOCK to 32 KiB, intermediate between the 4 KiB trial and the original 
 
 The immutable 32 KiB source passes all 18 reference datasets in the actual offline Cargo executable at 1/4/12 CPU affinities. AddressSanitizer passes all 18 at 1/12 affinities, substituting only fixture paths. Full output SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Canonical source count stays 394 Rust plus nine Dockerfile lines. All build blobs remain identical to the retained O3 baseline. Only Track A source and documentation are included.
 
-Thirty-two-KiB scan official result: pending.
+Thirty-two-KiB scan `a608d94`, `run-36997f2823c3`: all official gates passed; T=0.019143 s, M=16,179,200 bytes, S=403, D=1, K=51.654984, 85.655611 points. Rejected against the standing 85.847678-point baseline. Smaller batches and common-value formatting did not establish an official gain; both are removed from the following compiler-only trial.
+
+
+### Restore the winner and evaluate Alder Lake CPU scheduling
+
+Restore the exact f7e6bf8 source: original 64 KiB batches, original full-range formatter, original parser and writer, path/worker overrides and twelve-worker cap. The source is byte-identical to the 85.847678-point implementation. Change only target-cpu from x86-64-v3 to alderlake, retaining explicit AES/VAES/static linking, O3, fat LTO, one codegen unit, panic abort and the original pinned builder/runtime images. The scoring i5-13500 uses the same instruction generation family; no AVX-512 flag is requested. Rust's supported target CPU list includes alderlake. Source count returns to 417 Rust plus nine Dockerfile lines, predicted S=426.
+
+The actual offline Cargo executable with these flags passes all 18 reference datasets at 1/4/12 CPU affinities. The byte-identical source built with Alder Lake scheduling passes AddressSanitizer on all 18 at 1/12 workers. Full SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. No algorithmic or memory-ownership change accompanies this build comparison.
+
+A 51-round randomized RAM-output comparison measured exact generic baseline / Alder Lake baseline medians 15.029 / 15.117 ms, CPU 128.316 / 129.274 ms. Local results do not establish a gain. A similarly tested 32 KiB Alder Lake variant measured 14.300 ms versus 14.336 generic and is not included; restore the actual winning algorithm before evaluating this compiler choice. Every timed output hash checked. Official K decides acceptance.
+
+Allocator studies are rejected: limiting glibc arenas to 1/2/4 on the exact baseline did not give a useful local memory reduction; nine-run medians were 15,855,616 / 16,068,608 / 16,232,448 bytes versus baseline 15,880,192. The single-arena candidate was slower (16.400 versus baseline 15.878 ms). M_ARENA_MAX trades arena memory against contention (https://man7.org/linux/man-pages/man3/mallopt.3.html); no allocator tuning is submitted. Retiring fully parsed input prefixes in 8/16/32 MiB pieces also failed to beat the checked 4 KiB executable locally and was not submitted.
+
+Alder Lake compiler official result: pending. Only Track A is changed. Preserve the original x86-64-v3 config in f7e6bf8 for rollback.
