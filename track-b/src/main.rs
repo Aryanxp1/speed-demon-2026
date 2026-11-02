@@ -26,7 +26,7 @@ const BUCKETS: usize = 1 << 15;
 const BUCKET_SLOTS: usize = 7;
 const ID_BLOCK: usize = 32;
 const MAX_TERMS: usize = BUCKETS * BUCKET_SLOTS + 64 * ID_BLOCK;
-const AHEAD: usize = 12;
+const AHEAD: usize = 20;
 const HEAVY: u32 = 1 << 31;
 const OVERFLOW: u32 = 1 << 30;
 const ANCHOR: u32 = 1 << 29;
@@ -547,12 +547,10 @@ impl Run {
                 std::array::from_fn(|j| std::mem::take(&mut group[j * words + k]));
             for width in [32usize, 16, 8, 4, 2, 1] {
                 let mask = u64::MAX / ((1 << width) + 1);
-                for block in (0..64).step_by(2 * width) {
-                    for r in block..block + width {
-                        let t = ((m[r] >> width) ^ m[r + width]) & mask;
-                        m[r + width] ^= t;
-                        m[r] ^= t << width;
-                    }
+                for r in (0..64).filter(|r| r & width == 0) {
+                    let t = ((m[r] >> width) ^ m[r + width]) & mask;
+                    m[r + width] ^= t;
+                    m[r] ^= t << width;
                 }
             }
             for (t, &bits) in m.iter().enumerate().take(heavy - k * 64) {

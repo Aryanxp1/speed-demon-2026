@@ -5,6 +5,7 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
+    fn _exit(status: i32) -> !;
 }
 
 const BIAS: i64 = 1 << 40;
@@ -35,11 +36,12 @@ unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
 
 unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
     for at in (0..count).step_by(4) {
-        let d = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
-        let p = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x010A));
-        let f = _mm256_madd_epi16(p, _mm256_set1_epi32(0x0001_0064));
-        let e = _mm256_madd_epi16(_mm256_packus_epi32(f, f), _mm256_set1_epi32(0x0001_2710));
-        let packed = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(e));
+        let digits = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
+        let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
+        let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_0064));
+        let fours = _mm256_packus_epi32(fours, fours);
+        let eights = _mm256_madd_epi16(fours, _mm256_set1_epi32(0x0001_2710));
+        let packed = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(eights));
         _mm_storeu_si128(numbers.as_mut_ptr().add(at).cast(), packed);
     }
 }
@@ -53,14 +55,12 @@ unsafe fn name_hash(name: *const u8, len: usize) -> (u64, usize) {
     }
     let bytes = _mm256_and_si256(load(name), load(MASKS.as_ptr().cast::<u8>().add(32 - len)));
     let quotes = equal_mask(bytes, b'"').count_ones() as usize;
-    let k = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
-    let (lo, hi) = (
-        _mm256_castsi256_si128(bytes),
-        _mm256_extracti128_si256::<1>(bytes),
-    );
-    let m = _mm_aesenc_si128(_mm_xor_si128(lo, k), hi);
-    let m = _mm_aesenc_si128(_mm_aesenc_si128(m, k), k);
-    (_mm_cvtsi128_si64(m) as u64 | 1, quotes)
+    let key = _mm_set_epi64x(0x1D8E_4E27_C47D_124F, len as i64 ^ 0x5899_65CC_7537_4CC3);
+    let low = _mm256_castsi256_si128(bytes);
+    let high = _mm256_extracti128_si256::<1>(bytes);
+    let mixed = _mm_aesenc_si128(_mm_xor_si128(low, key), high);
+    let mixed = _mm_aesenc_si128(_mm_aesenc_si128(mixed, key), key);
+    (_mm_cvtsi128_si64(mixed) as u64 | 1, quotes)
 }
 
 fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
@@ -69,7 +69,8 @@ fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
 
 impl Run {
     unsafe fn intern(&self, hash: u64, spare: &mut Range<usize>) -> usize {
-        let (index, tag) = ((hash >> 49) as usize, hash & (1 << 47) - 1 | 1);
+        let index = (hash >> 49) as usize;
+        let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
         let [low, high] = [0, 1].map(|half| {
@@ -134,7 +135,9 @@ impl Run {
                 line += at + 5;
             }
         }
-        self.3.wait();
+        if self.3.wait().is_leader() {
+            madvise(self.1.as_ptr() as *mut u8, self.1.len(), 4);
+        }
         prctl(41, 1usize, 0usize, 0usize, 0usize);
         let (input, len) = (self.0.as_ptr() as *mut u8, self.0.len());
         let mut stats = [[0i64; 8]; 256];
@@ -154,8 +157,9 @@ impl Run {
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
             while record < end {
                 for _ in 0..32 {
-                    let (low, high) = (load(input.add(at)), load(input.add(at + 32)));
-                    let mask = |b| equal_mask(low, b) | equal_mask(high, b) << 32;
+                    let low = load(input.add(at));
+                    let high = load(input.add(at + 32));
+                    let mask = |byte| equal_mask(low, byte) | equal_mask(high, byte) << 32;
                     let (quote, comma, newline) = (mask(b'"'), mask(b','), mask(b'\n'));
                     let quoted = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quote as i64), ones, 0);
                     let inside_now = _mm_cvtsi128_si64(quoted) as u64 ^ inside;
@@ -174,23 +178,25 @@ impl Run {
                     at += 64;
                 }
 
-                let quotes_up_to = |p: usize| {
-                    let (q, b) = quotes[(p - origin) / 64 % 1024];
-                    b.wrapping_add(_bzhi_u64(q, ((p - origin) % 64) as u32).count_ones())
+                let quotes_up_to = |position: usize| {
+                    let (quote, before) = quotes[(position - origin) / 64 % 1024];
+                    let below = _bzhi_u64(quote, ((position - origin) % 64) as u32);
+                    before.wrapping_add(below.count_ones())
                 };
                 let field = |a| (*pos.as_ptr().add(a * 5).cast::<[u32; 5]>()).map(|p| p as usize);
-                let (mut count, mut start) = (0, record);
+                let mut count = 0;
+                let mut start = record;
                 while count < filled / 5 && start < end {
-                    let [c1, _, c3, c4, nl] = field(count);
+                    let [comma1, _, comma3, comma4, newline] = field(count);
                     let bom = (*input.add(start) == 0xEF) as usize * 3;
-                    digits[0][count] = digits_before(input.add(c1), c1 - start - bom);
-                    digits[2][count] = digits_before(input.add(c4), c4 - c3 - 1);
-                    let stop = nl - (*input.add(nl - 1) == b'\r') as usize;
-                    let neg = (*input.add(c4 + 1) == b'-') as usize;
-                    let cents = digits_before(input.add(stop), stop - c4 - 1 - neg);
+                    digits[0][count] = digits_before(input.add(comma1), comma1 - start - bom);
+                    digits[2][count] = digits_before(input.add(comma4), comma4 - comma3 - 1);
+                    let stop = newline - (*input.add(newline - 1) == b'\r') as usize;
+                    let neg = (*input.add(comma4 + 1) == b'-') as usize;
+                    let cents = digits_before(input.add(stop), stop - comma4 - 1 - neg);
                     digits[1][count] = (cents & 0xFF_FFFF_FFFF) << 8 | cents >> 48 << 48;
                     signs[count] = -(neg as i64);
-                    start = nl + 1;
+                    start = newline + 1;
                     count += 1;
                 }
                 for kind in 0..3 {
@@ -198,15 +204,15 @@ impl Run {
                 }
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
-                    let [c1, c2, c3, ..] = field(at);
-                    let raw_name = c2 - c1 - 1;
+                    let [comma1, comma2, comma3, ..] = field(at);
+                    let raw_name = comma2 - comma1 - 1;
                     let sub2 = raw_name.saturating_sub(2);
-                    let (hash, inner) = name_hash(input.add(c1 + 2), sub2);
+                    let (hash, inner) = name_hash(input.add(comma1 + 2), sub2);
                     let name_len = sub2 - inner / 2;
-                    let before = std::mem::replace(&mut rank, quotes_up_to(c3));
+                    let before = std::mem::replace(&mut rank, quotes_up_to(comma3));
                     let name_quotes = inner + 2 * (raw_name != 0) as usize;
                     let note_q = rank.wrapping_sub(before) as usize - name_quotes;
-                    let note_len = c3 - c2 - 1 - note_q / 2 - (note_q != 0) as usize;
+                    let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 49) as usize].as_ptr().cast());
                     let region = (numbers[2][at] as usize).min(1_000_000);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
@@ -254,7 +260,9 @@ unsafe fn map(path: &str) -> &'static [u8] {
     let (fd, len) = (f.as_raw_fd(), f.metadata().unwrap().len() as usize);
     let size = len.next_multiple_of(4096) + 4096;
     let base = mmap(null_mut(), size, 1, 0x4022, -1, 0);
-    mmap(base, len, 1, 0x12, fd, 0);
+    if len > 0 {
+        mmap(base, len, 1, 0x12, fd, 0);
+    }
     slice::from_raw_parts(base, len)
 }
 
@@ -267,16 +275,9 @@ unsafe fn zeroed<T>() -> &'static T {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let d = (
-        "/data/regions.csv",
-        "/data/records.csv",
-        "/out/aggregates.txt",
-    );
-    let (reg, rec, out) = if a.len() > 3 {
-        (a[1].as_str(), a[2].as_str(), a[3].as_str())
-    } else {
-        d
-    };
+    let reg = a.get(1).map_or("/data/regions.csv", |s| s);
+    let rec = a.get(2).map_or("/data/records.csv", |s| s);
+    let out = a.get(3).map_or("/out/aggregates.txt", |s| s);
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
     let run = unsafe { Run(map(rec), map(reg), zeroed(), Barrier::new(n)) };
@@ -285,17 +286,18 @@ fn main() {
     let totals = TOTALS.lock().unwrap();
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
-    let mut out_str = String::new();
+    let mut out_str = String::with_capacity(32768);
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
+        let row = &run.2 .1[group * 2048..][..2048];
+        let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
+        let [sum, min, max] =
+            [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
+        let (nb, tb) = (lengths as u32, lengths >> 32);
         if count > 0 {
-            let row = &run.2 .1[group * 2048..][..2048];
-            let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
-            let [s, mn, mx] =
-                [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
-            let (n, t) = (lengths as u32, lengths >> 32);
-            out_str += &format!("{key} {count} {id_sum} {s} {mn} {mx} {distinct} {n} {t}\n");
+            out_str += &format!("{key} {count} {id_sum} {sum} {min} {max} {distinct} {nb} {tb}\n");
         }
     }
     std::fs::write(out, out_str).unwrap();
+    unsafe { _exit(0) }
 }
