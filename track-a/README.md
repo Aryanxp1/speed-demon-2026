@@ -1,6 +1,6 @@
 # Track A: Ingest — Team Lex
 
-Standing verified official best: **85.847678 points, K=52.113899**, run `run-3a1919ec7fb8`, evaluated commit `9e4b798`. All gates passed. This is a new measurement of the exact f7e6bf8 Rust implementation and original pinned O3 build. The launch-only candidate is awaiting official evaluation; 86+ has not yet been verified. Full evidence is in PERF.md.
+Standing verified official best: **85.847678 points, K=52.113899**, run `run-3a1919ec7fb8`, evaluated commit `9e4b798`. All gates passed. This is a new measurement of the exact f7e6bf8 Rust implementation and original pinned O3 build. The launch-only candidate scored 85.645372 points, K=51.630632 on its first official evaluation. An unchanged-build repeat is pending to investigate a possible executable-cache effect; 86+ has not yet been verified. Full evidence is in PERF.md.
 
 Rust 2021, standard library only. Combines Team Lex's streaming guards with the user-provided thorta endpoint lookup. Workers parse 1 MiB claims in 64 KiB SIMD batches, store four-byte rows with an escape for large uint32 latencies and compute exact nearest-rank percentiles with radix sorting. Active-hour leases protect parser writes; late records trigger a complete rerun with early sealing disabled. Ordered output reuses completed-hour storage.
 

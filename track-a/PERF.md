@@ -304,4 +304,8 @@ Canonical Rust count is 394 nonblank lines, plus the unchanged nine-line Dockerf
 
 The actual offline Cargo release executable passes all 18 reference datasets at 1/4/12 CPU affinities with the literal contest paths. AddressSanitizer passes all 18 at 1/12 workers; only main's fixture directory arguments are substituted, with all aggregation code unchanged. Full SHA-256 stays 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Formatting and whitespace checks pass. Fingerprint matching retains its previously documented rare same-length collision limitation. Only Track A source and documentation are included.
 
-Launch-only official result: pending.
+Launch-only `7b4c12e`, `run-c8e58c8af43b`: all official gates passed. T=0.019107 s, M=16,293,888 bytes, S=403, D=1, K=51.630632, 85.645372 points. The expected 23-line saving was confirmed, but this fresh-build sample remains below the retained 85.847678-point winner.
+
+Repeat-study hypothesis: fresh-image candidates repeatedly have roughly 0.3..0.5 MB more official memory and several tenths of a millisecond more time than the reused winning image. The published harness explicitly prewarms data, not executable files. This is a possible cache/accounting effect, not an established explanation. Request a second evaluation of the exact same launch-only source, build flags and Dockerfile through this documentation-only commit. Any change between these two measurements is not an algorithm improvement. The current candidate is not declared a retained winner before the repeat result.
+
+Launch-only unchanged-build repeat: pending.
