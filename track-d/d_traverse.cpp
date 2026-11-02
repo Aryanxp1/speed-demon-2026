@@ -1,6 +1,6 @@
-// Track D: fused construction and saturating queries adapted from the
-// user-supplied td solver. Team Lex retains unique claims, checked mappings,
-// AVX2 and a persistent phase pool.
+// Track D: fused construction and exact saturated-label queries for Team Lex.
+// Packed order/degree records remove a construction array without truncating
+// large degrees.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
@@ -333,10 +333,11 @@ std::pair<u32, u32> row(const Graph &raw, u32 u) {
                      (r[3] != NONE)};
 }
 
-// One worker's share of the search order: vertices in discovery order, the
-// end of each one's out-edges, and those edges with their raw heads.
+// One worker's discovery order packs raw IDs and degrees together.
+// Degrees at the sentinel retain their full counts in large.
 struct alignas(64) Region {
-  u32 *order, *ends, *out, len = 0, edges = 0;
+  u32 *order, *out, len = 0, edges = 0;
+  std::vector<u32> large;
   Escapes esc; // keyed by position in out
 };
 
@@ -357,13 +358,13 @@ struct Grower {
   Region &reg;
   std::vector<Walk> walks;
 
-  // A global atomic claim gives each raw vertex exactly one region owner.
+  // A global atomic claim assigns each raw vertex to exactly one region.
   void claim(u32 z) {
     u64 bit = u64(1) << (z & 63), *word = &claimed[z >> 6];
     if (__atomic_load_n(word, __ATOMIC_RELAXED) & bit)
       return;
     if (!(__atomic_fetch_or(word, bit, __ATOMIC_RELAXED) & bit))
-      reg.order[reg.len++] = z;
+      reg.order[reg.len++] = z << raw.wbits;
   }
   void put(u32 pos, u32 z, u64 w) {
     if (w >= raw.mask)
@@ -418,10 +419,16 @@ struct Grower {
     for (claim(z); lo < reg.len; lo = hi) {
       hi = std::min(reg.len, lo + BATCH);
       for (u32 h = hi; h < std::min(reg.len, hi + 2 * BATCH); ++h)
-        __builtin_prefetch(&raw.adj[4 * size_t(reg.order[h])]);
+        __builtin_prefetch(&raw.adj[4 * size_t(raw.head(reg.order[h]))]);
       size_t walking = 0;
-      for (u32 h = lo; h < hi; ++h)
-        expand(reg.order[h], walking), reg.ends[h] = reg.edges;
+      for (u32 h = lo; h < hi; ++h) {
+        u32 before = reg.edges;
+        expand(raw.head(reg.order[h]), walking);
+        u32 degree = reg.edges - before;
+        reg.order[h] |= std::min(degree, raw.mask);
+        if (degree >= raw.mask)
+          reg.large.push_back(degree);
+      }
       while (walking) {
         size_t kept = 0;
         for (size_t i = 0; i < walking; ++i)
@@ -488,8 +495,7 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
   std::vector<Region> regions(threads);
   parallel(threads, [&](unsigned t) {
     Region &reg = regions[t];
-    reg.order = alloc<u32>(n), reg.ends = alloc<u32>(n),
-    reg.out = alloc<u32>(m);
+    reg.order = alloc<u32>(n), reg.out = alloc<u32>(m);
     Grower grower{*raw, bypass, claimed, reg};
     for (u32 x = cut(n, t, threads); x < cut(n, t + 1, threads); ++x)
       if (!test(bypass, x))
@@ -517,14 +523,27 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
         f(t, std::max(cuts[k], base[t]) - base[t],
           std::min(cuts[k + 1], base[t + 1]) - base[t]);
   };
-  // Unique raw vertices receive their final IDs before edges are renamed.
+  Graph *g = new Graph(total, edges[threads], spare + edges[threads], spare);
+  // Unique vertex owners write the canonical raw-to-final ID map.
   parallel(threads, [&](unsigned k) {
     each(k, [&](unsigned t, u32 lo, u32 hi) {
-      for (u32 i = lo; i < hi; ++i)
-        __atomic_store_n(&where[regions[t].order[i]], base[t] + i,
-                         __ATOMIC_RELAXED);
+      for (u32 i = lo; i < hi; ++i) {
+        u32 packed = regions[t].order[i];
+        where[packed >> wbits] = base[t] + i;
+        g->off[base[t] + i] = packed & mask;
+      }
     });
   });
+  parallel(threads, [&](unsigned t) {
+    u32 pos = edges[t];
+    auto large = regions[t].large.begin();
+    for (u32 i = base[t]; i < base[t + 1]; ++i) {
+      u32 degree = g->off[i];
+      g->off[i] = pos;
+      pos += degree == mask ? *large++ : degree;
+    }
+  });
+  g->off[total] = edges[threads];
   // The pages of the regions' orders and edges become the reverse graph.
   Parts orders, outs;
   for (Region &reg : regions) {
@@ -532,19 +551,17 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
     orders.push_back({reg.order, reg.len * 4ul});
     outs.push_back({reg.out, reg.edges * 4ul});
   }
-  Graph *g = new Graph(total, edges[threads], spare + edges[threads], spare);
   Reverse rev(g->n, g->m, cuts, splice<u32>(orders, total + 1));
   std::vector<Escapes> escapes(threads);
   parallel(threads, [&](unsigned k) {
     std::fill(rev.r->off + cuts[k], rev.r->off + cuts[k + 1], 0);
     each(k, [&](unsigned t, u32 lo, u32 hi) {
       Region &reg = regions[t];
-      u32 pos = lo ? reg.ends[lo - 1] : 0, shift = edges[t];
+      u32 shift = edges[t], pos = g->off[base[t] + lo] - shift;
       auto esc = std::lower_bound(reg.esc.begin(), reg.esc.end(),
                                   std::pair(size_t(pos), u64(0)));
       for (u32 i = lo; i < hi; ++i) {
-        g->off[base[t] + i] = shift + pos;
-        for (; pos < reg.ends[i]; ++pos) {
+        for (u32 stop = g->off[base[t] + i + 1] - shift; pos < stop; ++pos) {
           __builtin_prefetch(
               &where[reg.out[std::min(pos + 24, reg.edges - 1)] >> wbits]);
           u32 e = reg.out[pos], w = e & mask, h = where[e >> wbits];
@@ -555,8 +572,6 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
       }
     });
   });
-  for (Region &reg : regions)
-    release(reg.ends, n);
   rev.r->adj = splice<u32>(outs, g->m);
   g->off[g->n] = edges[threads];
   g->merge(escapes);
