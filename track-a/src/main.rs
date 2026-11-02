@@ -1,5 +1,5 @@
 use std::arch::x86_64::*;
-use std::ptr::{copy_nonoverlapping, read_unaligned as read, write_unaligned};
+use std::ptr::{copy_nonoverlapping, read_unaligned, write_unaligned};
 use std::sync::{atomic::Ordering::*, atomic::*, Arc, Mutex, OnceLock};
 use std::{fs::File, os::fd::AsRawFd, os::unix::fs::FileExt, thread};
 
@@ -14,7 +14,7 @@ const CLAIM: usize = 1 << 20;
 const BLOCK: usize = 1 << 16;
 const MIN_LINE: usize = 40;
 const HOURS: usize = 72;
-const CHUNK: usize = 128;
+const CHUNK: usize = 256;
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
@@ -25,6 +25,10 @@ const LATENCY_BITS: u32 = 20;
 const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
 const DIGIT_BITS: u32 = 10;
 const DIGITS: usize = 1 << DIGIT_BITS;
+
+unsafe fn read(p: *const u8) -> u64 {
+    read_unaligned(p.cast())
+}
 
 fn spaces_in(word: u64) -> u64 {
     let z = word ^ 0x2020_2020_2020_2020;
@@ -44,7 +48,12 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
         mixed = _mm256_aesenc_epi128(mixed, load(name.add(len - 64)));
     }
 
-    let key: __m256i = std::mem::transmute([KEY_LOW, KEY_HIGH]);
+    let key = _mm256_set_epi64x(
+        KEY as i64,
+        KEY.rotate_left(17) as i64,
+        !KEY as i64,
+        KEY.rotate_right(23) as i64,
+    );
     let mixed = _mm256_aesenc_epi128(_mm256_aesenc_epi128(mixed, key), mixed);
     let [a, b]: [u64; 2] = std::mem::transmute(_mm_xor_si128(
         _mm256_castsi256_si128(mixed),
@@ -54,8 +63,7 @@ unsafe fn name_hash(name: *const u8, len: usize) -> u64 {
 }
 
 const SEALED: usize = 1 << (usize::BITS - 1);
-const KEY_LOW: u128 = 0x61c8864680b583ea94f82b3c6ef372fe;
-const KEY_HIGH: u128 = 0x9e3779b97f4a7c15f372fe94f82b3c6e;
+const KEY: u64 = 0x9E37_79B9_7F4A_7C15;
 
 struct Run {
     input: *mut u8,
@@ -106,7 +114,7 @@ impl Run {
         }
     }
 
-    unsafe fn work(&self) {
+    unsafe fn parse(&self) {
         let input = self.input;
 
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
@@ -116,7 +124,7 @@ impl Run {
             self.advance();
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= self.len {
-                break;
+                return;
             }
 
             let mut line = input.add(claim);
@@ -140,7 +148,7 @@ impl Run {
                     let end = input.add(end as usize);
                     _mm_prefetch(end.wrapping_add(BLOCK).cast(), _MM_HINT_T0);
 
-                    let clock: u64 = read(line.add(8).cast());
+                    let clock = read(line.add(8));
                     if clock << 24 != key {
                         cursors[hour] = cursor;
                         key = clock << 24;
@@ -161,10 +169,10 @@ impl Run {
                         }
                     }
 
-                    let method = spaces_in(read(line.add(28).cast())).trailing_zeros() / 8;
-                    let name = line.add(29 + method as usize);
+                    let method = spaces_in(read(line.add(28))).trailing_zeros() as usize / 8;
+                    let name = line.add(29 + method);
 
-                    let last_eight = read(end.sub(8).cast());
+                    let last_eight = read(end.sub(8));
                     let spaces = spaces_in(last_eight);
                     let (latency, digits) = if spaces != 0 {
                         let digits = spaces.leading_zeros() as usize / 8;
@@ -205,11 +213,6 @@ impl Run {
             }
             madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
             self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
-        }
-
-        while self.next_hour.load(Relaxed) < HOURS {
-            self.advance();
-            thread::yield_now();
         }
     }
 
@@ -352,6 +355,15 @@ impl Run {
             unsafe { madvise(rows.cast(), self.stride * 4, 4) };
         }
     }
+
+    fn work(&self) {
+        unsafe { self.parse() };
+
+        while self.next_hour.load(Relaxed) < HOURS {
+            self.advance();
+            thread::yield_now();
+        }
+    }
 }
 
 fn eight_digits(value: u32) -> u64 {
@@ -374,13 +386,40 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
-    let _ = solve(true) && solve(false);
+    let data = directory("--data", &["DATA_DIR", "SD_DATA_DIR"], "/data");
+    let out = directory("--out", &["OUT_DIR", "SD_OUT_DIR"], "/out");
+    std::fs::create_dir_all(&out).unwrap();
+    if solve(true, &data, &out) {
+        solve(false, &data, &out);
+    }
+}
+fn directory(flag: &str, variables: &[&str], default: &str) -> String {
+    let args: Vec<String> = std::env::args().collect();
+    variables
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            args.windows(2)
+                .rev()
+                .find(|a| a[0] == flag)
+                .map(|a| a[1].clone())
+        })
+        .unwrap_or_else(|| default.to_owned())
 }
 
-fn solve(early: bool) -> bool {
-    let file = File::open("/data/requests.log").unwrap();
+fn solve(early: bool, data: &str, out: &str) -> bool {
+    let file = File::open(if std::path::Path::new(data).is_file() {
+        data.to_owned()
+    } else {
+        format!("{data}/requests.log")
+    })
+    .unwrap();
     let len = file.metadata().unwrap().len() as usize;
-    let threads = 12;
+    let threads = std::env::var("SD_THREADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| thread::available_parallelism().map_or(12, |n| n.get()))
+        .clamp(1, 12);
 
     let (input, rows, stride) = unsafe {
         prctl(41, 1usize, 0usize, 0usize, 0usize);
@@ -416,14 +455,14 @@ fn solve(early: bool) -> bool {
         dirty: AtomicBool::new(false),
         next_hour: AtomicUsize::new(0),
         texts: [const { OnceLock::new() }; HOURS],
-        output: File::create("/out/summary.txt").unwrap(),
+        output: File::create(format!("{out}/summary.txt")).unwrap(),
         placed: Mutex::new((0, 0)),
     };
     thread::scope(|s| {
         for _ in 1..threads {
-            s.spawn(|| unsafe { run.work() });
+            s.spawn(|| run.work());
         }
-        unsafe { run.work() };
+        run.work();
     });
     run.dirty.load(Relaxed)
 }
