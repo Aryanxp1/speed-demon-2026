@@ -20,6 +20,7 @@ const ID_BITS: u32 = 11;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
 const SPARE_AT: usize = 1 << 18;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
+const DIGIT_MASK: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 15, 15, 15, 15, 15, 15, 15, 15];
 
 const LATENCY_BITS: u32 = 20;
 const ESCAPE: u32 = (1 << LATENCY_BITS) - 1;
@@ -30,9 +31,12 @@ unsafe fn read(p: *const u8) -> u64 {
     read_unaligned(p.cast())
 }
 
-fn spaces_in(word: u64) -> u64 {
-    let z = word ^ 0x2020_2020_2020_2020;
-    z.wrapping_sub(0x0101_0101_0101_0101) & !z & 0x8080_8080_8080_8080
+#[inline(always)]
+unsafe fn spaces_at(at: *const u8) -> u32 {
+    _mm_movemask_epi8(_mm_cmpeq_epi8(
+        _mm_loadl_epi64(at.cast()),
+        _mm_set1_epi8(b' ' as i8),
+    )) as u32
 }
 
 #[inline(always)]
@@ -169,18 +173,18 @@ impl Run {
                         }
                     }
 
-                    let method = spaces_in(read(line.add(28))).trailing_zeros() as usize / 8;
+                    let method = spaces_at(line.add(28)).trailing_zeros() as usize;
                     let name = line.add(29 + method);
 
-                    let last_eight = read(end.sub(8));
-                    let spaces = spaces_in(last_eight);
+                    let spaces = spaces_at(end.sub(8));
                     let (latency, digits) = if spaces != 0 {
-                        let digits = spaces.leading_zeros() as usize / 8;
-                        let v = (last_eight ^ ZEROS) >> (64 - 8 * digits) << (64 - 8 * digits);
-                        let v = (v & 0x0F0F_0F0F_0F0F_0F0F).wrapping_mul(2561) >> 8;
-                        let v = (v & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
-                        let v = (v & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32;
-                        (v as u32, digits)
+                        let digits = spaces.leading_zeros() as usize - 24;
+                        let mask = _mm_loadl_epi64(DIGIT_MASK.as_ptr().add(digits).cast());
+                        let v = _mm_and_si128(_mm_loadl_epi64(end.sub(8).cast()), mask);
+                        let v = _mm_maddubs_epi16(v, _mm_set1_epi16(0x010A));
+                        let v = _mm_madd_epi16(v, _mm_set1_epi32(0x0001_0064));
+                        let v = _mm_madd_epi16(_mm_packus_epi32(v, v), _mm_set1_epi32(0x0001_2710));
+                        (_mm_cvtsi128_si32(v) as u32, digits)
                     } else {
                         let digits = (1..).find(|&n| *end.sub(n + 1) == b' ').unwrap();
                         let text = std::slice::from_raw_parts(end.sub(digits), digits);
@@ -315,11 +319,8 @@ impl Run {
         let date = ["10-30", "10-31", "11-01", "11-02"][(hour + 18) / 24];
         let label = format!("2026-{date}T{:02}:00:00Z ", (hour + 18) % 24);
         let (text, mut w) = (rows.cast::<u8>(), rows.cast::<u8>());
-        for &(name, id) in order {
+        for &(name, id) in order.iter().filter(|&&(_, id)| starts[id] < starts[id + 1]) {
             let span = starts[id] as usize..starts[id + 1] as usize;
-            if span.is_empty() {
-                continue;
-            }
             let (n, bad) = (span.len() as u32, errors[id + 1]);
             let sorted = std::slice::from_raw_parts(spare.add(span.start), span.len());
             let at_rank = |p: usize| sorted[(p * sorted.len() + 99) / 100 - 1];
@@ -340,14 +341,12 @@ impl Run {
 
     fn write_ready(&self) {
         let mut ready = Vec::new();
-        {
-            let mut placed = self.placed.lock().unwrap();
-            let (next, offset) = &mut *placed;
-            while let Some(text) = self.texts.get(*next).and_then(|text| text.get()) {
-                ready.push((*next, *offset, *text));
-                (*next, *offset) = (*next + 1, *offset + text.len() as u64);
-            }
+        let mut placed = self.placed.lock().unwrap();
+        while let Some(text) = self.texts.get(placed.0).and_then(|text| text.get()) {
+            ready.push((placed.0, placed.1, *text));
+            *placed = (placed.0 + 1, placed.1 + text.len() as u64);
         }
+        drop(placed);
         for (hour, offset, text) in ready {
             self.output.write_all_at(text, offset).unwrap();
 
@@ -376,9 +375,14 @@ fn eight_digits(value: u32) -> u64 {
 
 unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
     *w = b' ';
+    if value < 100_000_000 {
+        let digits = eight_digits(value);
+        let skip = (digits | 1 << 63).trailing_zeros() as usize / 8;
+        write_unaligned(w.add(1).cast(), (digits + ZEROS) >> (8 * skip));
+        return w.add(9 - skip);
+    }
     let digits = eight_digits(value / 100_000_000) as u128
         | (eight_digits(value % 100_000_000) as u128) << 64;
-
     let skip = (digits | 1 << 127).trailing_zeros() as usize / 8;
     let zeros = ZEROS as u128 * ((1 << 64) + 1);
     write_unaligned(w.add(1).cast(), (digits + zeros) >> (8 * skip));
