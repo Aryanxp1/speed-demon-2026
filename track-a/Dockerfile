@@ -11,7 +11,7 @@ COPY src src
 COPY --from=training /data /data
 RUN mkdir -p /out /profiles
 RUN cargo rustc --release --offline -- -Cprofile-generate=/profiles
-RUN for trial in 1 2 3; do LLVM_PROFILE_FILE=/profiles/%m-%p.profraw taskset -c 0-11 target/release/ingest || exit 1; done
+RUN for trial in 1 2 3; do LLVM_PROFILE_FILE=/profiles/%m-%p.profraw target/release/ingest || exit 1; done
 RUN llvm-profdata merge -o /profiles/merged.profdata /profiles/*.profraw
 RUN cargo rustc --release --offline -- -Cprofile-use=/profiles/merged.profdata -Cllvm-args=-pgo-warn-missing-function
 
