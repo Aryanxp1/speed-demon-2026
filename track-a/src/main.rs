@@ -106,7 +106,7 @@ impl Run {
         }
     }
 
-    unsafe fn parse(&self) {
+    unsafe fn work(&self) {
         let input = self.input;
 
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
@@ -116,7 +116,7 @@ impl Run {
             self.advance();
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= self.len {
-                return;
+                break;
             }
 
             let mut line = input.add(claim);
@@ -205,6 +205,11 @@ impl Run {
             }
             madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
             self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
+        }
+
+        while self.next_hour.load(Relaxed) < HOURS {
+            self.advance();
+            thread::yield_now();
         }
     }
 
@@ -347,15 +352,6 @@ impl Run {
             unsafe { madvise(rows.cast(), self.stride * 4, 4) };
         }
     }
-
-    fn work(&self) {
-        unsafe { self.parse() };
-
-        while self.next_hour.load(Relaxed) < HOURS {
-            self.advance();
-            thread::yield_now();
-        }
-    }
 }
 
 fn eight_digits(value: u32) -> u64 {
@@ -384,7 +380,7 @@ fn main() {
 fn solve(early: bool) -> bool {
     let file = File::open("/data/requests.log").unwrap();
     let len = file.metadata().unwrap().len() as usize;
-    let threads = thread::available_parallelism().map_or(12, |n| n.get());
+    let threads = 12;
 
     let (input, rows, stride) = unsafe {
         prctl(41, 1usize, 0usize, 0usize, 0usize);
@@ -425,9 +421,9 @@ fn solve(early: bool) -> bool {
     };
     thread::scope(|s| {
         for _ in 1..threads {
-            s.spawn(|| run.work());
+            s.spawn(|| unsafe { run.work() });
         }
-        run.work();
+        unsafe { run.work() };
     });
     run.dirty.load(Relaxed)
 }
