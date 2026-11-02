@@ -1,6 +1,6 @@
 # Track A: Ingest — Team Lex
 
-Verified standing best: **85.847678 points, K=52.113899**, run `run-3a1919ec7fb8`, using f7e6bf8 and the original pinned build. The trackaa SIMD parser adaptation is awaiting official measurement; 86+ is not yet claimed. PERF.md records provenance, tests and results.
+Verified standing best remains **85.847678 points, K=52.113899**, run `run-3a1919ec7fb8`. The SIMD candidate passed every official gate but scored 85.719189, K=51.806445, in its first sample. An unchanged-source repeat is pending before the retention decision. PERF.md records provenance and checks.
 
 The candidate adapts eight-byte SIMD space detection and common-latency multiply-add decoding into our Rust engine, plus common-eight-digit decimal output. Full uint32 input/output paths remain. Existing active-hour writer leases, exclusive sealing, arbitrary-order rerun, corrected endpoint-length fingerprints, radix percentiles and ordered output are retained. The supplied unguarded reclamation and original hash are not substituted.
 
