@@ -1,6 +1,6 @@
 # Track B: Index — Team Lex
 
-Standing verified best: **78.443977 points, K=37.057792**, run `run-af75921d7bb7`, using the unchanged 1a718ef implementation. The current candidate adds early exit after all worker threads join and all output writes finish. Official evaluation is pending; 79+ has not yet been verified. Detailed measurements and rejected ideas are in PERF.md.
+Standing verified best: **78.471404 points, K=37.104627**, run `run-489677098d0a`, using the unchanged 1a718ef implementation. Early exit's first official sample scored 78.471095, K=37.104100; a second unchanged-source sample is pending. No 79+ result is claimed. Detailed evidence is in PERF.md.
 
 Rust 2021, standard library only. The engine reads queries first and scans the corpus in phases, using sparse postings or transposed 64-document bitmaps. A cache-line bucket contains seven hash tags and eight actions. Phrases compare neighboring token hashes around their rarest word. Boolean operators remain strictly left to right.
 
