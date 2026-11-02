@@ -8,8 +8,6 @@ C++20, zero runtime dependencies. Four-slot raw rows feed fused contraction/loca
 
 Queries use saturated 16-bit labels below 65535, a 256-settle forward probe, bidirectional search and a dynamically packed 64-bucket queue with an exact distant heap. Saturated/uncertain results rerun with full 64-bit labels. General edge decoding complements the common 11-bit specialization.
 
-Current candidate owns process-lifetime worker handles and joins workers during offline profile training, after every callback has completed. Normal runs complete callbacks and write output before leaving cleanup to process exit. This handles GCC's documented profile-collection risk without imposing thread joins during evaluation. The pinned offline GCC15 native PGO build retains seed-17 training and original flags. The affinity-only trial and other regressing combinations are not retained.
-
-Full optimized, ASan/UBSan and TSan suites pass at 1/4/12 workers, including empty queries, oracle fixtures and numeric/concurrency boundaries. Final static PGO packaging matches all public reference outputs. PERF.md records provenance, exact measurements and rejected experiments. Both normal and training cleanup modes pass the complete suite. Official scoring of the training-only cleanup candidate is pending; the official best above remains authoritative.
+The exact source and build of the verified winner are restored. Joined-worker and training-only-cleanup experiments passed gates but scored lower. Native PGO, ASan/UBSan and TSan verify the retained implementation. PERF.md preserves full results and rejected trials.
 
 Environment: `SD_DATA`, `SD_OUT`, `SD_THREADS`; output: `distances.txt`.
