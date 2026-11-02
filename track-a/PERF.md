@@ -308,4 +308,21 @@ Launch-only `7b4c12e`, `run-c8e58c8af43b`: all official gates passed. T=0.019107
 
 Repeat-study hypothesis: fresh-image candidates repeatedly have roughly 0.3..0.5 MB more official memory and several tenths of a millisecond more time than the reused winning image. The published harness explicitly prewarms data, not executable files. This is a possible cache/accounting effect, not an established explanation. Request a second evaluation of the exact same launch-only source, build flags and Dockerfile through this documentation-only commit. Any change between these two measurements is not an algorithm improvement. The current candidate is not declared a retained winner before the repeat result.
 
-Launch-only unchanged-build repeat: pending.
+Launch-only unchanged-build repeat `9b9c430`, `run-3db9b60da005`: all gates passed; T=0.021080 s, M=16,015,360 bytes, S=403, D=1, K=49.324875, 84.653300 points. Rejected. The repeat does not establish a reliable executable-cache gain. The retained best remains 85.847678 points, K=52.113899.
+
+Cache diagnostic: eleven cold/warm pairs of a private 1,378,016-byte executable copy, with input prewarmed, measured local median cgroup peaks of 17,309,696 and 16,375,808 bytes. Only the private executable copy was evicted; no global cache setting was changed. This local effect does not explain or predict the official variation.
+
+
+### Eight-digit common-path decimal output
+
+Use a 64-bit, eight-digit conversion for numbers below 100,000,000. The previous formatter always constructed sixteen digits in a 128-bit value, even for counts, error rates and ordinary latencies. The new predictable range check keeps the original full-uint32 formatter in a cold helper for larger values; zero still emits one digit. The original formatter's fixed-width unaligned store is retained, with eight bytes on the common path and sixteen on the large path. No decimal precision or percentile rule changes.
+
+This starts from the previously checked compact contest interface: literal /data/requests.log and /out/summary.txt, available CPU affinity, the identical precomputed AES-key bits and an unaligned-read alias. The 256-row parser, per-claim input reclamation, guarded hour sealing, ordered writer and complete arbitrary-order fallback stay unchanged. Canonical Rust is 394 nonblank lines, plus nine Dockerfile lines (predicted S=403). Original pinned O3/fat-LTO/static-PIE configuration and zero crates are retained. No implementation is moved into build metadata.
+
+Two 51-round randomized RAM-output comparisons measured control/candidate wall medians 14.920/14.697 ms (paired gain 1.703%) and 16.497/16.153 ms (paired gain 2.146%). Every timed full-data output hash checked. The second study's CPU medians were 137.689/138.400 ms, so no large CPU gain is claimed. Nine warmed-input private-cgroup observations measured candidate median 15,863,808 bytes versus exact baseline 16,138,240; these are noisy local observations, not official axes.
+
+The actual offline Cargo release executable passes all 18 reference datasets at 1/4/12 CPU affinities. The final immutable source passes AddressSanitizer on all 18 at 1/12 CPU affinities, substituting only fixture file paths. This includes all uint32 boundaries and 116,135 individually checked latency groups. Full SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Source SHA-256: b1faf4c0caa4b75b7933f3b823fb435a1b22a67801de394c7cb8a7dd30c6df48.
+
+Rejected local experiments: unmapping finished hour regions after replacing stored slices with lengths passed all reference and sanitizer checks but increased local wall time and did not lower measured peak memory; retaining only the current hour lease also passed references but was slower. A non-PIE static build reduced binary size from 1,376,416 to 1,332,928 bytes without a clear timing or memory advantage, so original flags remain. The stable force-unwind-tables=no option did not change binary size. The immediate-abort panic strategy requires nightly/rebuilding the standard library and is not selected (Rust codegen documentation: https://doc.rust-lang.org/rustc/codegen-options/). None of these rejected changes enters the submitted candidate.
+
+Eight-digit formatter official result: pending. Only Track A source and documentation are changed. The rare same-length fingerprint collision limitation remains as documented.
