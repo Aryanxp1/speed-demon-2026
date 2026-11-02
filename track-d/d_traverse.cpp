@@ -29,9 +29,9 @@ void set(Bits &b, u32 v) { b[v >> 6] |= u64(1) << (v & 63); }
 unsigned id_bits(u64 n) { return n < 2 ? 1 : 64 - __builtin_clzll(n - 1); }
 u32 cut(size_t n, unsigned t, unsigned threads) { return n * t / threads; }
 
-// Uninitialized storage, committed page by page as it is written. Huge pages
+// Fresh mmap storage cannot alias any live allocation. Huge pages
 // are refused, as partly used buffers would round up to them.
-template <class T> T *alloc(size_t n) {
+template <class T> __attribute__((malloc)) T *alloc(size_t n) {
   size_t bytes = n * sizeof(T) + 64;
   int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
   void *p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, flags, -1, 0);
@@ -116,8 +116,7 @@ u32 scan8(const char *&p, const char *end) {
 }
 
 template <class Emit>
-void parse(const char *lo, const char *hi, const char *p, const char *end,
-           Emit emit) {
+void parse(const char *hi, const char *p, const char *end, Emit emit) {
   while (p < end) {
     u32 u = scan8(p, hi), v = scan8(p, hi), w = scan8(p, hi);
     emit(u, v, w);
@@ -215,8 +214,8 @@ struct alignas(64) Bins {
 // exist. A row is four slots, or for more edges a pointer to spilled ones.
 // Marks the vertices that can be bypassed: out-degree <= 2 and no query
 // endpoint.
-Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
-                  Bits &bypass, unsigned threads) {
+Graph *read_graph(const char *lo, const char *hi, Bits &bypass,
+                  unsigned threads) {
   const char *p = lo;
   u32 n = scan(p), m = scan(p);
   // Worker k parses from the first line start at or after its share's start.
@@ -237,7 +236,7 @@ Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
   parallel(threads, [&](unsigned t) {
     Bins &bin = bins[t];
     bin.pool = pool;
-    parse(lo, hi, line(t), line(t + 1),
+    parse(hi, line(t), line(t + 1),
           [&](u32 u, u32 v, u32 w) { bin.add(u, v, w); });
     std::sort(bin.heavy.begin(), bin.heavy.end());
   });
@@ -264,8 +263,10 @@ Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
       u32 pos = 4 * n + spilled.fetch_add(extra);
       for (u32 x = 0; x < size; ++x) {
         u32 v = first + x, *row = rows + 4 * size_t(v);
-        if (at[x] <= 2 && !test(terminal, v))
-          set(bypass, v); // buckets are word aligned
+        // Each bucket owns complete words. Flip query endpoints off and
+        // non-terminal low-degree vertices on, reusing the terminal bitmap.
+        if (at[x] <= 2 || test(bypass, v))
+          bypass[v >> 6] ^= u64(1) << (v & 63);
         std::fill(row, row + 4, NONE);
         if (at[x] > 4)
           row[0] = SPILL, row[1] = pos, row[2] = at[x], at[x] = pos,
@@ -659,23 +660,25 @@ template <class L> struct Side {
   // the entries ahead; returns the number of vertices settled. Relaxations are
   // branch-free: nd + other(v) is a real path length either way.
   template <unsigned W = 0> size_t drain_bits(const Side &other, u64 &best) {
+    // Graph arrays stay immutable and cannot alias either side's labels.
+    const u32 *__restrict offsets = g.off, *__restrict adjacency = g.adj;
     Queue::Bucket &bk = queue.bucket[queue.cur % Queue::B];
     u32 mask = (1u << queue.node_bits) - 1, settled = 0;
     for (u32 k = 0; k < bk.size; ++k) {
       u32 ahead = bk.data[std::min(k + 8, bk.size - 1)] & mask;
-      __builtin_prefetch(&g.off[ahead]), __builtin_prefetch(dist.at(ahead));
+      __builtin_prefetch(&offsets[ahead]), __builtin_prefetch(dist.at(ahead));
       ahead = bk.data[std::min(k + 4, bk.size - 1)] & mask;
-      __builtin_prefetch(&g.adj[g.off[ahead]]);
+      __builtin_prefetch(&adjacency[offsets[ahead]]);
       u32 u = bk.data[k] & mask;
       u64 d = queue.cur << queue.shift | bk.data[k] >> queue.node_bits;
       if (dist.get(u) != d)
         continue;
       ++settled;
-      for (u32 i = g.off[u]; i < g.off[u + 1]; ++i) {
-        u32 v = g.adj[i] >> (W ? W : g.wbits);
+      for (u32 i = offsets[u]; i < offsets[u + 1]; ++i) {
+        u32 v = adjacency[i] >> (W ? W : g.wbits);
         L *x = dist.slot(v);
         u32 mask = W ? (1u << W) - 1 : g.mask;
-        u64 w = g.adj[i] & mask;
+        u64 w = adjacency[i] & mask;
         u64 nd = d + (w == mask ? g.weight(i) : w), old = *x;
         *x = L(std::min(nd, old));
         queue.push(nd, v, nd < old);
@@ -742,10 +745,10 @@ int main() {
   while (q < qend)
     ends.push_back(scan(q));
   const char *graph = map(data + "/graph.txt", gsize), *p = graph;
-  Bits terminal(scan(p) / 64 + 1), bypass(terminal.size());
+  Bits bypass(scan(p) / 64 + 1);
   for (u32 v : ends)
-    set(terminal, v);
-  Graph *raw = read_graph(graph, graph + gsize, terminal, bypass, threads);
+    set(bypass, v);
+  Graph *raw = read_graph(graph, graph + gsize, bypass, threads);
   auto [fwd, rev] = contract(raw, bypass, threads, ends);
   size_t queries = ends.size() / 2;
   std::vector<int64_t> answers(queries);
