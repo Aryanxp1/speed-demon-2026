@@ -59,18 +59,18 @@ template <class T> T *splice(const Parts &parts, size_t n) {
   return (T *)p;
 }
 
-// The stack callback remains live until completion. Workers join before exit
-// so profile data is collected after all worker execution has finished.
+// The stack callback remains live until the completion barrier.
 static std::barrier<> *phase = nullptr;
 static void *work;
 static void (*invoke)(void *, unsigned);
 static unsigned capacity, active;
-static std::vector<std::thread> team;
+// Process-lifetime handles; profile training joins them before collecting data.
+static auto *team = new std::vector<std::thread>;
 template <class F> void parallel(unsigned threads, F f) {
   if (!phase) {
     phase = new std::barrier<>(capacity = threads);
     for (unsigned t = 1; t < threads; ++t)
-      team.emplace_back([t] {
+      team->emplace_back([t] {
         for (;;) {
           phase->arrive_and_wait();
           if (!work)
@@ -774,11 +774,14 @@ int main() {
       answers[i] = d < INF ? int64_t(d) : -1;
     }
   });
-  // Finish profiling only after every worker and its callback have returned.
-  work = nullptr;
-  phase->arrive_and_wait();
-  for (auto &thread : team)
-    thread.join();
+  // Offline profiling joins workers before collecting data; normal runs use
+  // process cleanup after completing every callback.
+  if (getenv("SD_PGO_TRAIN")) {
+    work = nullptr;
+    phase->arrive_and_wait();
+    for (auto &thread : *team)
+      thread.join();
+  }
   std::string text;
   for (int64_t x : answers)
     text += std::to_string(x) + '\n';
