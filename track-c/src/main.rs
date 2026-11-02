@@ -9,7 +9,6 @@ extern "C" {
 }
 
 const BIAS: i64 = 1 << 40;
-const HOT_GROUPS: usize = 241;
 const HOT_WORDS: usize = 1630;
 
 static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
@@ -71,12 +70,10 @@ fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
 
 #[inline(always)]
 fn matrix_index(group: usize, word: usize) -> usize {
-    if group >= HOT_GROUPS {
-        group * 2048 + word
-    } else if word < HOT_WORDS {
+    if word < HOT_WORDS {
         group * HOT_WORDS + word
     } else {
-        HOT_GROUPS * HOT_WORDS + group * (2048 - HOT_WORDS) + word - HOT_WORDS
+        256 * HOT_WORDS + group * (2048 - HOT_WORDS) + word - HOT_WORDS
     }
 }
 
@@ -314,11 +311,7 @@ fn main() {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
         let words = NEXT[3].load(Relaxed).div_ceil(64);
         let first = matrix_index(group, 0);
-        let split = if group < HOT_GROUPS {
-            words.min(HOT_WORDS)
-        } else {
-            words
-        };
+        let split = words.min(HOT_WORDS);
         let spill = if words > split {
             matrix_index(group, split)
         } else {

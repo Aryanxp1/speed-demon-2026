@@ -1,11 +1,11 @@
 # Track C: Join — Team Lex
 
-Verified standing best: **82.397532 points, K=44.458073**, run `run-9590070c9d73`; T=0.023193 s, M=8,941,568 bytes, S=326. All official gates passed. The evaluated compact-table version is retained; the slower output-count experiment was reverted. PERF.md records provenance, experiments and official results.
+Verified standing best: **82.441739 points, K=44.548675**, run `run-bba010f3ad51`; T=0.022911 s, M=9,125,888 bytes, S=326. The uniform-overflow layout is awaiting official evaluation. PERF.md records source provenance, local checks and native results.
 
-Rust 2021, standard library only, with the unchanged pinned offline build. The parser uses AVX2 structural masks and batched numeric decoding. Workers parse regions, synchronize, then join records in 1 MiB claims with per-worker statistics. Shared atomic name buckets assign dense IDs; atomic bit rows count distinct names per country. Names use probabilistic fingerprints, so rare hash collisions remain possible.
+Rust 2021, standard library only, unchanged pinned offline build. The existing parser uses AVX2 structural masks, batched numeric decoding, tree workers, a region join and per-worker statistics. Shared atomic name buckets assign IDs and bit rows count distinct names per country. Names retain the existing probabilistic fingerprints; rare collisions remain possible.
 
-The candidate keeps hot buckets and bit rows in two huge pages and retains cold space for the existing 256 groups and 131,072 name IDs. It also removes redundant digit conversion, separates the common eight-delimiter extraction, and supports a missing final newline using private mapping padding. The original join, CSV handling and worker structure remain. Useful layout ideas came from user-supplied code; the overflow layout retains our base's capacity.
+The candidate gives every country the same compact bit-row head and cold overflow tail, preserving all 256 groups and 131,072 IDs. The first 241 groups' hot heads and name buckets still fit inside two huge pages. This simplifies our capacity-preserving adaptation of the supplied 5pm layout without copying its hard limits. CSV handling, EOF padding and the record loop remain unchanged.
 
-All 11 reference datasets pass at 1/4/12 CPU affinities, and all 11 pass AddressSanitizer at 1/12 affinities. Tests include full and other seeds, quoted CSV and Unicode, 110,000 names, 255 country groups plus unmatched, and unterminated/page-aligned final records. Source: 319 nonblank Rust plus seven Dockerfile lines. PERF.md distinguishes local measurements from the official result.
+All 12 reference datasets pass in the actual Cargo executable at 1/4/12 CPU affinities and under AddressSanitizer at 1/12. These include full/other seeds, hostile CSV, 110,000 names spread over 255 countries, and unterminated/page-aligned records. Candidate canonical source: 312 Rust plus seven Dockerfile lines. No native improvement is claimed until measured.
 
 Run `solution regions.csv records.csv output.txt`. Defaults: `/data/regions.csv`, `/data/records.csv`, `/out/aggregates.txt`.
