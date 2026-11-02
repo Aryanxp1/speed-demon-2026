@@ -9,7 +9,6 @@ extern "C" {
 }
 
 const BIAS: i64 = 1 << 40;
-const HOT_GROUPS: usize = 241;
 const HOT_WORDS: usize = 1630;
 
 static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
@@ -36,7 +35,8 @@ unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
     read_unaligned::<u64>(end.sub(8).cast()) >> s << s
 }
 
-unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
+#[inline(always)]
+unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize, limit: u32) {
     for at in (0..count).step_by(4) {
         let digits = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
         let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
@@ -44,6 +44,7 @@ unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
         let fours = _mm256_packus_epi32(fours, fours);
         let eights = _mm256_madd_epi16(fours, _mm256_set1_epi32(0x0001_2710));
         let packed = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(eights));
+        let packed = _mm_min_epu32(packed, _mm_set1_epi32(limit as i32));
         _mm_storeu_si128(numbers.as_mut_ptr().add(at).cast(), packed);
     }
 }
@@ -71,12 +72,10 @@ fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
 
 #[inline(always)]
 fn matrix_index(group: usize, word: usize) -> usize {
-    if group >= HOT_GROUPS {
-        group * 2048 + word
-    } else if word < HOT_WORDS {
+    if word < HOT_WORDS {
         group * HOT_WORDS + word
     } else {
-        HOT_GROUPS * HOT_WORDS + group * (2048 - HOT_WORDS) + word - HOT_WORDS
+        256 * HOT_WORDS + group * (2048 - HOT_WORDS) + word - HOT_WORDS
     }
 }
 
@@ -127,6 +126,10 @@ impl Run {
             scope.spawn(move || unsafe { self.start(scope, share - 1) });
             descendants -= share;
         }
+        let page = NEXT[2].fetch_add(1, Relaxed) << 21;
+        if page < 2 << 21 {
+            (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
+        }
         while let Some(claim) = take_block(&NEXT[0], 1 << 16, self.1.len()) {
             let rest = &self.1[claim..];
             let mut line = rest.iter().position(|&c| c == b'\n').unwrap() + 1;
@@ -148,6 +151,7 @@ impl Run {
         if self.3.wait().is_leader() {
             madvise(self.1.as_ptr() as *mut u8, self.1.len(), 4);
         }
+        prctl(41, 1usize, 0usize, 0usize, 0usize);
         let (input, len) = (self.0.as_ptr() as *mut u8, self.0.len());
         let mut stats = [[0i64; 8]; 256];
         let mut pos = [0u32; 191 * 5];
@@ -212,8 +216,8 @@ impl Run {
                     start = newline + 1;
                     count += 1;
                 }
-                for kind in 0..3 {
-                    decode_digits(&digits[kind], &mut numbers[kind], count);
+                for (kind, limit) in [u32::MAX, u32::MAX, 1_000_000].into_iter().enumerate() {
+                    decode_digits(&digits[kind], &mut numbers[kind], count, limit);
                 }
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
@@ -227,15 +231,17 @@ impl Run {
                     let note_q = rank.wrapping_sub(before) as usize - name_quotes;
                     let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 50) as usize].as_ptr().cast());
-                    let region = (numbers[2][at] as usize).min(1_000_000);
-                    _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
-                    numbers[2][at] = region as u32;
+                    _mm_prefetch::<_MM_HINT_T0>(
+                        REGION_GROUP.as_ptr().add(numbers[2][at] as usize).cast(),
+                    );
                     hashes[at] = hash;
                     lengths[at] = name_len as u64 | (note_len as u64) << 32;
                 }
                 record = start;
                 for at in 0..count {
-                    let group = REGION_GROUP[numbers[2][at] as usize].load(Relaxed) as usize;
+                    let group = REGION_GROUP
+                        .get_unchecked(numbers[2][at] as usize)
+                        .load(Relaxed) as usize;
                     let amount = (numbers[1][at] as i64 ^ signs[at]) - signs[at];
                     let s = &mut stats[group];
                     s[0] += 1;
@@ -297,15 +303,8 @@ fn main() {
     let rec = a.get(2).map_or("/data/records.csv", |s| s);
     let out = a.get(3).map_or("/out/aggregates.txt", |s| s);
     let n = thread::available_parallelism().map_or(12, |n| n.get());
-    let tables = unsafe { zeroed::<Tables>() };
-    unsafe {
-        for page in [0, 2 << 20] {
-            (*(tables as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
-        }
-        prctl(41, 1usize, 0usize, 0usize, 0usize);
-    }
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
-    let run = unsafe { Run(map(rec), map(reg), tables, Barrier::new(n)) };
+    let run = unsafe { Run(map(rec), map(reg), zeroed(), Barrier::new(n)) };
     thread::scope(|s| unsafe { run.start(s, n - 1) });
 
     let totals = TOTALS.lock().unwrap();
@@ -316,11 +315,7 @@ fn main() {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
         let words = NEXT[3].load(Relaxed).div_ceil(64);
         let first = matrix_index(group, 0);
-        let split = if group < HOT_GROUPS {
-            words.min(HOT_WORDS)
-        } else {
-            words
-        };
+        let split = words.min(HOT_WORDS);
         let spill = if words > split {
             matrix_index(group, split)
         } else {
