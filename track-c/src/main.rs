@@ -9,6 +9,7 @@ extern "C" {
 }
 
 const BIAS: i64 = 1 << 40;
+const HOT_GROUPS: usize = 241;
 const HOT_WORDS: usize = 1630;
 
 static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
@@ -70,10 +71,12 @@ fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
 
 #[inline(always)]
 fn matrix_index(group: usize, word: usize) -> usize {
-    if word < HOT_WORDS {
+    if group >= HOT_GROUPS {
+        group * 2048 + word
+    } else if word < HOT_WORDS {
         group * HOT_WORDS + word
     } else {
-        256 * HOT_WORDS + group * (2048 - HOT_WORDS) + word - HOT_WORDS
+        HOT_GROUPS * HOT_WORDS + group * (2048 - HOT_WORDS) + word - HOT_WORDS
     }
 }
 
@@ -124,10 +127,6 @@ impl Run {
             scope.spawn(move || unsafe { self.start(scope, share - 1) });
             descendants -= share;
         }
-        let page = NEXT[2].fetch_add(1, Relaxed) << 21;
-        if page < 2 << 21 {
-            (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
-        }
         while let Some(claim) = take_block(&NEXT[0], 1 << 16, self.1.len()) {
             let rest = &self.1[claim..];
             let mut line = rest.iter().position(|&c| c == b'\n').unwrap() + 1;
@@ -149,7 +148,6 @@ impl Run {
         if self.3.wait().is_leader() {
             madvise(self.1.as_ptr() as *mut u8, self.1.len(), 4);
         }
-        prctl(41, 1usize, 0usize, 0usize, 0usize);
         let (input, len) = (self.0.as_ptr() as *mut u8, self.0.len());
         let mut stats = [[0i64; 8]; 256];
         let mut pos = [0u32; 191 * 5];
@@ -299,8 +297,15 @@ fn main() {
     let rec = a.get(2).map_or("/data/records.csv", |s| s);
     let out = a.get(3).map_or("/out/aggregates.txt", |s| s);
     let n = thread::available_parallelism().map_or(12, |n| n.get());
+    let tables = unsafe { zeroed::<Tables>() };
+    unsafe {
+        for page in [0, 2 << 20] {
+            (*(tables as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
+        }
+        prctl(41, 1usize, 0usize, 0usize, 0usize);
+    }
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
-    let run = unsafe { Run(map(rec), map(reg), zeroed(), Barrier::new(n)) };
+    let run = unsafe { Run(map(rec), map(reg), tables, Barrier::new(n)) };
     thread::scope(|s| unsafe { run.start(s, n - 1) });
 
     let totals = TOTALS.lock().unwrap();
@@ -311,7 +316,11 @@ fn main() {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
         let words = NEXT[3].load(Relaxed).div_ceil(64);
         let first = matrix_index(group, 0);
-        let split = words.min(HOT_WORDS);
+        let split = if group < HOT_GROUPS {
+            words.min(HOT_WORDS)
+        } else {
+            words
+        };
         let spill = if words > split {
             matrix_index(group, split)
         } else {

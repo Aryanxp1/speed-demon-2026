@@ -1,11 +1,11 @@
 # Track C: Join — Team Lex
 
-Verified standing best: **82.441739 points, K=44.548675**, run `run-bba010f3ad51`; T=0.022911 s, M=9,125,888 bytes, S=326. The uniform-overflow layout is awaiting official evaluation. PERF.md records source provenance, local checks and native results.
+Verified standing best: **82.446607 points, K=44.558663**, run `run-d997ff843f5c`; T=0.022971 s, M=9,056,256 bytes, S=326. The earlier uniform-overflow experiment scored 82.254885 and is reverted. The early table-setup comparison awaits official evaluation. PERF.md records provenance and all results.
 
-Rust 2021, standard library only, unchanged pinned offline build. The existing parser uses AVX2 structural masks, batched numeric decoding, tree workers, a region join and per-worker statistics. Shared atomic name buckets assign IDs and bit rows count distinct names per country. Names retain the existing probabilistic fingerprints; rare collisions remain possible.
+The Rust join retains the supplied 5pm layout/decode ideas in our capacity-preserving base: two hot huge pages, cold name/group overflow, AVX2 CSV masks, batched numeric decoding, atomic name IDs and distinct-name bits, and per-worker statistics. Names retain probabilistic fingerprints; rare collisions remain possible. All 256 groups and 131,072 ID slots remain available.
 
-The candidate gives every country the same compact bit-row head and cold overflow tail, preserving all 256 groups and 131,072 IDs. The first 241 groups' hot heads and name buckets still fit inside two huge pages. This simplifies our capacity-preserving adaptation of the supplied 5pm layout without copying its hard limits. CSV handling, EOF padding and the record loop remain unchanged.
+The candidate prepares the two hot table pages in main before disabling future transparent huge pages and creating workers. Parsing, hash values, region lookup, statistics, output, EOF handling and the existing barrier are unchanged. No local performance improvement is claimed; official evaluation decides retention.
 
-All 12 reference datasets pass in the actual Cargo executable at 1/4/12 CPU affinities and under AddressSanitizer at 1/12. These include full/other seeds, hostile CSV, 110,000 names spread over 255 countries, and unterminated/page-aligned records. Candidate canonical source: 312 Rust plus seven Dockerfile lines. No native improvement is claimed until measured.
+Warnings-denied offline Cargo and all 12 references pass at 1/4/12 CPU affinities; ASAN passes all 12 at 1/12, including combined 110,000-name / 255-country overflow. Source: 321 Rust plus seven Dockerfile lines. Pinned build settings and zero dependencies remain unchanged.
 
 Run `solution regions.csv records.csv output.txt`. Defaults: `/data/regions.csv`, `/data/records.csv`, `/out/aggregates.txt`.
