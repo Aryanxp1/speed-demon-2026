@@ -390,39 +390,14 @@ unsafe fn put_number(w: *mut u8, value: u32) -> *mut u8 {
 }
 
 fn main() {
-    let data = directory("--data", &["DATA_DIR", "SD_DATA_DIR"], "/data");
-    let out = directory("--out", &["OUT_DIR", "SD_OUT_DIR"], "/out");
-    std::fs::create_dir_all(&out).unwrap();
-    if solve(true, &data, &out) {
-        solve(false, &data, &out);
-    }
-}
-fn directory(flag: &str, variables: &[&str], default: &str) -> String {
-    let args: Vec<String> = std::env::args().collect();
-    variables
-        .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|s| !s.is_empty()))
-        .or_else(|| {
-            args.windows(2)
-                .rev()
-                .find(|a| a[0] == flag)
-                .map(|a| a[1].clone())
-        })
-        .unwrap_or_else(|| default.to_owned())
+    let _ = solve(true, "/data", "/out") && solve(false, "/data", "/out");
 }
 
 fn solve(early: bool, data: &str, out: &str) -> bool {
-    let file = File::open(if std::path::Path::new(data).is_file() {
-        data.to_owned()
-    } else {
-        format!("{data}/requests.log")
-    })
-    .unwrap();
+    let file = File::open(format!("{data}/requests.log")).unwrap();
     let len = file.metadata().unwrap().len() as usize;
-    let threads = std::env::var("SD_THREADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| thread::available_parallelism().map_or(12, |n| n.get()))
+    let threads = thread::available_parallelism()
+        .map_or(12, |n| n.get())
         .clamp(1, 12);
 
     let (input, rows, stride) = unsafe {
