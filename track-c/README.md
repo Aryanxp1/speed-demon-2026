@@ -1,43 +1,11 @@
 # Track C: Join — Team Lex
 
-Zero-dependency Rust 2021 implementation (`dependency_count = 0`). Built statically offline with pinned `rust:1-slim-trixie`.
-Proven performance on the official Falkenstein benchmark server: **81.25 to 82.4+ points**, **$T \approx 0.019 - 0.022$ s**, **$M \approx 10.8 - 11.4$ MB**, **$S = 301$ lines**.
-Verified 100% byte-identical against official references on all scales (`tiny`, `sample`, `full`, `seed42`, `seed999`).
+Verified standing best: **82.374132 points, K=44.410192**, run `run-012b0c9fd050`; T=0.022297 s, M=10,858,496 bytes, S=289. The compact-table candidate awaits official measurement. PERF.md records provenance, experiments and official results.
 
-The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md).
+Rust 2021, standard library only, with the unchanged pinned offline build. The parser uses AVX2 structural masks and batched numeric decoding. Workers parse regions, synchronize, then join records in 1 MiB claims with per-worker statistics. Shared atomic name buckets assign dense IDs; atomic bit rows count distinct names per country. Names use probabilistic fingerprints, so rare hash collisions remain possible.
 
-## Approach
+The candidate keeps hot buckets and bit rows in two huge pages and retains cold space for the existing 256 groups and 131,072 name IDs. It also removes redundant digit conversion, separates the common eight-delimiter extraction, and supports a missing final newline using private mapping padding. The original join, CSV handling and worker structure remain. Useful layout ideas came from user-supplied code; the overflow layout retains our base's capacity.
 
-Rust, standard library only. The design comes from measuring the data first. `PERF.md` has every step, including the failures.
+All 11 reference datasets pass at 1/4/12 CPU affinities, and all 11 pass AddressSanitizer at 1/12 affinities. Tests include full and other seeds, quoted CSV and Unicode, 110,000 names, 255 country groups plus unmatched, and unterminated/page-aligned final records. Source: 319 nonblank Rust plus seven Dockerfile lines. Local memory results are diagnostic; official candidate metrics remain pending.
 
-**Threads.** `main` maps both files and starts one worker per CPU as a tree. Each worker zeroes one huge page of the shared tables. The workers then parse `regions.csv` together into a table from region id to country group, wait at a single barrier, and parse `records.csv` in 1 MiB claims. Each worker keeps its own statistics per group, and these are merged at the end. Claims are released with `MADV_DONTNEED` as they finish, so the kernel does not tear down the whole mapping on one thread at exit.
-
-**Parallel start.** The file can be split anywhere without reading from its start. The spec guarantees that inside a note an LF is followed only by a lowercase word or a quote. An LF followed by a digit or a BOM therefore always begins a record.
-
-**Structure.** For each 64 bytes, AVX2 finds quotes, commas and LFs. A carry-less multiply turns the quote bits into an inside-quotes mask. A `""` toggles twice, so escapes need no special case. Every record then has exactly five structural bytes, whose positions are stored with unconditional writes.
-
-**Fields.** About 23% of records hold an escape and field lengths vary, so any branch on either would mispredict constantly. The program has none:
-
-- The digits of the id, region and amount are shifted into eight-byte words, so the bytes below the digits read as leading zeros. `decode_digits` converts them four records at a time with `vpmaddubsw`, `vpmaddwd` and a pack.
-- The BOM, the CR and the sign are handled by arithmetic.
-- A field with raw length L and q quote bytes has a value of L - q/2 - 1 bytes, or L when q is 0. A name's quote count comes from the 32 bytes its hash has already loaded, so only the note needs a rank query on the saved quote masks.
-
-**Names.** Names are drawn uniformly from 100,000 values, so every lookup misses the cache. A batch therefore runs in passes:
-
-1. Read the fields, then prefetch the record's region entry and name bucket.
-2. Read both, update the statistics, and number the name. Then prefetch the bit-matrix line for write.
-3. Set the bit with `fetch_or`.
-
-A name is a 64-bit AES hash. Its top 15 bits select a 64-byte bucket of eight u64 slots. Each slot holds a 47-bit tag above the name's dense 17-bit number, so a single compare-and-swap claims a slot together with its number, and no lock is needed. Workers reserve numbers in blocks of 32, so a first appearance does not touch a shared counter.
-
-Comparing hashes instead of names is a deliberate shortcut. Two of the 100,000 names would have to match on all 62 bits, at odds of about 1 in a billion, and the shortcut saves a memory access per record.
-
-**Distinct names.** One shared bit matrix has a row per country group, indexed by the name's number. It is 256 × 2^17 bits, or 4 MiB, on huge pages. Popcounts of the rows give the distinct-name counts.
-
-## Dependencies
-
-None.
-
-## With another 24 hours
-
-Interning a name is the largest remaining step, because the shared name table misses the cache on every record. An unlocked probe, which gives wrong answers, showed a ceiling of only about 2 ms for removing the lock on the bit matrix. A real gain needs a layout that stops threads sharing these tables without 12 private 4 MiB copies.
+Run `solution regions.csv records.csv output.txt`. Defaults: `/data/regions.csv`, `/data/records.csv`, `/out/aggregates.txt`.

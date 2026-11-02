@@ -9,6 +9,8 @@ extern "C" {
 }
 
 const BIAS: i64 = 1 << 40;
+const HOT_GROUPS: usize = 241;
+const HOT_WORDS: usize = 1630;
 
 static NEXT: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static REGION_GROUP: [AtomicU8; 1_000_001] = [const { AtomicU8::new(0) }; 1_000_001];
@@ -17,7 +19,7 @@ static TOTALS: Mutex<[[i64; 8]; 256]> = Mutex::new([[0; 8]; 256]);
 static COUNTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 #[repr(C)]
-struct Tables([[AtomicU64; 8]; 1 << 15], [AtomicU64; 524288]);
+struct Tables([[AtomicU64; 8]; 1 << 14], [AtomicU64; 524288]);
 
 struct Run(&'static [u8], &'static [u8], &'static Tables, Barrier);
 
@@ -31,7 +33,7 @@ unsafe fn equal_mask(chunk: __m256i, byte: u8) -> u64 {
 
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
     let s = 64 - 8 * len;
-    (read_unaligned(end.sub(8).cast::<u64>()) ^ 0x3030_3030_3030_3030) >> s << s
+    read_unaligned::<u64>(end.sub(8).cast()) >> s << s
 }
 
 unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
@@ -67,9 +69,20 @@ fn take_block(c: &AtomicUsize, s: usize, len: usize) -> Option<usize> {
     Some(c.fetch_add(s, Relaxed)).filter(|&a| a < len)
 }
 
+#[inline(always)]
+fn matrix_index(group: usize, word: usize) -> usize {
+    if group >= HOT_GROUPS {
+        group * 2048 + word
+    } else if word < HOT_WORDS {
+        group * HOT_WORDS + word
+    } else {
+        HOT_GROUPS * HOT_WORDS + group * (2048 - HOT_WORDS) + word - HOT_WORDS
+    }
+}
+
 impl Run {
     unsafe fn intern(&self, hash: u64, spare: &mut Range<usize>) -> usize {
-        let index = (hash >> 49) as usize;
+        let index = (hash >> 50) as usize;
         let tag = hash & (1 << 47) - 1 | 1;
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
@@ -88,6 +101,7 @@ impl Run {
     unsafe fn insert(&self, index: usize, tag: u64, spare: &mut Range<usize>) -> usize {
         if spare.start >= spare.end {
             let first = NEXT[3].fetch_add(32, Relaxed);
+            assert!(first + 32 <= 1 << 17);
             *spare = first..first + 32;
         }
         let claimed = tag << 17 | spare.start as u64;
@@ -114,7 +128,7 @@ impl Run {
             descendants -= share;
         }
         let page = NEXT[2].fetch_add(1, Relaxed) << 21;
-        if page < size_of::<Tables>() {
+        if page < 2 << 21 {
             (*(self.2 as *const Tables as *const AtomicU8).add(page)).store(0, Relaxed);
         }
         while let Some(claim) = take_block(&NEXT[0], 1 << 16, self.1.len()) {
@@ -168,10 +182,14 @@ impl Run {
                     quotes[(at - origin) / 64 % 1024] = (quote, quote_total);
                     quote_total += quote.count_ones();
                     let found = bits.count_ones() as usize;
-                    let mut extra = 0;
-                    while extra < 8 || bits != 0 {
+                    for extra in 0..8 {
                         *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
                         bits &= bits.wrapping_sub(1);
+                    }
+                    let mut extra = 8;
+                    while bits != 0 {
+                        *pos.get_unchecked_mut(filled + extra) = at as u32 + bits.trailing_zeros();
+                        bits &= bits - 1;
                         extra += 1;
                     }
                     filled += found;
@@ -213,7 +231,7 @@ impl Run {
                     let name_quotes = inner + 2 * (raw_name != 0) as usize;
                     let note_q = rank.wrapping_sub(before) as usize - name_quotes;
                     let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
-                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 49) as usize].as_ptr().cast());
+                    _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 50) as usize].as_ptr().cast());
                     let region = (numbers[2][at] as usize).min(1_000_000);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
                     numbers[2][at] = region as u32;
@@ -232,7 +250,7 @@ impl Run {
                     s[4] = s[4].max(BIAS + amount);
                     s[5] = s[5].max(BIAS - amount);
                     let name = self.intern(hashes[at], &mut spare);
-                    let word = (group << 11) + name / 64;
+                    let word = matrix_index(group, name / 64);
                     _mm_prefetch::<_MM_HINT_ET0>(self.2 .1.as_ptr().add(word).cast());
                     hashes[at] = (word << 6 | name % 64) as u64;
                 }
@@ -257,11 +275,16 @@ impl Run {
 
 unsafe fn map(path: &str) -> &'static [u8] {
     let f = File::open(path).unwrap();
-    let (fd, len) = (f.as_raw_fd(), f.metadata().unwrap().len() as usize);
+    let (fd, mut len) = (f.as_raw_fd(), f.metadata().unwrap().len() as usize);
     let size = len.next_multiple_of(4096) + 4096;
-    let base = mmap(null_mut(), size, 1, 0x4022, -1, 0);
+    let base = mmap(null_mut(), size, 3, 0x4022, -1, 0);
+    assert!(base as isize != -1);
     if len > 0 {
-        mmap(base, len, 1, 0x12, fd, 0);
+        assert!(mmap(base, len, 3, 0x12, fd, 0) == base);
+    }
+    if len > 0 && *base.add(len - 1) != b'\n' {
+        *base.add(len) = b'\n';
+        len += 1;
     }
     slice::from_raw_parts(base, len)
 }
@@ -289,8 +312,23 @@ fn main() {
     let mut out_str = String::with_capacity(32768);
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
-        let row = &run.2 .1[group * 2048..][..2048];
-        let distinct: u32 = row.iter().map(|w| w.load(Relaxed).count_ones()).sum();
+        let words = NEXT[3].load(Relaxed).div_ceil(64);
+        let first = matrix_index(group, 0);
+        let split = if group < HOT_GROUPS {
+            words.min(HOT_WORDS)
+        } else {
+            words
+        };
+        let spill = if words > split {
+            matrix_index(group, split)
+        } else {
+            0
+        };
+        let distinct: u32 = [(first, split), (spill, words - split)]
+            .into_iter()
+            .flat_map(|(at, len)| run.2 .1[at..at + len].iter())
+            .map(|w| w.load(Relaxed).count_ones())
+            .sum();
         let [sum, min, max] =
             [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));
         let (nb, tb) = (lengths as u32, lengths >> 32);
