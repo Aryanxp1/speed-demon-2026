@@ -8,6 +8,6 @@ C++20, zero runtime dependencies. Four-slot raw rows feed fused contraction/loca
 
 Queries use saturated 16-bit labels below 65535, a 256-settle forward probe, bidirectional search and a dynamically packed 64-bucket queue with an exact distant heap. Saturated/uncertain results rerun with full 64-bit labels. General edge decoding complements the common 11-bit specialization.
 
-The exact source and build of the verified winner are restored. Joined-worker and training-only-cleanup experiments passed gates but scored lower. Native PGO, ASan/UBSan and TSan verify the retained implementation. PERF.md preserves full results and rejected trials.
+The C++ source is identical to the verified winner. A build-only comparison uses -O2 in both native static PGO stages; the prior -O3 recipe remains the official best above. The new package passes the full native reference/oracle/boundary/stress suite. Prior ASan/UBSan and TSan verification applies to identical source. Official -O2 scoring is pending; no higher score is claimed yet. PERF.md preserves all rejected experiments.
 
 Environment: `SD_DATA`, `SD_OUT`, `SD_THREADS`; output: `distances.txt`.

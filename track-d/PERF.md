@@ -497,3 +497,14 @@ Both cleanup modes independently pass the entire existing suite under optimized 
 
 
 Training-only cleanup4804ef4, run-328bc53b7954: all gates passed, T0.089010 s, M56,512,512 bytes, S693, D1, K32.709155,75.733466 points. It does not beat76.514177 / K33.906546. Restoring exact4b37425 source/Dockerfile. A scratch same-binary contraction-worker sweep6/8/10/12 also rejects fewer workers: seed1 medians73.819/68.599/65.514/62.401 ms; seed17 75.501/71.747/67.927/63.802. All outputs matched. No worker cap is submitted.
+
+
+### Further distance-layout screening and source-identical -O2 trial
+
+All additional distance-layout experiments remain outside track-d. Dense generation-tagged cells(u16 value/u16 tag for narrow searches, u64 value/u16 tag for wide) lose both time and memory:31-round full-input medians retained65.985/63.542 ms versus dense variants117.269..120.468/117.555..120.317. Five-sample median anonymous RSS grows52,288 to145,924..146,768 KiB: physical writes accumulate across queries instead of reusing a compact page store. Rejected.
+
+Generation tags only in recycled page directories also lose runtime: retained62.537/63.154 ms, packed directory65.273/66.322, branchless tagged directory66.640/66.983, split32-bit offsets/16-bit stamps67.186/65.442. Median anonymous RSS52,160/52,028/52,156/51,360 KiB respectively. Smaller metadata does not offset the added lookup work. Earlier pointer-offset-only directory measurements were likewise inconsistent and are not repeated. No epoch/stamp implementation is submitted.
+
+The next official comparison changes only the compiler level from -O3 to -O2 in both PGO stages. C++ source is byte-identical to4b37425; seed17, native targeting, LTO, static linkage, runtime image and dependency metadata remain. Prior31-round two-seed screens show no local gain(O2 64.847/64.661 ms versus O3 62.958/63.995), but local relative timings have repeatedly not transferred to the official host. The purpose is a bounded build-only scoring-box comparison; no speedup is asserted.
+
+Actual new -O2 static native GCC15 PGO package passes public tiny/sample/full at1/4/12, full output SHA-256 a23dbdf0a3e49cc8901310a9ee1dc6a9a569a85297b6da75c2a7002cb2ed277e. The new optimized binary also passes the complete native suite:70 independent oracles, cross-group cycle, empty/single queries,88 supplied differential cases,60 u32-boundary cases,110 saturation cases and lattice/contraction stress. Sanitizer source is unchanged from the verified winner; no claim of local Docker execution. Official gates and score pending. Retained best remains76.514177 / K33.906546.
