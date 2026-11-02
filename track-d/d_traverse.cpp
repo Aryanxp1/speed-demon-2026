@@ -1,13 +1,12 @@
-// Track D: fused construction and saturating queries adapted from the
-// user-supplied td solver. Team Lex retains unique claims, checked mappings,
-// AVX2 and a persistent phase pool.
+// Track D for Team Lex: exact fused graph construction and saturated-label
+// search. Packed records, two-edge bypass walks and a typed persistent
+// dispatcher retain exact fallbacks.
 #include <algorithm>
 #include <atomic>
 #include <barrier>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
-#include <functional>
 #include <immintrin.h>
 #include <numeric>
 #include <queue>
@@ -61,38 +60,32 @@ template <class T> T *splice(const Parts &parts, size_t n) {
   return (T *)p;
 }
 
-struct PhasePool {
-  unsigned capacity;
-  std::barrier<> gate;
-  std::function<void(unsigned)> job;
-  std::vector<std::thread> workers;
-  explicit PhasePool(unsigned n) : capacity(n), gate(n) {
-    for (unsigned t = 1; t < n; ++t)
-      workers.emplace_back([this, t] {
+// The stack callback remains live until the completion barrier.
+static std::barrier<> *phase = nullptr;
+static void *work;
+static void (*invoke)(void *, unsigned);
+static unsigned capacity, active;
+template <class F> void parallel(unsigned threads, F f) {
+  if (!phase) {
+    phase = new std::barrier<>(capacity = threads);
+    for (unsigned t = 1; t < threads; ++t)
+      std::thread([t] {
         for (;;) {
-          gate.arrive_and_wait();
-          job(t);
-          gate.arrive_and_wait();
+          phase->arrive_and_wait();
+          if (t < active)
+            invoke(work, t);
+          phase->arrive_and_wait();
         }
-      });
+      }).detach();
   }
-};
-// Main-thread phase executor; workers live until process exit. No scoped job
-// remains published after the completion barrier.
-static PhasePool *pool = nullptr;
-template <class F> static void parallel(unsigned threads, F &&f) {
-  if (!pool)
-    pool = new PhasePool(threads);
-  if (threads > pool->capacity)
+  if (threads > capacity)
     std::abort();
-  pool->job = [&](unsigned t) {
-    if (t < threads)
-      f(t);
-  };
-  pool->gate.arrive_and_wait();
-  pool->job(0);
-  pool->gate.arrive_and_wait();
-  pool->job = {};
+  active = threads;
+  work = &f;
+  invoke = [](void *p, unsigned t) { (*static_cast<F *>(p))(t); };
+  phase->arrive_and_wait();
+  f(0);
+  phase->arrive_and_wait();
 }
 
 // ---------------------------------------------------------------- parsing
@@ -333,10 +326,11 @@ std::pair<u32, u32> row(const Graph &raw, u32 u) {
                      (r[3] != NONE)};
 }
 
-// One worker's share of the search order: vertices in discovery order, the
-// end of each one's out-edges, and those edges with their raw heads.
+// One worker's raw IDs and degrees share order records; large counts remain
+// exact.
 struct alignas(64) Region {
-  u32 *order, *ends, *out, len = 0, edges = 0;
+  u32 *order, *out, len = 0, edges = 0;
+  std::vector<u32> large;
   Escapes esc; // keyed by position in out
 };
 
@@ -357,13 +351,13 @@ struct Grower {
   Region &reg;
   std::vector<Walk> walks;
 
-  // A global atomic claim gives each raw vertex exactly one region owner.
+  // An atomic claim gives each raw vertex exactly one owner.
   void claim(u32 z) {
     u64 bit = u64(1) << (z & 63), *word = &claimed[z >> 6];
     if (__atomic_load_n(word, __ATOMIC_RELAXED) & bit)
       return;
     if (!(__atomic_fetch_or(word, bit, __ATOMIC_RELAXED) & bit))
-      reg.order[reg.len++] = z;
+      reg.order[reg.len++] = z << raw.wbits;
   }
   void put(u32 pos, u32 z, u64 w) {
     if (w >= raw.mask)
@@ -373,14 +367,14 @@ struct Grower {
   // Advances a walk by one hop; returns false once its edge is final. A
   // branch ends the walk at a survivor; a dead end or a way back to the root
   // leaves a useless self-loop.
+  // Only bypassable vertices reach this path, so at most two raw edges exist.
   bool step(Walk &w) {
-    auto [i, end] = row(raw, w.at);
-    u32 ahead = 0, next = w.at, which = i;
-    for (; i < end; ++i) {
-      u32 h = raw.head(raw.adj[i]);
-      if (h != w.prev && h != w.at)
-        ++ahead, next = h, which = i;
-    }
+    u32 i = 4 * w.at, a = raw.adj[i], b = raw.adj[i + 1];
+    u32 x = raw.head(a), y = raw.head(b);
+    bool use_x = (a != NONE) & (x != w.prev) & (x != w.at);
+    bool use_y = (b != NONE) & (y != w.prev) & (y != w.at);
+    u32 ahead = unsigned(use_x) + unsigned(use_y);
+    u32 next = use_y ? y : x, which = i + unsigned(use_y);
     if (ahead > 1) {
       next = w.at;
     } else if (ahead == 0 || next == w.root) {
@@ -418,17 +412,25 @@ struct Grower {
     for (claim(z); lo < reg.len; lo = hi) {
       hi = std::min(reg.len, lo + BATCH);
       for (u32 h = hi; h < std::min(reg.len, hi + 2 * BATCH); ++h)
-        __builtin_prefetch(&raw.adj[4 * size_t(reg.order[h])]);
+        __builtin_prefetch(&raw.adj[4 * size_t(raw.head(reg.order[h]))]);
       size_t walking = 0;
-      for (u32 h = lo; h < hi; ++h)
-        expand(reg.order[h], walking), reg.ends[h] = reg.edges;
+      for (u32 h = lo; h < hi; ++h) {
+        u32 before = reg.edges;
+        expand(raw.head(reg.order[h]), walking);
+        u32 degree = reg.edges - before;
+        reg.order[h] |= std::min(degree, raw.mask);
+        if (degree >= raw.mask)
+          reg.large.push_back(degree);
+      }
       while (walking) {
         size_t kept = 0;
         for (size_t i = 0; i < walking; ++i)
           __builtin_prefetch(&raw.adj[4 * size_t(walks[i].at)]);
-        for (size_t i = 0; i < walking; ++i)
-          if (step(walks[i]))
-            walks[kept++] = walks[i];
+        for (size_t i = 0; i < walking; ++i) {
+          bool keep = step(walks[i]);
+          walks[kept] = walks[i];
+          kept += keep;
+        }
         walking = kept;
       }
     }
@@ -488,8 +490,7 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
   std::vector<Region> regions(threads);
   parallel(threads, [&](unsigned t) {
     Region &reg = regions[t];
-    reg.order = alloc<u32>(n), reg.ends = alloc<u32>(n),
-    reg.out = alloc<u32>(m);
+    reg.order = alloc<u32>(n), reg.out = alloc<u32>(m);
     Grower grower{*raw, bypass, claimed, reg};
     for (u32 x = cut(n, t, threads); x < cut(n, t + 1, threads); ++x)
       if (!test(bypass, x))
@@ -517,14 +518,27 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
         f(t, std::max(cuts[k], base[t]) - base[t],
           std::min(cuts[k + 1], base[t + 1]) - base[t]);
   };
-  // Unique raw vertices receive their final IDs before edges are renamed.
+  Graph *g = new Graph(total, edges[threads], spare + edges[threads], spare);
+  // Unique owners write the canonical raw-to-final ID map.
   parallel(threads, [&](unsigned k) {
     each(k, [&](unsigned t, u32 lo, u32 hi) {
-      for (u32 i = lo; i < hi; ++i)
-        __atomic_store_n(&where[regions[t].order[i]], base[t] + i,
-                         __ATOMIC_RELAXED);
+      for (u32 i = lo; i < hi; ++i) {
+        u32 packed = regions[t].order[i];
+        where[packed >> wbits] = base[t] + i;
+        g->off[base[t] + i] = packed & mask;
+      }
     });
   });
+  parallel(threads, [&](unsigned t) {
+    u32 pos = edges[t];
+    auto large = regions[t].large.begin();
+    for (u32 i = base[t]; i < base[t + 1]; ++i) {
+      u32 degree = g->off[i];
+      g->off[i] = pos;
+      pos += degree == mask ? *large++ : degree;
+    }
+  });
+  g->off[total] = edges[threads];
   // The pages of the regions' orders and edges become the reverse graph.
   Parts orders, outs;
   for (Region &reg : regions) {
@@ -532,19 +546,17 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
     orders.push_back({reg.order, reg.len * 4ul});
     outs.push_back({reg.out, reg.edges * 4ul});
   }
-  Graph *g = new Graph(total, edges[threads], spare + edges[threads], spare);
   Reverse rev(g->n, g->m, cuts, splice<u32>(orders, total + 1));
   std::vector<Escapes> escapes(threads);
   parallel(threads, [&](unsigned k) {
     std::fill(rev.r->off + cuts[k], rev.r->off + cuts[k + 1], 0);
     each(k, [&](unsigned t, u32 lo, u32 hi) {
       Region &reg = regions[t];
-      u32 pos = lo ? reg.ends[lo - 1] : 0, shift = edges[t];
+      u32 shift = edges[t], pos = g->off[base[t] + lo] - shift;
       auto esc = std::lower_bound(reg.esc.begin(), reg.esc.end(),
                                   std::pair(size_t(pos), u64(0)));
       for (u32 i = lo; i < hi; ++i) {
-        g->off[base[t] + i] = shift + pos;
-        for (; pos < reg.ends[i]; ++pos) {
+        for (u32 stop = g->off[base[t] + i + 1] - shift; pos < stop; ++pos) {
           __builtin_prefetch(
               &where[reg.out[std::min(pos + 24, reg.edges - 1)] >> wbits]);
           u32 e = reg.out[pos], w = e & mask, h = where[e >> wbits];
@@ -555,8 +567,6 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
       }
     });
   });
-  for (Region &reg : regions)
-    release(reg.ends, n);
   rev.r->adj = splice<u32>(outs, g->m);
   g->off[g->n] = edges[threads];
   g->merge(escapes);
@@ -602,7 +612,8 @@ struct Queue {
     u32 b = (d >> shift) % B;
     Bucket &k = bucket[b];
     if (k.size == k.cap)
-      k.data = (u32 *)realloc(k.data, (k.cap = std::max(16u, 2 * k.cap)) * 4);
+      k.data = (u32 *)realloc(k.data,
+                              (k.cap = std::max(16u, k.cap + k.cap / 2)) * 4);
     k.data[k.size] = v | u32(d & ((1u << shift) - 1)) << node_bits;
     k.size += take, near += take;
     occupied[b / 64] |= u64(take) << b % 64;
