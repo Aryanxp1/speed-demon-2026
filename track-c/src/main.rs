@@ -5,7 +5,6 @@ extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     fn prctl(option: i32, ...) -> i32;
-    fn _exit(status: i32) -> !;
 }
 
 const BIAS: i64 = 1 << 40;
@@ -135,9 +134,7 @@ impl Run {
                 line += at + 5;
             }
         }
-        if self.3.wait().is_leader() {
-            madvise(self.1.as_ptr() as *mut u8, self.1.len(), 4);
-        }
+        self.3.wait();
         prctl(41, 1usize, 0usize, 0usize, 0usize);
         let (input, len) = (self.0.as_ptr() as *mut u8, self.0.len());
         let mut stats = [[0i64; 8]; 256];
@@ -260,9 +257,7 @@ unsafe fn map(path: &str) -> &'static [u8] {
     let (fd, len) = (f.as_raw_fd(), f.metadata().unwrap().len() as usize);
     let size = len.next_multiple_of(4096) + 4096;
     let base = mmap(null_mut(), size, 1, 0x4022, -1, 0);
-    if len > 0 {
-        mmap(base, len, 1, 0x12, fd, 0);
-    }
+    mmap(base, len, 1, 0x12, fd, 0);
     slice::from_raw_parts(base, len)
 }
 
@@ -275,9 +270,11 @@ unsafe fn zeroed<T>() -> &'static T {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let reg = a.get(1).map_or("/data/regions.csv", |s| s);
-    let rec = a.get(2).map_or("/data/records.csv", |s| s);
-    let out = a.get(3).map_or("/out/aggregates.txt", |s| s);
+    let (reg, rec, out) = if a.len() > 3 {
+        (a[1].as_str(), a[2].as_str(), a[3].as_str())
+    } else {
+        ("/data/regions.csv", "/data/records.csv", "/out/aggregates.txt")
+    };
     let n = thread::available_parallelism().map_or(12, |n| n.get());
     COUNTRIES.lock().unwrap().push("_UNMATCHED".into());
     let run = unsafe { Run(map(rec), map(reg), zeroed(), Barrier::new(n)) };
@@ -286,7 +283,7 @@ fn main() {
     let totals = TOTALS.lock().unwrap();
     let mut keys: Vec<_> = COUNTRIES.lock().unwrap().iter().cloned().zip(0..).collect();
     keys.sort_unstable();
-    let mut out_str = String::with_capacity(32768);
+    let mut out_str = String::new();
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
         let row = &run.2 .1[group * 2048..][..2048];
@@ -299,5 +296,4 @@ fn main() {
         }
     }
     std::fs::write(out, out_str).unwrap();
-    unsafe { _exit(0) }
 }

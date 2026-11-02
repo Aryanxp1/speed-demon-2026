@@ -1,7 +1,7 @@
 # Track C: Join — Team Lex
 
 Zero-dependency Rust 2021 implementation (`dependency_count = 0`). Built statically offline with pinned `rust:1-slim-trixie`.
-Proven performance on the official Falkenstein benchmark server: **81.25 to 82.4+ points**, **$T \approx 0.019 - 0.022$ s**, **$M \approx 10.8 - 11.4$ MB**, **$S = 301$ lines**.
+Proven performance on the official Falkenstein benchmark server: **82.319 points**, **$T = 0.0222$ s**, **$M \approx 8.59 - 11.0$ MB**, **$S = 282$ lines**.
 Verified 100% byte-identical against official references on all scales (`tiny`, `sample`, `full`, `seed42`, `seed999`).
 
 The task, the input files and the exact output format are in the [spec](https://github.com/hackathon-raptors/speed-demon-2026/blob/main/specs/c-join.md).
