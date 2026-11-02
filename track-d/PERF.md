@@ -461,3 +461,14 @@ The combined optimized PGO binary, ASan+UBSan and TSan pass all public scales at
 
 
 Official alias-analysis trial5037e29, run-ff7f4f6bca31: all gates passed, T0.097293 s, M56,422,400 bytes, S684, K31.357260,74.816905 points. It loses to76.486585 / K33.863489. Restoring exact4b37425 source and Dockerfile; balanced aliases/bitmap/PTA changes are not retained. Actual packaged local comparison had only0.6% lower medians on both full inputs(58.805/58.431 ms and60.173/59.809 ms), and did not predict the scoring-box loss. Further build-only comparisons use the proven source.
+
+
+### Restored-source receipt and evaluation-matched training affinity
+
+Exact4b37425 source/build restored under4588426, run-f0ffbfc40e9a: all five gates passed; T=0.083196 s, M=56,451,072 bytes, S=684, D=1, K=33.906546, **76.514177 points**. This same-source sample improves the retained record by0.027592 points. It is not attributed to a new algorithm. Last verified leading score76.681057 / K34.168125 leaves0.166880 points.
+
+Build-only alternatives on the proven source,31 randomized rounds per full input with exact outputs: seed1 native-PGO62.958 ms, generic/no-PGO70.458, native/no-PGO66.676, generic-PGO65.631, native-O2-PGO64.847, no-unroll/no-peel63.547; seed17 corresponding63.995/73.497/68.386/67.768/64.661/64.073. No compiler simplification establishes a gain, so original flags are retained.
+
+New build-only trial pins the training executable to CPUs0..11, matching the grading cpuset rather than allowing training to roam across all20 logical CPUs. The source, seed17 generator, thread count, compiler flags and runtime image remain unchanged. A shell fallback executes normal training if the build worker lacks taskset or the requested CPUs; it adds no runtime dependency. Debian's util-linux file list confirms taskset is a standard tool: https://packages.debian.org/trixie/amd64/util-linux/filelist . No local pinned-container replay is claimed because the Docker daemon remains stopped.
+
+Local31-round two-seed medians: normal67.728/65.731 ms; pinned once67.518/66.495; pinned three times68.270/65.841. This does not establish a local runtime improvement. Five median RssAnon samples52,244/52,348/52,184 KiB; page-table medians3,004/3,000/3,004 KiB. The purpose is an official comparison of hardware-matched training, not an asserted local speedup. Select one pinned training pass to preserve the existing build cost. Native static PGO packaging uses the unchanged source byte-for-byte and unchanged compile flags, with pinned training. Stored tiny/sample/full and70 independent oracle fixtures pass at1/4/12 workers; prior full sanitizer validation applies to identical source. Official gates and score pending.

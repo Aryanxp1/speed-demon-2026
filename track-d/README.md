@@ -1,6 +1,6 @@
 # Team Lex: Track D
 
-Official best: **76.486585 points / K=33.863489**, run `run-b8a48823a5d3`, commit `4b37425`. T=0.083369 s, M=56,516,608 bytes, S=684, D=1. All five official gates passed.
+Official best: **76.514177 points / K=33.906546**, run `run-f0ffbfc40e9a`, scored commit `4588426`. T=0.083196 s, M=56,451,072 bytes, S=684, D=1. All five official gates passed. Source and compiler settings match `4b37425`; the small later gain is a same-source measurement.
 
 The complete 147-team board generated at 2026-11-02 10:25:36 UTC ranks Lex **third** in Track D. The leader has 76.681057 points / K=34.168125. This improves the earlier fifth place and exceeds the supplied project's reported 75.839.
 
@@ -14,4 +14,4 @@ Native PGO, ASan/UBSan and TSan pass public inputs, independent oracle cases, sa
 
 The combined in-place bitmap / per-region offset trial passed gates but scored74.852264, so the exact4b37425 source is restored. Equal-slice mapping remains.
 
-The alias-analysis trial passed all gates but scored74.816905. Exact4b37425 source/build are restored while build-only alternatives are compared.
+The alias-analysis trial passed all gates but scored74.816905. The current source is exactly4b37425. A build-only trial pins offline PGO training to CPUs0..11, matching evaluation, with a fallback for build workers that lack those CPUs. Static packaging and independent oracle checks pass; official scoring is pending.
