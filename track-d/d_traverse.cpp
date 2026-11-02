@@ -182,7 +182,7 @@ struct __attribute__((packed)) Entry {
 // released together once its rows are built, and the bins shrink while the
 // graph grows. Each worker owns `cap` entries (whole pages) of each group.
 struct alignas(64) Bins {
-  static constexpr u32 CHUNK = 256, GROUP = 16;
+  static constexpr u32 CHUNK = 256, GROUP = 128;
   u32 bits, shift, buckets, cap;
   Entry *pool;
   std::vector<u32> fill, used;
@@ -227,7 +227,9 @@ Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
   size_t most = 0; // edges any one worker may receive
   for (unsigned t = 0; t < threads; ++t)
     most = std::max<size_t>(most, (line(t + 1) - line(t)) / 6);
-  u32 cap = (most / 2048 + 9) * 2048;
+  // Bound edges plus one partial chunk per bucket, then round to 2048
+  // records (three 4 KiB pages) so whole groups can be unmapped safely.
+  u32 cap = (most + Bins::GROUP * Bins::CHUNK + 2047) / 2048 * 2048;
   std::vector<Bins> bins;
   for (unsigned t = 0; t < threads; ++t)
     bins.emplace_back(n, cap, t, threads);
