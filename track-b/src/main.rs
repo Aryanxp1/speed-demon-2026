@@ -13,9 +13,9 @@ extern "C" {
 const ANONYMOUS: i32 = 0x4022;
 
 const HUGE_PAGE: usize = 1 << 21;
-const CLAIM: usize = 1 << 18;
+const CLAIM: usize = 1 << 20;
 
-const PHASE_CLAIMS: usize = 200;
+const PHASE_CLAIMS: usize = 50;
 
 const HEADER: usize = 1;
 
@@ -82,7 +82,7 @@ struct Buffers {
     actions: &'static mut [u32],
     list_actions: &'static mut [u32],
     list_ends: &'static mut [u32],
-    counts: &'static mut [u32],
+    counts: &'static [AtomicU32],
 }
 
 struct Term {
@@ -210,12 +210,14 @@ struct Run {
     bucket_shift: u32,
     max_terms: usize,
     phase_claims: usize,
+    claim_bytes: usize,
     terms: *mut Term,
     term_count: AtomicUsize,
     queries: &'static [u8],
     shares: Vec<OnceLock<Parsed>>,
     phrases: *mut Phrase,
     sample: &'static [AtomicU32],
+    counts: &'static [AtomicU32],
 
     setup: [AtomicUsize; 6],
 
@@ -350,8 +352,18 @@ impl Run {
     }
 
     unsafe fn index_claim<const SAMPLE: bool>(&self, claim: usize, b: &mut Buffers) -> usize {
-        let (start, mut doc) = aligned_line(self.text, self.docs, claim * CLAIM);
-        let end = aligned_line(self.text, self.docs, claim * CLAIM + CLAIM).0;
+        let (start, mut doc) = aligned_line(self.text, self.docs, claim * self.claim_bytes);
+        let end = aligned_line(
+            self.text,
+            self.docs,
+            claim * self.claim_bytes
+                + if SAMPLE {
+                    self.claim_bytes.min(1 << 18)
+                } else {
+                    self.claim_bytes
+                },
+        )
+        .0;
         if start >= end {
             return 0;
         }
@@ -543,7 +555,8 @@ impl Run {
             let mut emit = |hit: u64| {
                 let term = ((hit >> 32) as u32 & !ANCHOR) - 1;
                 if SAMPLE {
-                    b.counts[term as usize] += 1;
+                    let count = &b.counts[term as usize];
+                    count.store(count.load(Relaxed) + 1, Relaxed);
                     return;
                 }
                 let shard = term as usize & (SHARDS - 1);
@@ -860,7 +873,7 @@ impl Run {
             actions: take(&mut next, tokens),
             list_actions: take(&mut next, tokens),
             list_ends: take(&mut next, BATCH / 2 + 64),
-            counts: take(&mut next, self.max_terms),
+            counts: &self.counts[id * self.max_terms..(id + 1) * self.max_terms],
         };
         assert!(next.offset_from(self.workspace.add(id * WORKSPACE)) as usize <= WORKSPACE);
         self.shares[id].set(self.parse_share(id)).ok();
@@ -869,13 +882,18 @@ impl Run {
         self.each_job(&self.setup[0], 12, |claim| {
             self.setup[4].fetch_add(self.index_claim::<true>(claim, &mut buffers), Relaxed);
         });
-        let terms = self.term_count.load(Relaxed);
-        for (total, &part) in self.sample.iter().zip(&buffers.counts[..terms]) {
-            total.fetch_add(part, Relaxed);
-        }
-
-        discard(buffers.counts.as_ptr().cast(), self.max_terms * 4);
         self.barrier();
+        let (terms, threads) = (self.term_count.load(Relaxed), self.shares.len());
+        for term in terms * id / threads..terms * (id + 1) / threads {
+            let total = (0..threads)
+                .map(|worker| self.counts[worker * self.max_terms + term].load(Relaxed))
+                .sum();
+            self.sample[term].store(total, Relaxed);
+        }
+        self.barrier();
+        if id == 0 {
+            discard(self.counts.as_ptr().cast(), threads * self.max_terms * 4);
+        }
         self.each_job(&self.setup[1], JOBS, |slice| self.plan_phrases(slice));
         self.barrier();
         self.each_job(&self.setup[2], JOBS, |part| self.plan_buckets(part));
@@ -1145,17 +1163,21 @@ fn main() {
         let docs = last_line.map_or(0, |line| id_of(line.as_ptr()) + 1);
         assert!(docs < 1 << DOC_BITS);
 
-        let mut phase_claims = PHASE_CLAIMS;
+        let (mut phase_claims, mut claim_bytes) = (PHASE_CLAIMS, CLAIM);
         let phase_base: Vec<u32> = loop {
-            let phases = text.len().div_ceil(phase_claims * CLAIM).max(1);
+            let phases = text.len().div_ceil(phase_claims * claim_bytes).max(1);
             let base: Vec<u32> = (0..=phases)
-                .map(|p| aligned_line(text, docs, p * phase_claims * CLAIM).1 as u32)
+                .map(|p| aligned_line(text, docs, p * phase_claims * claim_bytes).1 as u32)
                 .collect();
             if base.windows(2).all(|w| w[1] - w[0] < u16::MAX as u32) {
                 break base;
             }
-            assert!(phase_claims > 1);
-            phase_claims = phase_claims.div_ceil(2);
+            if phase_claims > 1 {
+                phase_claims = phase_claims.div_ceil(2);
+            } else {
+                assert!(claim_bytes > 4096);
+                claim_bytes /= 2;
+            }
         };
         let phases = phase_base.len() - 1;
         let widest = phase_base.windows(2).fold(0, |m, w| m.max(w[1] - w[0]));
@@ -1172,12 +1194,14 @@ fn main() {
             bucket_shift: 64 - bucket_count.ilog2(),
             max_terms,
             phase_claims,
+            claim_bytes,
             terms: reserve(max_terms, true),
             term_count: AtomicUsize::new(0),
             queries,
             shares: (0..threads).map(|_| OnceLock::new()).collect(),
             phrases: reserve(max_terms, false),
             sample: space(max_terms),
+            counts: space(threads * max_terms),
             setup: [0; 6].map(AtomicUsize::new),
             phase: (0..phases).map(|_| Default::default()).collect(),
             phase_base,

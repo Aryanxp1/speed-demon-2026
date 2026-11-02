@@ -1,15 +1,13 @@
 # Track B: Index — Team Lex
 
-Standing verified best: **78.471404 points, K=37.104627**, run `run-489677098d0a`, using the unchanged 1a718ef implementation. Early exit's first official sample scored 78.471095, K=37.104100; a second unchanged-source sample is pending. No 79+ result is claimed. Detailed evidence is in PERF.md.
+Verified standing best: **78.599644 points, K=37.324403**, run `run-0815c7a9fffa`, using the early-exit implementation. The new balanced-sampling candidate awaits official measurement; 79+ is not yet verified. See PERF.md for evidence and source provenance.
 
-Rust 2021, standard library only. The engine reads queries first and scans the corpus in phases, using sparse postings or transposed 64-document bitmaps. A cache-line bucket contains seven hash tags and eight actions. Phrases compare neighboring token hashes around their rarest word. Boolean operators remain strictly left to right.
+Rust 2021, standard library only. Queries are parsed first; the corpus is scanned in phases using sparse postings and transposed 64-document bitmaps. Eight-token AVX2 action compaction preserves per-document boundaries. Boolean operators evaluate left to right, and phrases anchor on their rarest word.
 
-The retained adaptation borrows the supplied trackalternate engine's eight-token AVX2 compaction idea. Per-worker action arrays, masked stable lane permutations and per-document boundaries replace scalar stores for every token. Phrase anchors are extracted from vector masks. The existing stored bucket shift, dynamic dictionary sizing, density-safe phase sizing, atomic publication and checked mappings are preserved.
+The candidate uses 1 MiB claims, twelve spread-out quarter-MiB sample jobs, and a term-owned reduction over contiguous atomic counters. Document-density checks shrink phases and claims as needed to preserve u16 offsets. Dynamic dictionary bounds, checked mappings, atomic publication and wrapping prefetch remain. The source combines the existing Rust engine with measured ideas from user-supplied versions; PERF.md records the adaptations.
 
-Matching retains the previously authorized probabilistic fingerprints: rare collisions can confuse distinct words. Full-word collision verification is absent, so universal exact matching is not claimed.
+Matching uses the previously authorized probabilistic hash fingerprints. Rare collisions can confuse distinct words; universal exact matching is not claimed.
 
-The pinned offline O3/fat-LTO build links statically with x86-64-v3, AES and VAES support and uses zero external crates. Workers are capped at twelve. Use `--data` and `--out`, or `DATA_DIR`/`OUT_DIR`; `SD_DATA` and `SD_OUT` are also supported. Defaults are `/data` and `/out`.
+The unchanged pinned offline O3/fat-LTO build links statically with x86-64-v3, AES and VAES and zero external crates. Workers are capped at twelve. Use `--data` and `--out`, `DATA_DIR`/`OUT_DIR`, or `SD_DATA`/`SD_OUT`; defaults are `/data` and `/out`.
 
-The actual release executable passes all 26 reference datasets at 1/4/12 CPU affinities. AddressSanitizer passes all 26 at 1/12 affinities, including a dedicated SIMD-tail and document-boundary reference case. Full output SHA-256 remains `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`. Candidate canonical count is 1114 Rust plus nine Dockerfile lines. PERF.md records provenance, tests, timing and official evidence. Only Track B is changed by this pass.
-
-Official measurements: T=0.094077 s, M=42,975,232 bytes, S=1122, D=1, K=36.716871, **78.243283 points**.
+The actual Cargo executable passes all 27 reference datasets at 1/4/12 CPU affinities and all 27 with AddressSanitizer at 1/12 affinities, including SIMD tails and the 250,000-document density fallback. Full output SHA-256: `f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927`. Candidate canonical source: 1139 Rust plus nine Dockerfile lines. All official candidate metrics remain pending.
