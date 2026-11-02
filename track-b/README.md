@@ -1,6 +1,6 @@
 # Track B: Index — Team Lex
 
-Verified standing best: **78.599644 points, K=37.324403**, run `run-0815c7a9fffa`, using the early-exit implementation. The new balanced-sampling candidate awaits official measurement; 79+ is not yet verified. See PERF.md for evidence and source provenance.
+Verified standing best: **78.599644 points, K=37.324403**, run `run-0815c7a9fffa`, using the early-exit implementation. The balanced-sampling candidate passed all official gates but scored 77.815883 in its first sample; an unchanged-source repeat is pending. 79+ is not yet verified. See PERF.md for evidence and source provenance.
 
 Rust 2021, standard library only. Queries are parsed first; the corpus is scanned in phases using sparse postings and transposed 64-document bitmaps. Eight-token AVX2 action compaction preserves per-document boundaries. Boolean operators evaluate left to right, and phrases anchor on their rarest word.
 
