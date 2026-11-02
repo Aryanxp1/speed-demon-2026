@@ -1,6 +1,6 @@
 # Team Lex: Track D
 
-Official best: **76.311963 points / K=33.592263**, run `run-22eacd56e441`, commit `443a0ac`. T=0.084272 s, M=56,107,008 bytes, S=703, D=1. All five official gates passed.
+Official best: **76.486585 points / K=33.863489**, run `run-b8a48823a5d3`, commit `4b37425`. T=0.083369 s, M=56,516,608 bytes, S=684, D=1. All five official gates passed.
 
 The complete 147-team board generated at 2026-11-02 10:25:36 UTC ranks Lex **third** in Track D. The leader has 76.681057 points / K=34.168125. This improves the earlier fifth place and exceeds the supplied project's reported 75.839.
 
@@ -12,4 +12,4 @@ The pinned offline GCC15 build uses native twelve-worker seed-17 PGO. Environmen
 
 Native PGO, ASan/UBSan and TSan pass public inputs, independent oracle cases, saturation/u32/u64 boundaries and concurrency stress. PERF.md records provenance, complete results, rejected experiments and the remaining gap to the leader. Earlier implementations and all submitted trials remain in Git history.
 
-The pending direct SWAR scanner removes the AVX2 separator state machine while preserving exact parsing. It passes the full native/ASan/UBSan/TSan suite and improves both full-input local medians. The official best above remains authoritative until this trial is scored.
+The pending follow-up reuses query-endpoint bits as bypass flags and writes the canonical ID map and final offsets in one pass per region. It passes full native/ASan/UBSan/TSan validation, high-degree sentinel tests, and final static PGO packaging. The official best above remains authoritative until this trial is scored.
