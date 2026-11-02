@@ -1,11 +1,13 @@
-// Track D: fused construction adapted from the user-supplied td solver for Team
-// Lex. Unique claims, checked mappings and exact saturated-label fallback are
-// retained.
+// Track D: fused construction and saturating queries adapted from the
+// user-supplied td solver. Team Lex retains unique claims, checked mappings,
+// AVX2 and a persistent phase pool.
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <immintrin.h>
 #include <numeric>
 #include <queue>
@@ -59,27 +61,51 @@ template <class T> T *splice(const Parts &parts, size_t n) {
   return (T *)p;
 }
 
-template <class F> void parallel(unsigned threads, F f) {
-  std::vector<std::thread> pool;
-  for (unsigned t = 1; t < threads; ++t)
-    pool.emplace_back(f, t);
-  f(0);
-  for (auto &t : pool)
-    t.join();
+struct PhasePool {
+  unsigned capacity;
+  std::barrier<> gate;
+  std::function<void(unsigned)> job;
+  std::vector<std::thread> workers;
+  explicit PhasePool(unsigned n) : capacity(n), gate(n) {
+    for (unsigned t = 1; t < n; ++t)
+      workers.emplace_back([this, t] {
+        for (;;) {
+          gate.arrive_and_wait();
+          job(t);
+          gate.arrive_and_wait();
+        }
+      });
+  }
+};
+// Main-thread phase executor; workers live until process exit. No scoped job
+// remains published after the completion barrier.
+static PhasePool *pool = nullptr;
+template <class F> static void parallel(unsigned threads, F &&f) {
+  if (!pool)
+    pool = new PhasePool(threads);
+  if (threads > pool->capacity)
+    std::abort();
+  pool->job = [&](unsigned t) {
+    if (t < threads)
+      f(t);
+  };
+  pool->gate.arrive_and_wait();
+  pool->job(0);
+  pool->gate.arrive_and_wait();
+  pool->job = {};
 }
 
 // ---------------------------------------------------------------- parsing
 
 // Bit i is set when p[i] is a separator (space or LF), the only bytes below
 // '0' in the input.
-u64 separators(const char *p) {
-  u64 m = 0;
-  for (int k = 0; k < 64; k += 16) {
-    __m128i x = _mm_loadu_si128(reinterpret_cast<const __m128i *>(p + k));
-    u32 bits = _mm_movemask_epi8(_mm_cmplt_epi8(x, _mm_set1_epi8('0')));
-    m |= u64(bits) << k;
-  }
-  return m;
+static u64 separators(const char *p) {
+  auto half = [](const char *q) {
+    auto x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q));
+    return u32(
+        _mm256_movemask_epi8(_mm256_cmpgt_epi8(_mm256_set1_epi8('0'), x)));
+  };
+  return half(p) | (u64(half(p + 32)) << 32);
 }
 
 // Value of the digits [a, b). Up to eight digits are converted at once from
@@ -331,7 +357,7 @@ struct Grower {
   Region &reg;
   std::vector<Walk> walks;
 
-  // Each raw vertex is assigned to exactly one region by an atomic claim.
+  // A global atomic claim gives each raw vertex exactly one region owner.
   void claim(u32 z) {
     u64 bit = u64(1) << (z & 63), *word = &claimed[z >> 6];
     if (__atomic_load_n(word, __ATOMIC_RELAXED) & bit)
@@ -491,7 +517,7 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
         f(t, std::max(cuts[k], base[t]) - base[t],
           std::min(cuts[k + 1], base[t + 1]) - base[t]);
   };
-  // Unique vertex owners write canonical raw-to-final IDs.
+  // Unique raw vertices receive their final IDs before edges are renamed.
   parallel(threads, [&](unsigned k) {
     each(k, [&](unsigned t, u32 lo, u32 hi) {
       for (u32 i = lo; i < hi; ++i)
@@ -550,18 +576,16 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
 // push always writes the entry but counts it only when `take`, so relaxations
 // need no branch.
 struct Queue {
-  static constexpr u32 B = 2048;
+  static constexpr u32 B = 64;
   struct Bucket {
     u32 *data = nullptr, size = 0, cap = 0;
   } bucket[B];
   u64 occupied[B / 64] = {}, cur = 0, near = 0;
-  // The input vertex bound leaves seven bits for the key remainder.
-  static constexpr u32 shift = 7, node_bits = 25;
+  u32 shift, node_bits;
   using Far = std::pair<u64, u32>;
   std::priority_queue<Far, std::vector<Far>, std::greater<Far>> far;
-  explicit Queue(u32 n) {
-    if (n > (1u << node_bits))
-      std::exit(2);
+  explicit Queue(u32 n) : shift(std::min(5u, 32 - id_bits(n))) {
+    node_bits = 32 - shift;
   }
   void clear() {
     for (u32 w = 0; w < B / 64; occupied[w++] = 0)
