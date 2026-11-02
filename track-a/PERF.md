@@ -1,5 +1,7 @@
 # Track A: performance log
 
+Latest observed leaderboard best (November 2, 2026 screenshot): **86.225 points, K=53.027431**, scored commit `2ae1a6c`, Rust, T=0.018 s, M=16 MB, S=406. Points, time and memory are rounded as displayed; the screenshot does not show a run ID or unrounded measurements. Source/build are unchanged from the verified `421ac2a` implementation. This supersedes the earlier 86.101357-point best; historical measurements below are preserved.
+
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |
@@ -324,3 +326,7 @@ Canonical source is 397 nonblank Rust plus the unchanged nine Dockerfile lines, 
 Retention decision: keep the exact 421ac2a Rust source and all three unchanged pinned build blobs. Versus the previous standing best 85.847678 / K=52.113899, the measured improvement is **+0.253679 points / +0.612381 K**. Source falls from S=426 to 406. This sample's memory is higher than the old best, while time is lower; the combined official axes improve K. Native sampling varies, so the entire improvement is not attributed solely to the parser. The earlier 85.719189 and 85.415870 samples remain documented and are not presented as wins.
 
 The selected implementation keeps Team Lex's corrected hash/length behavior, active-hour leases, exclusive sealing and full arbitrary-order fallback, with the supplied SIMD decoding, common-number formatting and fixed-interface ideas adapted into that base. No whole-file source replacement or cosmetic provenance concealment was used. The exact actual Cargo source passes all 18 references at 1/4/12 affinities; ASAN passes the same 18 at 1/12 with only main's fixture paths substituted. All full outputs remain byte-identical. The only interface change is the documented frozen /data/requests.log and /out/summary.txt contract. Same-length fingerprint collisions remain the existing known limitation. Only Track A paths were edited; other-track work is preserved.
+
+### November 2 leaderboard update
+
+The user-supplied leaderboard screenshot records a newer best at `2ae1a6c`: **86.225 points, K=53.027431**, T=0.018 s, M=16 MB, S=406, Rust. Git comparison confirms that Track A's source, manifest and Dockerfile are byte-identical to `421ac2a`. This is another measurement of the retained fixed-interface SIMD implementation, not a new code change. The screenshot's rounded points/time/memory replace no historical raw measurements; its run ID and unrounded values are unavailable. No new benchmark or gate result is claimed by this documentation update.

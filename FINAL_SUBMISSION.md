@@ -2,14 +2,14 @@
 
 Repository: [Aryanxp1/speed-demon-2026](https://github.com/Aryanxp1/speed-demon-2026). Submission branch: `speed-demon`.
 
-This document records the official public full-dataset, seed-1 bests checked on **2 November 2026, approximately 20:26 IST**, against repository snapshot `2ae1a6c`. These are observed leaderboard results, not predictions for the private final evaluation. Individual runs can vary.
+This document records the official public full-dataset, seed-1 bests from the latest supplied **2 November 2026** leaderboard screenshot, including Track B's newer result at `534e399`. These are observed leaderboard results, not predictions for the private final evaluation. Individual runs can vary.
 
 ## Official results
 
-**Overall: 82.596 points**, the geometric mean of A, C and B. Track D is the fourth, non-counting track in this snapshot. The supplied leaderboard screenshot shows rank 11; rank is a time-specific observation.
+**Overall: 82.597 points**, the geometric mean of A, C and B, as shown in the latest supplied leaderboard screenshot on 2 November 2026. Track D is the fourth, non-counting track in this snapshot.
 
 - **Track A: 86.225029 points**, K=53.027431; T=0.018219 s; M=15,970,304 bytes; S=406; D=1. Best evaluated commit [`2ae1a6c`](https://github.com/Aryanxp1/speed-demon-2026/commit/2ae1a6c0b2bc3f11cafd9478982dacde0e218656); run `run-c3755766ac89`.
-- **Track B: 79.068682 points**, K=38.139382; T=0.086593 s; M=41,431,040 bytes; S=1148; D=1. Best evaluated commit [`421ac2a`](https://github.com/Aryanxp1/speed-demon-2026/commit/421ac2ace999e79ec2488cc7f13a63aa462b5181); run `run-b178a753c826`.
+- **Track B: 79.073 points**, K=38.146211; T=0.087 s; M=42 MB; S=1148. Best evaluated commit [`534e399`](https://github.com/Aryanxp1/speed-demon-2026/commit/534e399). These are the latest screenshot's displayed values; its run ID and unrounded points/time/memory are not shown.
 - **Track C: 82.648215 points**, K=44.974289; T=0.022840 s; M=8,830,976 bytes; S=323; D=1. Best evaluated commit [`2ae1a6c`](https://github.com/Aryanxp1/speed-demon-2026/commit/2ae1a6c0b2bc3f11cafd9478982dacde0e218656); run `run-d42f3999e566`.
 - **Track D: 76.514177 points**, K=33.906546; T=0.083196 s; M=56,451,072 bytes; S=684; D=1. Best evaluated commit [`4588426`](https://github.com/Aryanxp1/speed-demon-2026/commit/45884261ae64e2c6184b534212cb466d730db336); run `run-f0ffbfc40e9a`.
 

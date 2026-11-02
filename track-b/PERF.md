@@ -1,5 +1,7 @@
 # Track B: performance log
 
+Latest observed leaderboard best (latest November 2, 2026 screenshot): **79.073 points, K=38.146211**, scored commit `534e399`, Rust, T=0.087 s, M=42 MB, S=1148. Points, time and memory are displayed rounded values; no run ID or unrounded measurements are shown. This supersedes the previous 79.068682-point / K=38.139382 record at `421ac2a`. Historical measurements below are preserved.
+
 Every step from the reference to your final version, each with the live-board run ID that measured it. Judges check that the run IDs exist and that each change moved the way you say it did.
 
 | Step | Change | Run ID | T (s) | M (MB) | Points |

@@ -1,6 +1,6 @@
 # Team Lex: Track D
 
-Official best: **76.514177 points / K=33.906546**, run `run-f0ffbfc40e9a`, scored commit `4588426`. T=0.083196 s, M=56,451,072 bytes, S=684, D=1. All five official gates passed. Its source/build match `4b37425`; the later small gain is a same-source measurement.
+Latest leaderboard score: **76.514 points / K=33.906546**, scored commit `4588426`; T=0.083 s, M=56 MB, S=684. The latest 2 November 2026 screenshot marks D dropped/weakest. The underlying recorded best is **76.514177 points**, run `run-f0ffbfc40e9a`; T=0.083196 s, M=56,451,072 bytes, D=1. All five official gates passed. Its source/build match `4b37425`; the later small gain is a same-source measurement.
 
 The complete 148-team board generated 2026-11-02 12:19:35 UTC ranks Lex **third** in Track D. The leader has 76.681057 points / K=34.168125, leaving 0.166880 points. This improves the earlier fifth place and exceeds the supplied project's reported 75.839.
 

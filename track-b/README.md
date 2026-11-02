@@ -1,6 +1,6 @@
 # Track B: Index — Team Lex
 
-Retained verified best: **79.068682 points, K=38.139382**, run `run-b178a753c826`, evaluated at `421ac2a`. All gates passed: T=0.086593 s, M=41,431,040 bytes, S=1148, D=1. The source and all build metadata are restored byte-for-byte to that winner. The final-minute SLVS trial passed correctness but scored 78.653855, so all three changes were reverted.
+Latest leaderboard score: **79.073 points, K=38.146211**, scored commit `534e399`; T=0.087 s, M=42 MB, S=1148. These are the displayed values in the latest 2 November 2026 screenshot; the run ID and unrounded measurements are not shown. The final-minute SLVS trial passed correctness but scored 78.653855, so all three changes were reverted.
 
 Rust 2021, standard library only. The existing phased index uses eight-token AVX2 action compaction, sparse postings and transposed bitmaps. Balanced quarter-MiB sampling across twelve 1 MiB claims uses contiguous atomic counters and term-owned reduction. Density-dependent phases and smaller claims preserve u16 offsets. Boolean operators evaluate left to right and phrases anchor on their rarest word. Dynamic dictionary sizing, atomic publication, checked mappings and wrapping prefetch remain.
 

@@ -4,7 +4,7 @@ Final submission branch: **`speed-demon`**. Rust 2021 for A/B/C; C++20 for D. Al
 
 Read **[FINAL_SUBMISSION.md](FINAL_SUBMISSION.md)** for the official results, exact best commits, implementation summaries, input/output paths, build commands, validation and known limitations.
 
-Official bests checked on 2 November 2026: **A 86.225**, **B 79.069**, **C 82.648**, **D 76.514**. Overall best-three geometric mean: **82.596**. These public leaderboard observations are not a prediction of private final scoring.
+Final scores shown in the latest 2 November 2026 leaderboard screenshot: **A 86.225**, **B 79.073**, **C 82.648**, **D 76.514**. Overall best-three geometric mean: **82.597**. These public leaderboard observations are not a prediction of private final scoring.
 
 - [Track A — Ingest](track-a/README.md) · [history](track-a/PERF.md)
 - [Track B — Index](track-b/README.md) · [history](track-b/PERF.md)

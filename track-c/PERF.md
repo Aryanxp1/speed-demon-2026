@@ -1,6 +1,8 @@
 # Track C: performance log
 
-**Final: T 22.3 ms, M 11.4 MB, 81.10 points on run-3310cc70197e (S 401 there). The last line cut (S 380 by default rustfmt, step 23, hot loops unchanged) read 81.25 on the board, but its run ID was not recorded.** From the first Rust version: 51.4 ms to 22.3, 13.2 MB to 11.4, 70.62 to 81.10 points.
+Latest observed leaderboard best (November 2, 2026 screenshot): **82.648 points, K=44.974289**, scored commit `2ae1a6c`, Rust, T=0.023 s, M=9 MB, S=323. Points, time and memory are rounded as displayed; the screenshot does not show a run ID or unrounded measurements. Source/build match the isolated SIMD region-clamp candidate at `f5940f2`. This supersedes the earlier 82.458848-point best; historical measurements below are preserved.
+
+Earlier milestone: T 22.3 ms, M 11.4 MB, 81.10 points on run-3310cc70197e (S 401 there). The subsequent line cut (S 380 by default rustfmt, step 23, hot loops unchanged) read 81.25 on the board, but its run ID was not recorded. From the first Rust version to that milestone: 51.4 ms to 22.3, 13.2 MB to 11.4, 70.62 to 81.10 points.
 
 Key ideas, in order of what they were worth:
 
@@ -104,4 +106,8 @@ Use this layout and its original parallel table setup as the base. Adapt only th
 
 Actual offline Cargo release builds with warnings denied. All 12 independent reference datasets pass at 1/4/12 CPU affinities; ASAN passes all 12 at 1/12. Every full-data hash matches the reference, including all timed runs. Thirty-one alternating pairs versus the original 326-line-axis baseline measured wall medians 19.854 / 18.938 ms, CPU 170.055 / 165.689 ms, median paired wall gain +3.448%. A direct thirty-one-pair comparison to the new winning uniform layout measured 18.194 / 17.886 ms, CPU 154.937 / 152.298 ms, paired gain +1.769%. These are local observations, not official scores.
 
-Canonical source is 316 nonblank Rust plus seven Dockerfile lines, predicting S=323, versus rollback S=319 and original S=326. Source SHA-256: 40f8638d654e4ff2ff169328cdd365a63fb4feb0c04ab991cfb5337bb3b8317d. Build flags, manifests and pinned Dockerfile are byte-identical to the winning build. Isolated SIMD clamp official result: pending. Only C paths change. Retain the best evaluated C source after the result, preserving A/B/D work.
+Canonical source is 316 nonblank Rust plus seven Dockerfile lines, predicting S=323, versus rollback S=319 and original S=326. Source SHA-256: 40f8638d654e4ff2ff169328cdd365a63fb4feb0c04ab991cfb5337bb3b8317d. Build flags, manifests and pinned Dockerfile are byte-identical to the winning build. The isolated SIMD clamp's subsequent leaderboard result is recorded below. Only C paths change. Retain the best evaluated C source after the result, preserving A/B/D work.
+
+### November 2 SIMD-clamp leaderboard result
+
+The user-supplied leaderboard screenshot records **82.648 points, K=44.974289** at `2ae1a6c`, T=0.023 s, M=9 MB, S=323, Rust. Git comparison confirms that all Track C source/build blobs match `f5940f2`, the isolated SIMD region-clamp candidate described above. This exceeds the prior 82.458848 / K=44.583786 best and identifies the SIMD-clamp version as the latest observed winning implementation. Points/time/memory are rounded display values; the screenshot supplies neither a run ID nor unrounded measurements or gate details. The existing reference/ASAN evidence applies to the identical source; no new local tests or benchmarks were run for this documentation update.

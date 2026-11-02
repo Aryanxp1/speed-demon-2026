@@ -1,6 +1,6 @@
 # Track A: Ingest — Team Lex
 
-Verified official best: **86.101357 points, K=52.726280**, run `run-9e16dea2adc9`, source `421ac2a`. All gates passed: T=0.018202 s, M=16,470,016 bytes, S=406, D=1. The exact evaluated source and pinned build are retained. This exceeds the previous 85.847678-point best and meets the 86+ target. PERF.md records provenance, rejected trials and results.
+Latest leaderboard score: **86.225 points, K=53.027431**, scored commit `2ae1a6c`; T=0.018 s, M=16 MB, S=406. These are the displayed values in the latest 2 November 2026 screenshot. PERF.md records provenance, rejected trials and historical results.
 
 The Rust engine retains active-hour writer leases, exclusive sealing, a complete arbitrary-order rerun, corrected endpoint-length fingerprints, compact escaped rows, exact radix percentiles and ordered output. The supplied trackaa version contributed eight-byte SIMD space detection, multiply-add decoding for common latencies, common-eight-digit decimal output, and the fixed contest interface. Full uint32 input/output paths remain. Its original hash and unguarded reclamation are not substituted.
 
