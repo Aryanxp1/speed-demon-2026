@@ -292,3 +292,16 @@ Deeper rejected studies remain in ignored local artifacts. Exact Cargo audits co
 Compact-128 `4b2dc64`, `run-9be184bdad26`: all official gates passed. T=0.019589 s, M=16,146,432 bytes, S=389, D=1, K=51.355919, 85.529525 points. The expected 37-line saving was confirmed, but official runtime and memory did not beat the standing best. Rejected. Restore the exact f7e6bf8 Rust source and original O3 pinned build rather than retaining a lower-scoring candidate.
 
 The restored source and build are byte-identical to the retained official winner, run-d0163e91b459 (evaluated with independent commit ba8f1cc): 85.767155 points, K=51.921007, T=0.018856 s, M=15,708,160 bytes, S=426, D=1. The actual restored offline Cargo executable again passes all 18 reference datasets at 1/4/12 CPU affinities. Its AddressSanitizer build again passes all 18 at 1/12 workers. Full output SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Only Track A is included. The 86+ target has not yet been achieved; no rejected experiment is presented as a performance win.
+
+
+### Resume: launch-only source reduction
+
+The restored, byte-identical f7e6bf8 source reevaluated at `9e4b798`, `run-3a1919ec7fb8`, passed every official gate and recorded a new best: T=0.018643 s, M=15,863,808 bytes, S=426, D=1, K=52.113899, **85.847678 points**. This improvement over 85.767155 is measurement variation of the same implementation, not an algorithm change. The user asked to continue toward 86+.
+
+The next candidate changes only program launch and input-file selection. Delete the optional path-argument/environment parser, use the frozen `/data` and `/out` directories, omit directory creation because the harness mounts `/out`, and open requests.log directly inside the provided data directory. Every function before main, including every aggregation method, integer parser, endpoint hash/key construction, worker method and output formatter, is byte-identical to f7e6bf8. Preserve the original solve signature, row batch size 256, SD_THREADS override, available-CPU detection, twelve-worker cap, read helper, hash constants and original pinned O3 build. The output path is still formatted through the unchanged solve argument. The prior compact candidates' extra core/helper changes are absent.
+
+Canonical Rust count is 394 nonblank lines, plus the unchanged nine-line Dockerfile, predicting S=403: a reduction of 23 against the current winner. No runtime speedup is claimed. A noisy 51-round local comparison measured compact control 21.748 ms, exact Cargo baseline 22.485 ms and launch-only 23.187 ms, with every output SHA checked; these local results do not establish a speed gain and official K decides acceptance.
+
+The actual offline Cargo release executable passes all 18 reference datasets at 1/4/12 CPU affinities with the literal contest paths. AddressSanitizer passes all 18 at 1/12 workers; only main's fixture directory arguments are substituted, with all aggregation code unchanged. Full SHA-256 stays 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Formatting and whitespace checks pass. Fingerprint matching retains its previously documented rare same-length collision limitation. Only Track A source and documentation are included.
+
+Launch-only official result: pending.
