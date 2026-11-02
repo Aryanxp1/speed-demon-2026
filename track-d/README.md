@@ -1,15 +1,13 @@
 # Team Lex: Track D
 
-Exact directed shortest paths, C++20, no external runtime dependencies.
+Exact directed shortest paths, C++17, zero runtime dependencies.
 
-The current candidate combines the user-supplied `Downloads/td/td/track-d` construction and saturated-label query engine with Team Lex's unique atomic vertex ownership, AVX2 input scanner, checked mappings, compact label directories and reusable twelve-worker phase pool.
+Adapted from the user-supplied `Downloads/td/td/track-d` solver: four-slot raw rows with exact spills, fused contraction/locality ordering, equal final-ID slices, fused edge remapping/reverse counting and mapped-page recycling. Team Lex retains unique atomic vertex claims, checked allocations/mappings and process-wide huge-page disabling.
 
-Parsing builds four-slot raw rows with exact spill and heavy-weight tables. Contraction gathers locality-ordered regions. Equal final-ID slices fuse edge renaming with reverse-edge counting; cross-slice edges use owner mailboxes. Existing mapped pages are recycled into graph arrays. Every source vertex has exactly one owner.
+Queries use 16-bit saturated labels for paths below 65535, an exact 256-settle forward probe, bidirectional search and a 2048-bucket queue with seven-bit keys. Saturated or uncertain results rerun with full 64-bit labels. General edge decoding remains available alongside the common 11-bit specialization. Vertex packing is checked. Zero weights, unreachable paths, duplicate edges and large distances remain supported.
 
-Queries use 16-bit saturating labels for paths below 65535, and rerun saturated or uncertain results with full 64-bit labels. An exact 256-settle forward probe precedes balanced bidirectional search. A 64-bucket queue retains its exact far-distance heap. Zero weights, unreachable paths, duplicate edges and large distances remain supported.
+The two-stage pinned GCC15/Debian13 build now matches the supplied source project's generic C++17 static build, without PGO. Phase threads are joined. Environment: `SD_DATA`, `SD_OUT`, `SD_THREADS` (up to twelve); output: `distances.txt`.
 
-The pinned offline Docker build and organizer seed-17 PGO generator are unchanged. Environment: `SD_DATA`, `SD_OUT`, `SD_THREADS`; output: `distances.txt`. Worker counts are bounded to twelve.
+Historical Team Lex best: **75.016414 points / K=31.646688**, source `c9fb522`, run `run-11935518a85b`. The initial adaptation scored 74.897713; this build-parity trial awaits official evaluation. The supplied project's reported 75.839 is provenance, not a new Team Lex measurement.
 
-Prior official best: **75.016414 points / K=31.646688**, commit `c9fb522`, run `run-11935518a85b`. The current candidate awaits official evaluation; the source project's reported 75.839 is not a new Team Lex result.
-
-Native PGO, ASan/UBSan and TSan pass public inputs, independent oracle cases, saturation/overflow boundaries and concurrency stress. Local PGO medians improved 22.3% and 16.7% on two full inputs, with higher sampled anonymous memory. See PERF.md for complete tradeoffs, provenance and validation. Scoring-box K decides promotion.
+Native release, ASan/UBSan and TSan pass public inputs, independent oracle cases, saturation/overflow boundaries and concurrency stress. See PERF.md for full results and rejected trials. No ranking or higher official score is claimed before evaluation.
