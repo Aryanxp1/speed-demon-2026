@@ -28,17 +28,6 @@ unsafe fn equal_mask(chunk: __m256i, byte: u8) -> u64 {
     _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(byte as i8))) as u32 as u64
 }
 
-unsafe fn pair_mask(low: __m256i, high: __m256i, byte: u8) -> u64 {
-    equal_mask(low, byte) | equal_mask(high, byte) << 32
-}
-
-unsafe fn delim_mask(low: __m256i, high: __m256i) -> u64 {
-    let (c, n) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8));
-    let dl = _mm256_or_si256(_mm256_cmpeq_epi8(low, c), _mm256_cmpeq_epi8(low, n));
-    let dh = _mm256_or_si256(_mm256_cmpeq_epi8(high, c), _mm256_cmpeq_epi8(high, n));
-    _mm256_movemask_epi8(dl) as u32 as u64 | (_mm256_movemask_epi8(dh) as u32 as u64) << 32
-}
-
 unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
     let s = 64 - 8 * len;
     (read_unaligned(end.sub(8).cast::<u64>()) ^ 0x3030_3030_3030_3030) >> s << s
@@ -46,12 +35,11 @@ unsafe fn digits_before(end: *const u8, len: usize) -> u64 {
 
 unsafe fn decode_digits(words: &[u64], numbers: &mut [u32], count: usize) {
     for at in (0..count).step_by(4) {
-        let digits = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
-        let pairs = _mm256_maddubs_epi16(digits, _mm256_set1_epi16(0x010A));
-        let fours = _mm256_madd_epi16(pairs, _mm256_set1_epi32(0x0001_0064));
-        let fours = _mm256_packus_epi32(fours, fours);
-        let eights = _mm256_madd_epi16(fours, _mm256_set1_epi32(0x0001_2710));
-        let packed = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(eights));
+        let d = _mm256_and_si256(load(words.as_ptr().add(at).cast()), _mm256_set1_epi8(15));
+        let p = _mm256_maddubs_epi16(d, _mm256_set1_epi16(0x010A));
+        let f = _mm256_madd_epi16(p, _mm256_set1_epi32(0x0001_0064));
+        let e = _mm256_madd_epi16(_mm256_packus_epi32(f, f), _mm256_set1_epi32(0x0001_2710));
+        let packed = _mm256_castsi256_si128(_mm256_permute4x64_epi64::<0b1000>(e));
         _mm_storeu_si128(numbers.as_mut_ptr().add(at).cast(), packed);
     }
 }
@@ -85,9 +73,8 @@ impl Run {
         let bucket = &self.2 .0[index];
         let wanted = _mm256_set1_epi64x(tag as i64);
         let [low, high] = [0, 1].map(|half| {
-            let slots = _mm256_srli_epi64::<17>(_mm256_load_si256(
-                bucket.as_ptr().cast::<__m256i>().add(half),
-            ));
+            let p = bucket.as_ptr().cast::<__m256i>().add(half);
+            let slots = _mm256_srli_epi64::<17>(_mm256_load_si256(p));
             _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(slots, wanted)))
         });
         match low | high << 4 {
@@ -167,13 +154,13 @@ impl Run {
             let (mut inside, mut quote_total, mut filled) = (0u64, 0u32, 0usize);
             while record < end {
                 for _ in 0..32 {
-                    let low = load(input.add(at));
-                    let high = load(input.add(at + 32));
-                    let quote = pair_mask(low, high, b'"');
+                    let (low, high) = (load(input.add(at)), load(input.add(at + 32)));
+                    let mask = |b| equal_mask(low, b) | equal_mask(high, b) << 32;
+                    let (quote, comma, newline) = (mask(b'"'), mask(b','), mask(b'\n'));
                     let quoted = _mm_clmulepi64_si128(_mm_cvtsi64_si128(quote as i64), ones, 0);
                     let inside_now = _mm_cvtsi128_si64(quoted) as u64 ^ inside;
                     inside = ((inside_now as i64) >> 63) as u64;
-                    let mut bits = delim_mask(low, high) & !inside_now;
+                    let mut bits = (comma | newline) & !inside_now;
                     quotes[(at - origin) / 64 % 1024] = (quote, quote_total);
                     quote_total += quote.count_ones();
                     let found = bits.count_ones() as usize;
@@ -187,25 +174,23 @@ impl Run {
                     at += 64;
                 }
 
-                let quotes_up_to = |position: usize| {
-                    let (quote, before) = quotes[(position - origin) / 64 % 1024];
-                    let below = _bzhi_u64(quote, ((position - origin) % 64) as u32);
-                    before.wrapping_add(below.count_ones())
+                let quotes_up_to = |p: usize| {
+                    let (q, b) = quotes[(p - origin) / 64 % 1024];
+                    b.wrapping_add(_bzhi_u64(q, ((p - origin) % 64) as u32).count_ones())
                 };
                 let field = |a| (*pos.as_ptr().add(a * 5).cast::<[u32; 5]>()).map(|p| p as usize);
-                let mut count = 0;
-                let mut start = record;
+                let (mut count, mut start) = (0, record);
                 while count < filled / 5 && start < end {
-                    let [comma1, _, comma3, comma4, newline] = field(count);
+                    let [c1, _, c3, c4, nl] = field(count);
                     let bom = (*input.add(start) == 0xEF) as usize * 3;
-                    digits[0][count] = digits_before(input.add(comma1), comma1 - start - bom);
-                    digits[2][count] = digits_before(input.add(comma4), comma4 - comma3 - 1);
-                    let stop = newline - (*input.add(newline - 1) == b'\r') as usize;
-                    let neg = (*input.add(comma4 + 1) == b'-') as usize;
-                    let cents = digits_before(input.add(stop), stop - comma4 - 1 - neg);
+                    digits[0][count] = digits_before(input.add(c1), c1 - start - bom);
+                    digits[2][count] = digits_before(input.add(c4), c4 - c3 - 1);
+                    let stop = nl - (*input.add(nl - 1) == b'\r') as usize;
+                    let neg = (*input.add(c4 + 1) == b'-') as usize;
+                    let cents = digits_before(input.add(stop), stop - c4 - 1 - neg);
                     digits[1][count] = (cents & 0xFF_FFFF_FFFF) << 8 | cents >> 48 << 48;
                     signs[count] = -(neg as i64);
-                    start = newline + 1;
+                    start = nl + 1;
                     count += 1;
                 }
                 for kind in 0..3 {
@@ -213,15 +198,15 @@ impl Run {
                 }
                 let mut rank = quotes_up_to(record);
                 for at in 0..count {
-                    let [comma1, comma2, comma3, ..] = field(at);
-                    let raw_name = comma2 - comma1 - 1;
+                    let [c1, c2, c3, ..] = field(at);
+                    let raw_name = c2 - c1 - 1;
                     let sub2 = raw_name.saturating_sub(2);
-                    let (hash, inner) = name_hash(input.add(comma1 + 2), sub2);
+                    let (hash, inner) = name_hash(input.add(c1 + 2), sub2);
                     let name_len = sub2 - inner / 2;
-                    let before = std::mem::replace(&mut rank, quotes_up_to(comma3));
+                    let before = std::mem::replace(&mut rank, quotes_up_to(c3));
                     let name_quotes = inner + 2 * (raw_name != 0) as usize;
                     let note_q = rank.wrapping_sub(before) as usize - name_quotes;
-                    let note_len = comma3 - comma2 - 1 - note_q / 2 - (note_q != 0) as usize;
+                    let note_len = c3 - c2 - 1 - note_q / 2 - (note_q != 0) as usize;
                     _mm_prefetch::<_MM_HINT_T0>(self.2 .0[(hash >> 49) as usize].as_ptr().cast());
                     let region = (numbers[2][at] as usize).min(1_000_000);
                     _mm_prefetch::<_MM_HINT_T0>(REGION_GROUP.as_ptr().add(region).cast());
