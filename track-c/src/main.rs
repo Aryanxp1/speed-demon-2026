@@ -313,12 +313,21 @@ fn main() {
     for (key, group) in keys {
         let [count, id_sum, amount, lengths, hi, lo, ..] = totals[group];
         let words = NEXT[3].load(Relaxed).div_ceil(64);
-        let distinct: u32 = (0..words)
-            .map(|word| {
-                run.2 .1[matrix_index(group, word)]
-                    .load(Relaxed)
-                    .count_ones()
-            })
+        let first = matrix_index(group, 0);
+        let split = if group < HOT_GROUPS {
+            words.min(HOT_WORDS)
+        } else {
+            words
+        };
+        let spill = if words > split {
+            matrix_index(group, split)
+        } else {
+            0
+        };
+        let distinct: u32 = [(first, split), (spill, words - split)]
+            .into_iter()
+            .flat_map(|(at, len)| run.2 .1[at..at + len].iter())
+            .map(|w| w.load(Relaxed).count_ones())
             .sum();
         let [sum, min, max] =
             [amount, BIAS - lo, hi - BIAS].map(|c| format!("{:.2}", c as f64 / 100.0));

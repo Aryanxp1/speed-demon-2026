@@ -438,3 +438,12 @@ An independently developed AVX2 bitmap transpose also passes the 27 reference ca
 First balanced-sampling official result at 869cd1c, run-b541b7c4f9c2: all gates passed; T=0.097184 s, M=41,172,992 bytes, S=1148, D=1, K=36.001256, **77.815883 points**. It does not beat the 78.599644 rollback best. The previous unchanged early-exit run at 4804ef4 was also slow (T=0.098188, 77.776008 points), so a second native observation is needed before deciding whether to restore. This push changes only C's output count and B's result documentation; all B source/build blobs remain byte-identical to 869cd1c for that repeat.
 
 Further local B probes: jumping directly between set bits for the first answer IDs cuts one Rust source line, but thirteen-pair studies measured +3.137% then -0.936% wall gain; no consistent improvement, withheld. Suppressing ordinary postings for phrase-anchor-only terms measured +0.073%, and combining the two +0.110%, insufficient to justify extra source. The AVX2 transpose's direct thirteen-pair comparison to balanced sampling measured -4.197%; it remains withheld.
+
+
+## Verified 79+ result
+
+Unchanged balanced-sampling source/build evaluated through the concurrent Track D descendant dbd3358e5a8ab5e68ee791f9ca6848ce7ff73988, run-858d8445c5a3: **79.041133 points, K=38.091025**, T=0.086813 s, M=41,508,864 bytes, S=1148, D=1. All build, check, correctness, sandbox and timeout gates passed. All four B source/build blobs are byte-identical to 3b611ac and 869cd1c. This meets the user's 79+ target and improves the incoming standing best 78.599644 / K=37.324403 by 0.441489 points / K=0.766622. The external source's reported 79.293 is not claimed for our version.
+
+Both native observations are retained: 77.815883 at 97.184 ms and 79.041133 at 86.813 ms, with identical code. These are variable samples, not evidence that all of the 10.7% time spread is algorithmic. The code selected here is the actual evaluated 79+ implementation. Source SHA-256: 42b0067e4efcf905528c2e8a3ef1cfd2a403c54c27ae81b9ab882dbf9396de42. The pinned build and all 27 reference/ASAN checks remain unchanged.
+
+A subsequent local owner-only UnsafeCell counter probe measured +2.071% in one thirteen-pair study but was not selected or submitted; the verified winner retains AtomicU32 counters. All other unproven local probes remain outside the submission. This result-recording change preserves B's tested source and restores C's independently verified best. No A or D path is edited by this pass.
