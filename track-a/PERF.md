@@ -325,4 +325,17 @@ The actual offline Cargo release executable passes all 18 reference datasets at 
 
 Rejected local experiments: unmapping finished hour regions after replacing stored slices with lengths passed all reference and sanitizer checks but increased local wall time and did not lower measured peak memory; retaining only the current hour lease also passed references but was slower. A non-PIE static build reduced binary size from 1,376,416 to 1,332,928 bytes without a clear timing or memory advantage, so original flags remain. The stable force-unwind-tables=no option did not change binary size. The immediate-abort panic strategy requires nightly/rebuilding the standard library and is not selected (Rust codegen documentation: https://doc.rust-lang.org/rustc/codegen-options/). None of these rejected changes enters the submitted candidate.
 
-Eight-digit formatter official result: pending. Only Track A source and documentation are changed. The rare same-length fingerprint collision limitation remains as documented.
+Eight-digit formatter `8be4c2a`, `run-c5bf484ec491`: all official gates passed; T=0.018845 s, M=16,519,168 bytes, S=403, D=1, K=51.845723, 85.735647 points. Below the retained 85.847678-point baseline. The new batch-size candidate below adds one isolated constant change to this fully checked source; the formatter alone is not declared a winner. Only Track A source and documentation are changed. The rare same-length fingerprint collision limitation remains as documented.
+
+
+### Keep the newline scan batch within cache
+
+Change BLOCK from 65,536 to 4,096 bytes. Workers still claim 1 MiB; the same AVX2 scan and parser now alternate after each 4 KiB instead of scanning 64 KiB ahead. This reduces the newline-offset buffer and the distance between scanning and parsing the same input. The existing prefetch follows BLOCK and is therefore also 4 KiB ahead. Fitting the working set in cache is a performance hypothesis; no hardware-cache-counter attribution is claimed. No additional source lines, allocation strategy, hash, percentiles, leases, sealing heuristic, fallback or build flags change.
+
+Three 51-round randomized RAM-output studies found the smaller batches consistently faster. In the first, old formatter control / format8 / 16 KiB / 32 KiB medians were 14.950 / 14.763 / 14.058 / 14.034 ms. In the second, old control / format8 / selected 4 KiB were 14.560 / 14.489 / 13.464 ms; selected paired gain versus control was 8.224%, CPU 109.979 versus 123.506 ms. In the third, control / selected 4 KiB were 17.331 / 15.268 ms, paired gain 9.691%, CPU 142.138 / 122.688 ms. Sizes 0.5/1/2/8 KiB were also checked; wall differences among the smaller sizes were close, and 4 KiB had the lowest measured CPU time in the final study. Every timed full-data SHA-256 checked.
+
+Reducing input claims to 512 or 256 KiB did not improve the combined tradeoff. A 256 KiB claim lowered a local memory median to 15,122,432 bytes but was 30.675% slower in the same timing study, and is rejected. Private-cgroup memory samples for selected 4 KiB batches were noisy (median 16,072,704 bytes, range 15,515,648..18,624,512); no official memory reduction is claimed.
+
+The actual selected offline Cargo release executable passes all 18 reference datasets at 1/4/12 CPU affinities. AddressSanitizer passes all 18 at 1/12 CPU affinities with only fixture paths substituted. Full output SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Immutable selected source SHA-256 is f0c69ae7754a74d79ba53dcaebfc67b9c2b5aa472fcd805364b3c80d74d85d42. Canonical Rust count stays 394, Dockerfile nine (predicted S=403). Only Track A is changed.
+
+Four-KiB scan official result: pending.

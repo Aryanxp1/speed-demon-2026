@@ -11,7 +11,7 @@ extern "C" {
 }
 
 const CLAIM: usize = 1 << 20;
-const BLOCK: usize = 1 << 16;
+const BLOCK: usize = 1 << 12;
 const MIN_LINE: usize = 40;
 const HOURS: usize = 72;
 const CHUNK: usize = 256;
