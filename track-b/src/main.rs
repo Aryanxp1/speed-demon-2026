@@ -40,6 +40,29 @@ const WORKSPACE: usize = 32 << 20;
 
 const MAX_WORDS: usize = 8;
 
+static SELECT_LANES: [[u8; 8]; 256] = {
+    let mut table = [[0; 8]; 256];
+    let mut mask = 0usize;
+    while mask < table.len() {
+        let (mut bits, mut count) = (mask, 0);
+        while bits != 0 {
+            table[mask][count] = bits.trailing_zeros() as u8;
+            bits &= bits - 1;
+            count += 1;
+        }
+        mask += 1;
+    }
+    table
+};
+
+#[inline(always)]
+unsafe fn compact_actions(values: __m256i, mask: u32, out: *mut u32) -> usize {
+    let indices = _mm_loadl_epi64(SELECT_LANES[mask as usize].as_ptr().cast());
+    let packed = _mm256_permutevar8x32_epi32(values, _mm256_cvtepu8_epi32(indices));
+    _mm256_storeu_si256(out.cast(), packed);
+    mask.count_ones() as usize
+}
+
 #[repr(C, align(64))]
 struct Bucket {
     tags: [u32; BUCKET_SLOTS + 1],
@@ -56,6 +79,9 @@ struct Buffers {
     group: &'static mut [u64],
     list_hits: &'static mut [u64],
     anchor_hits: &'static mut [u64],
+    actions: &'static mut [u32],
+    list_actions: &'static mut [u32],
+    list_ends: &'static mut [u32],
     counts: &'static mut [u32],
 }
 
@@ -428,37 +454,47 @@ impl Run {
             }
             let (mut heavy_count, mut list_count, mut anchor_count) = (0, 0, 0);
             let batch_doc = doc;
-
-            let buckets = self.buckets;
-            let (heavy_hits, list_hits) = (b.heavy_hits.as_mut_ptr(), b.list_hits.as_mut_ptr());
+            let actions = b.actions.as_mut_ptr();
             for line in 0..line_count {
                 let to = b.lines[line] as usize;
+                for at in token..to {
+                    let ahead = bucket_of(*hashes.add(at + AHEAD), self.bucket_shift);
+                    _mm_prefetch::<_MM_HINT_T0>(self.buckets.add(ahead).cast());
+                    *actions.add(at) = action_in(self, *hashes.add(at));
+                }
                 while token < to {
-                    let ahead = bucket_of(*hashes.add(token + AHEAD), self.bucket_shift);
-                    _mm_prefetch::<_MM_HINT_T0>(buckets.add(ahead).cast());
-                    let action = action_in(self, *hashes.add(token));
-
-                    *heavy_hits.add(heavy_count) = action;
-                    heavy_count += (action >> 31) as usize;
-                    *list_hits.add(list_count) = (action as u64) << 32 | doc as u64;
-
-                    list_count += (action.wrapping_sub(1) < HEAVY - 1) as usize;
-
-                    if action & ANCHOR != 0 {
+                    let values = _mm256_loadu_si256(actions.add(token).cast());
+                    let valid = (1u32 << (to - token).min(8)) - 1;
+                    let heavy = _mm256_movemask_ps(_mm256_castsi256_ps(values)) as u32 & valid;
+                    let positive = _mm256_cmpgt_epi32(values, _mm256_setzero_si256());
+                    let list = _mm256_movemask_ps(_mm256_castsi256_ps(positive)) as u32 & valid;
+                    heavy_count +=
+                        compact_actions(values, heavy, b.heavy_hits.as_mut_ptr().add(heavy_count));
+                    list_count +=
+                        compact_actions(values, list, b.list_actions.as_mut_ptr().add(list_count));
+                    let tagged = _mm256_slli_epi32::<2>(values);
+                    let mut anchors =
+                        _mm256_movemask_ps(_mm256_castsi256_ps(tagged)) as u32 & valid;
+                    while anchors != 0 {
+                        let at = token + anchors.trailing_zeros() as usize;
+                        let action = *actions.add(at);
                         *b.anchor_hits.get_unchecked_mut(anchor_count) =
-                            (action as u64) << 40 | (doc as u64) << 20 | token as u64;
+                            (action as u64) << 40 | (doc as u64) << 20 | at as u64;
                         anchor_count += 1;
+                        anchors &= anchors - 1;
                     }
-                    token += 1;
+                    token += 8;
                 }
                 *b.heavy_ends.get_unchecked_mut(line) = heavy_count as u32;
-
+                *b.list_ends.get_unchecked_mut(line) = list_count as u32;
+                token = to;
                 if line + 1 < line_count {
                     doc += 1;
                     b.hashes[to] = 0;
                     token = to + 1;
                 }
             }
+            let mut phrase_count = 0;
             for (i, &hit) in b.anchor_hits[..anchor_count].iter().enumerate() {
                 let later = |ahead: usize| (b.anchor_hits[i + ahead] >> 40) as usize;
                 _mm_prefetch::<_MM_HINT_T0>(
@@ -480,9 +516,9 @@ impl Run {
                         && token - pivot + len <= ready
                         && b.hashes[token - pivot..token - pivot + len] == phrase.words[..len]
                     {
-                        b.list_hits[list_count] =
+                        b.list_hits[phrase_count] =
                             (phrase.term as u64 + 1) << 32 | (hit >> 20 & ((1 << 20) - 1));
-                        list_count += 1;
+                        phrase_count += 1;
                     }
                 }
             }
@@ -504,11 +540,11 @@ impl Run {
                     }
                 }
             }
-            for &hit in &b.list_hits[..list_count] {
+            let mut emit = |hit: u64| {
                 let term = ((hit >> 32) as u32 & !ANCHOR) - 1;
                 if SAMPLE {
                     b.counts[term as usize] += 1;
-                    continue;
+                    return;
                 }
                 let shard = term as usize & (SHARDS - 1);
                 let cursor = cursors.get_unchecked_mut(shard);
@@ -517,6 +553,18 @@ impl Run {
                 }
                 *cursor.0 = ((term >> SHARDS.trailing_zeros()) + 1) << DOC_BITS | hit as u32;
                 cursor.0 = cursor.0.add(1);
+            };
+            let mut from = 0;
+            for line in 0..line_count {
+                let to = b.list_ends[line] as usize;
+                let doc = (batch_doc as usize + line) as u64;
+                for &action in &b.list_actions[from..to] {
+                    emit((action as u64) << 32 | doc);
+                }
+                from = to;
+            }
+            for &hit in &b.list_hits[..phrase_count] {
+                emit(hit);
             }
 
             b.lines[0] = 0;
@@ -809,8 +857,12 @@ impl Run {
             group: take(&mut next, 64 * MAX_HEAVY / 64),
             list_hits: take(&mut next, tokens),
             anchor_hits: take(&mut next, tokens),
+            actions: take(&mut next, tokens),
+            list_actions: take(&mut next, tokens),
+            list_ends: take(&mut next, BATCH / 2 + 64),
             counts: take(&mut next, self.max_terms),
         };
+        assert!(next.offset_from(self.workspace.add(id * WORKSPACE)) as usize <= WORKSPACE);
         self.shares[id].set(self.parse_share(id)).ok();
         self.barrier();
 
