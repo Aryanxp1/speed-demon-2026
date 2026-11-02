@@ -116,7 +116,8 @@ u32 scan8(const char *&p, const char *end) {
 }
 
 template <class Emit>
-void parse(const char *hi, const char *p, const char *end, Emit emit) {
+void parse(const char *lo, const char *hi, const char *p, const char *end,
+           Emit emit) {
   while (p < end) {
     u32 u = scan8(p, hi), v = scan8(p, hi), w = scan8(p, hi);
     emit(u, v, w);
@@ -214,8 +215,8 @@ struct alignas(64) Bins {
 // exist. A row is four slots, or for more edges a pointer to spilled ones.
 // Marks the vertices that can be bypassed: out-degree <= 2 and no query
 // endpoint.
-Graph *read_graph(const char *lo, const char *hi, Bits &bypass,
-                  unsigned threads) {
+Graph *read_graph(const char *lo, const char *hi, const Bits &terminal,
+                  Bits &bypass, unsigned threads) {
   const char *p = lo;
   u32 n = scan(p), m = scan(p);
   // Worker k parses from the first line start at or after its share's start.
@@ -236,7 +237,7 @@ Graph *read_graph(const char *lo, const char *hi, Bits &bypass,
   parallel(threads, [&](unsigned t) {
     Bins &bin = bins[t];
     bin.pool = pool;
-    parse(hi, line(t), line(t + 1),
+    parse(lo, hi, line(t), line(t + 1),
           [&](u32 u, u32 v, u32 w) { bin.add(u, v, w); });
     std::sort(bin.heavy.begin(), bin.heavy.end());
   });
@@ -263,10 +264,8 @@ Graph *read_graph(const char *lo, const char *hi, Bits &bypass,
       u32 pos = 4 * n + spilled.fetch_add(extra);
       for (u32 x = 0; x < size; ++x) {
         u32 v = first + x, *row = rows + 4 * size_t(v);
-        // Each bucket owns complete words. Flip query endpoints off and
-        // non-terminal low-degree vertices on, reusing the terminal bitmap.
-        if (at[x] <= 2 || test(bypass, v))
-          bypass[v >> 6] ^= u64(1) << (v & 63);
+        if (at[x] <= 2 && !test(terminal, v))
+          set(bypass, v); // buckets are word aligned
         std::fill(row, row + 4, NONE);
         if (at[x] > 4)
           row[0] = SPILL, row[1] = pos, row[2] = at[x], at[x] = pos,
@@ -496,15 +495,22 @@ std::pair<Graph *, Graph *> contract(Graph *raw, const Bits &bypass,
           std::min(cuts[k + 1], base[t + 1]) - base[t]);
   };
   Graph *g = new Graph(total, edges[threads], spare + edges[threads], spare);
-  // Each region writes its unique ID map and final offsets in one pass.
+  // Unique owners write the canonical raw-to-final ID map.
+  parallel(threads, [&](unsigned k) {
+    each(k, [&](unsigned t, u32 lo, u32 hi) {
+      for (u32 i = lo; i < hi; ++i) {
+        u32 packed = regions[t].order[i];
+        where[packed >> wbits] = base[t] + i;
+        g->off[base[t] + i] = packed & mask;
+      }
+    });
+  });
   parallel(threads, [&](unsigned t) {
-    Region &reg = regions[t];
     u32 pos = edges[t];
-    auto large = reg.large.begin();
-    for (u32 i = 0; i < reg.len; ++i) {
-      u32 packed = reg.order[i], degree = packed & mask;
-      where[packed >> wbits] = base[t] + i;
-      g->off[base[t] + i] = pos;
+    auto large = regions[t].large.begin();
+    for (u32 i = base[t]; i < base[t + 1]; ++i) {
+      u32 degree = g->off[i];
+      g->off[i] = pos;
       pos += degree == mask ? *large++ : degree;
     }
   });
@@ -736,10 +742,10 @@ int main() {
   while (q < qend)
     ends.push_back(scan(q));
   const char *graph = map(data + "/graph.txt", gsize), *p = graph;
-  Bits bypass(scan(p) / 64 + 1);
+  Bits terminal(scan(p) / 64 + 1), bypass(terminal.size());
   for (u32 v : ends)
-    set(bypass, v);
-  Graph *raw = read_graph(graph, graph + gsize, bypass, threads);
+    set(terminal, v);
+  Graph *raw = read_graph(graph, graph + gsize, terminal, bypass, threads);
   auto [fwd, rev] = contract(raw, bypass, threads, ends);
   size_t queries = ends.size() / 2;
   std::vector<int64_t> answers(queries);

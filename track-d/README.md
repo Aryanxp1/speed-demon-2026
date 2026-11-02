@@ -12,4 +12,4 @@ The pinned offline GCC15 build uses native twelve-worker seed-17 PGO. Environmen
 
 Native PGO, ASan/UBSan and TSan pass public inputs, independent oracle cases, saturation/u32/u64 boundaries and concurrency stress. PERF.md records provenance, complete results, rejected experiments and the remaining gap to the leader. Earlier implementations and all submitted trials remain in Git history.
 
-The pending follow-up reuses query-endpoint bits as bypass flags and writes the canonical ID map and final offsets in one pass per region. It passes full native/ASan/UBSan/TSan validation, high-degree sentinel tests, and final static PGO packaging. The official best above remains authoritative until this trial is scored.
+The combined in-place bitmap / per-region offset trial passed gates but scored74.852264, so the exact4b37425 source is restored. Equal-slice mapping remains.
