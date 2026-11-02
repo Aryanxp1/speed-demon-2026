@@ -447,3 +447,21 @@ Unchanged balanced-sampling source/build evaluated through the concurrent Track 
 Both native observations are retained: 77.815883 at 97.184 ms and 79.041133 at 86.813 ms, with identical code. These are variable samples, not evidence that all of the 10.7% time spread is algorithmic. The code selected here is the actual evaluated 79+ implementation. Source SHA-256: 42b0067e4efcf905528c2e8a3ef1cfd2a403c54c27ae81b9ab882dbf9396de42. The pinned build and all 27 reference/ASAN checks remain unchanged.
 
 A subsequent local owner-only UnsafeCell counter probe measured +2.071% in one thirteen-pair study but was not selected or submitted; the verified winner retains AtomicU32 counters. All other unproven local probes remain outside the submission. This result-recording change preserves B's tested source and restores C's independently verified best. No A or D path is edited by this pass.
+
+
+## Final-minute SLVS-inspired adaptation (untested)
+
+User supplied C:/Users/aryan/Downloads/SLVS/slvs/track-b/src and explicitly requested implementation/push within five minutes without tests or benchmarks. Reviewed its main/plan/scan code and PERF.md. Its reported approximately 82.01 points belong to the supplied SALAAR implementation, not Team Lex. Its perfect-hash and triggered truth-table scan would require replacing this phased-index engine and are not substituted during this short pass.
+
+Adapt three compatible scan/output ideas into the existing Rust base: enumerate answer IDs by trailing_zeros and clearing the lowest set bit; prefetch the tally four positions ahead while formatting a completed batch; and use BMI2 bzhi to clip the final partial token/newline masks, retaining the existing predictable tail branch. The first-ID iterator had passed all 27 references and ASAN in the earlier local probe, but its timings were mixed (+3.137%, then -0.936%) and it was previously withheld. Reconsidered here under the user's explicit final-minute request; no speedup is promised. The combined new source is untested and unmeasured. No build, correctness run, sanitizer run or benchmark is performed in this pass. Official evaluation remains pending.
+
+Keep query ordering, tally counts/sums, Boolean/phrase rules, existing probabilistic hash behavior, balanced sampling, density-safe claims, mappings, flags, twelve-worker cap and all pinned build metadata. Preserve the prior verified 79.041133 / K=38.091025 version in 3b611ac for rollback. Only Track B source and documentation change. This candidate must not be described as the already verified 79+ source.
+
+
+## Restore the verified winner after the SLVS deadline trial
+
+User reported that the final-minute change did not work and authorized running checks. Official evidence shows a performance regression rather than a correctness/build failure: b72b848, run-f9ef0846981a, passed every gate but scored **78.653855, K=37.417701**, T=0.089989 s, M=42,176,512 bytes, S=1147, D=1. Revert all three experimental changes: set-bit first-ID iteration, tally prefetch and bzhi tail clipping. No new unmeasured optimization is substituted near the submission deadline.
+
+Restore src/main.rs byte-for-byte to the actual standing winner, evaluated at 421ac2a, run-b178a753c826: **79.068682 points, K=38.139382**, T=0.086593 s, M=41,431,040 bytes, S=1148, D=1, all gates passed. All source/build blobs match the original balanced-sampling adaptation at 3b611ac; its prior best was 79.041133. This newer score is another observation of the same code, not a new implementation gain.
+
+Before restoring, rebuilt this exact source through the original offline Cargo O3/fat-LTO/static package with warnings denied. All 27 independent reference datasets pass again at 1/4/12 CPU affinities, including the full expected SHA-256 f86973c210228141bcb6f1f1b10188ad2a9b65f71e7cd7cf4590b38de4e80927 and the dense-document fallback. The identical source had already passed the same 27 AddressSanitizer cases at 1/12 affinities. Pinned images, flags, manifests and dependencies are unchanged. Final source is the previously evaluated winner, not the lower-scoring SLVS trial. Only Track B is changed; the user's stop request for C remains respected.
