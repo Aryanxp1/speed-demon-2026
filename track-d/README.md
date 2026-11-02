@@ -14,4 +14,4 @@ Native PGO, ASan/UBSan and TSan pass public inputs, independent oracle cases, sa
 
 The combined in-place bitmap / per-region offset trial passed gates but scored74.852264, so the exact4b37425 source is restored. Equal-slice mapping remains.
 
-Pending trial preserves balanced mapping, reuses endpoint bits for bypass flags, marks fresh mmap storage as non-aliasing, and uses immutable restricted query-array pointers with GCC interprocedural pointer analysis. Exact fallbacks, 12 workers and zero runtime dependencies remain. Complete native and sanitizer suites and static PGO packaging pass; official score is pending.
+The alias-analysis trial passed all gates but scored74.816905. Exact4b37425 source/build are restored while build-only alternatives are compared.
