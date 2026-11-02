@@ -1201,6 +1201,7 @@ fn main() {
         for part in &run.parts {
             out.write_all(&part.lock().unwrap()).unwrap();
         }
+        std::process::exit(0);
     }
 }
 
