@@ -14,7 +14,7 @@ const CLAIM: usize = 1 << 20;
 const BLOCK: usize = 1 << 16;
 const MIN_LINE: usize = 40;
 const HOURS: usize = 72;
-const CHUNK: usize = 256;
+const CHUNK: usize = 128;
 const SLOTS: usize = 1 << 13;
 const ID_BITS: u32 = 11;
 const ID_MASK: u64 = (1 << ID_BITS) - 1;
@@ -106,7 +106,7 @@ impl Run {
         }
     }
 
-    unsafe fn work(&self) {
+    unsafe fn parse(&self) {
         let input = self.input;
 
         let mut cursors = [(std::ptr::null_mut::<u32>(), std::ptr::null_mut()); HOURS];
@@ -116,7 +116,7 @@ impl Run {
             self.advance();
             let claim = self.next_claim.fetch_add(CLAIM, Relaxed);
             if claim >= self.len {
-                break;
+                return;
             }
 
             let mut line = input.add(claim);
@@ -203,21 +203,8 @@ impl Run {
                     state.fetch_sub(1, Release);
                 }
             }
+            madvise(input.add(claim), CLAIM.min(self.len - claim), 4);
             self.parsed[claim / CLAIM].store((1 << 16 | low << 8 | high) as u32, Release);
-        }
-
-        while self.next_hour.load(Acquire) < HOURS {
-            self.advance();
-            thread::yield_now();
-        }
-        loop {
-            let at = self.next_hour.fetch_add(32 << 20, Relaxed) - HOURS;
-            if at >= self.len {
-                break;
-            }
-            unsafe {
-                madvise(self.input.add(at), (32 << 20).min(self.len - at), 4);
-            }
         }
     }
 
@@ -239,7 +226,7 @@ impl Run {
         let Ok(_) = self.active[hour].compare_exchange(0, SEALED, AcqRel, Acquire) else {
             return;
         };
-        self.next_hour.store(hour + 1, Release);
+        self.next_hour.store(hour + 1, Relaxed);
 
         let order = {
             let names = self.names.lock().unwrap();
@@ -360,6 +347,15 @@ impl Run {
             unsafe { madvise(rows.cast(), self.stride * 4, 4) };
         }
     }
+
+    fn work(&self) {
+        unsafe { self.parse() };
+
+        while self.next_hour.load(Relaxed) < HOURS {
+            self.advance();
+            thread::yield_now();
+        }
+    }
 }
 
 fn eight_digits(value: u32) -> u64 {
@@ -429,9 +425,9 @@ fn solve(early: bool) -> bool {
     };
     thread::scope(|s| {
         for _ in 1..threads {
-            s.spawn(|| unsafe { run.work() });
+            s.spawn(|| run.work());
         }
-        unsafe { run.work() };
+        run.work();
     });
     run.dirty.load(Relaxed)
 }
