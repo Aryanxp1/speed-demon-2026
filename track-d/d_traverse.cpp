@@ -7,7 +7,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fcntl.h>
-#include <immintrin.h>
 #include <numeric>
 #include <queue>
 #include <string>
@@ -90,62 +89,39 @@ template <class F> void parallel(unsigned threads, F f) {
 
 // ---------------------------------------------------------------- parsing
 
-// Bit i is set when p[i] is a separator (space or LF), the only bytes below
-// '0' in the input.
-static u64 separators(const char *p) {
-  auto half = [](const char *q) {
-    auto x = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(q));
-    return u32(
-        _mm256_movemask_epi8(_mm256_cmpgt_epi8(_mm256_set1_epi8('0'), x)));
-  };
-  return half(p) | (u64(half(p + 32)) << 32);
-}
-
-// Value of the digits [a, b). Up to eight digits are converted at once from
-// the 8 bytes ending at b, the bytes before a masked off.
-u32 decimal(const char *a, const char *b, const char *file) {
-  u32 len = b - a, v = 0;
-  if (len > 8 || b - file < 8) {
-    for (; a < b; ++a)
-      v = v * 10 + (*a - '0');
-    return v;
-  }
-  u64 x, m = 0x000000FF000000FF;
-  memcpy(&x, b - 8, 8);
-  x &= (~u64(0) << (64 - 8 * len)) & 0x0F0F0F0F0F0F0F0F;
-  x = x * 10 + (x >> 8); // adjacent digit pairs
-  x = (x & m) * 0x000F424000000064 + ((x >> 16) & m) * 0x0000271000000001;
-  return x >> 32;
-}
-
-// Calls emit(u, v, w) for each line in [begin, end) of the file [lo, hi).
-template <class Emit>
-void parse(const char *lo, const char *hi, const char *begin, const char *end,
-           Emit emit) {
-  const char *field = begin;
-  u32 val[3], k = 0;
-  char pad[64];
-  for (const char *q = begin; q < end; q += 64) {
-    // The file's last block is scanned from a copy padded with digits.
-    if (hi - q < 64)
-      memset(pad, '0', 64), memcpy(pad, q, hi - q);
-    u64 m = separators(hi - q < 64 ? pad : q);
-    if (end - q < 64)
-      m &= (u64(1) << (end - q)) - 1;
-    for (; m; m &= m - 1) {
-      const char *sep = q + __builtin_ctzll(m);
-      val[k] = decimal(field, sep, lo), field = sep + 1;
-      if (++k == 3)
-        emit(val[0], val[1], val[2]), k = 0;
-    }
-  }
-}
-
 u32 scan(const char *&p) {
   u32 v = 0;
   while (*p >= '0')
     v = v * 10 + (*p++ - '0');
   return ++p, v;
+}
+
+// Convert up to seven digits from one little-endian load. Longer fields and
+// the final bytes use the scalar path; the guard keeps loads within the file.
+u32 scan8(const char *&p, const char *end) {
+  if (end - p < 8)
+    return scan(p);
+  u64 x;
+  memcpy(&x, p, 8);
+  u64 sep = ~x & 0x1010101010101010;
+  if (!sep)
+    return scan(p);
+  unsigned len = __builtin_ctzll(sep) / 8;
+  x = (x << (64 - 8 * len)) & 0x0F0F0F0F0F0F0F0F;
+  x = x * 10 + (x >> 8);
+  u64 m = 0x000000FF000000FF;
+  x = (x & m) * 0x000F424000000064 + ((x >> 16) & m) * 0x0000271000000001;
+  p += len + 1;
+  return x >> 32;
+}
+
+template <class Emit>
+void parse(const char *lo, const char *hi, const char *p, const char *end,
+           Emit emit) {
+  while (p < end) {
+    u32 u = scan8(p, hi), v = scan8(p, hi), w = scan8(p, hi);
+    emit(u, v, w);
+  }
 }
 
 // Maps a file read-only; its pages stay in the page cache.
