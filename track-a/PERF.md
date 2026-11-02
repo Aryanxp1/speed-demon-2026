@@ -338,4 +338,13 @@ Reducing input claims to 512 or 256 KiB did not improve the combined tradeoff. A
 
 The actual selected offline Cargo release executable passes all 18 reference datasets at 1/4/12 CPU affinities. AddressSanitizer passes all 18 at 1/12 CPU affinities with only fixture paths substituted. Full output SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Immutable selected source SHA-256 is f0c69ae7754a74d79ba53dcaebfc67b9c2b5aa472fcd805364b3c80d74d85d42. Canonical Rust count stays 394, Dockerfile nine (predicted S=403). Only Track A is changed.
 
-Four-KiB scan official result: pending.
+Four-KiB scan `fe1dc5d`, `run-88fb703d02c2`: every official gate passed; T=0.019926 s, M=15,974,400 bytes, S=403, D=1, K=50.759071, 85.275683 points. Rejected against the 85.847678-point baseline. The strong local time/CPU gain did not transfer to this official sample; no score gain is claimed.
+
+
+### Thirty-two-KiB scan comparison
+
+Increase BLOCK to 32 KiB, intermediate between the 4 KiB trial and the original 64 KiB. This changes only the scan/parse alternation, newline-buffer size and the existing BLOCK-relative input prefetch; no build, guard, fallback, hash or formatter change. It reduces scan-loop transitions compared with the rejected 4 KiB setting while retaining the smaller working set. In the previously documented randomized studies, 32 KiB measured 14.034 and 13.863 ms versus control 14.950 and 14.560 ms, paired gains 5.914% and 4.572%. The latter CPU medians were 114.299 versus 123.506 ms. Local speed is only a reason to evaluate; it did not prove the 4 KiB trial's native behavior.
+
+The immutable 32 KiB source passes all 18 reference datasets in the actual offline Cargo executable at 1/4/12 CPU affinities. AddressSanitizer passes all 18 at 1/12 affinities, substituting only fixture paths. Full output SHA-256 remains 495ca09682b9673ef836a506496177680bb4a3af54255174befddb1f83481cd3. Canonical source count stays 394 Rust plus nine Dockerfile lines. All build blobs remain identical to the retained O3 baseline. Only Track A source and documentation are included.
+
+Thirty-two-KiB scan official result: pending.
