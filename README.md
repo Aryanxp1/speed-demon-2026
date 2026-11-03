@@ -1,4 +1,4 @@
-# Speed Demon 2026 — Team Lex
+# Speed Demon 2026
 
 Final submission branch: **`speed-demon`**. Rust 2021 for A/B/C; C++20 for D. All tracks report zero external dependencies.
 
